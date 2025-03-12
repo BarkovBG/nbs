@@ -256,7 +256,9 @@ func (s *AvailabilityMonitoringStorageYDB) UpdateSuccessRate(
 func (s *AvailabilityMonitoringStorageYDB) GetAvailableComponents(
 	ctx context.Context,
 ) ([]string, error) {
-	return []string{"aboba"}, nil
+	var res []string
+	res = append(res, "aboba")
+	return res, nil
 }
 
 // Used in tests.

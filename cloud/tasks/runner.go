@@ -907,6 +907,11 @@ func StartRunners(
 	listerReadyToRun := newLister(
 		ctx,
 		func(ctx context.Context, limit uint64) ([]storage.TaskInfo, error) {
+			// availableComponents, err := availabilityMonitoringStorage.GetAvailableComponents(ctx)
+			// if err != nil {
+			// 	return []storage.TaskInfo{}, err
+			// }
+
 			return taskStorage.ListTasksReadyToRun(
 				ctx,
 				limit,

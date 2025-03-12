@@ -729,6 +729,8 @@ func TestTasksRunningOneTask(t *testing.T) {
 	response, err := waitTask(ctx, s.scheduler, id)
 	require.NoError(t, err)
 	require.EqualValues(t, 2*123, response)
+
+	require.NotNil(t, nil)
 }
 
 func TestTasksInflightLimit(t *testing.T) {

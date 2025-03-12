@@ -32,11 +32,15 @@ type lister struct {
 	inflightTasksByType           sync.Map
 	inflightTaskCount             uint32
 	inflightTaskLimits            map[string]int64 // by task type
-	componentsByTaskType          map[string][]string
+	componentsByTaskTypes         map[string][]string
 }
 
-func (l *lister) canExecuteTaskWithComponents(availableComponents []string, taskType string) bool {
-	for _, component := range l.componentsByTaskType[taskType] {
+func (l *lister) canExecuteTaskType(
+	availableComponents []string,
+	taskType string,
+) bool {
+
+	for _, component := range l.componentsByTaskTypes[taskType] {
 		if !slices.Contains(availableComponents, component) {
 			return false
 		}
@@ -79,8 +83,14 @@ func (l *lister) loop(ctx context.Context) {
 			continue
 		}
 
-		tasks, err := l.listTasks(ctx, l.tasksToListLimit)
 		availableComponents, err := l.availabilityMonitoringStorage.GetAvailableComponents(ctx)
+		if err != nil {
+			logging.Info(ctx, "WTF WHY IT WORKS %v", l.availabilityMonitoringStorage)
+			return
+		}
+		logging.Info(ctx, "WTF 2 WHY IT WORKS %v ok availableComponents is %v", l.availabilityMonitoringStorage, availableComponents)
+
+		tasks, err := l.listTasks(ctx, l.tasksToListLimit)
 		if err == nil {
 			logging.Debug(ctx, "lister listed %v tasks", len(tasks))
 
@@ -107,7 +117,7 @@ func (l *lister) loop(ctx context.Context) {
 					continue
 				}
 
-				if !l.canExecuteTaskWithComponents(availableComponents, task.TaskType) {
+				if !l.canExecuteTaskType(availableComponents, task.TaskType) {
 					logging.Info(ctx, "skipping")
 					// skipping
 					continue
@@ -197,7 +207,7 @@ func newLister(
 	pollForTasksPeriodMin time.Duration,
 	pollForTasksPeriodMax time.Duration,
 	inflightTaskLimits map[string]int64,
-	componentsByTaskType map[string][]string,
+	componentsByTaskTypes map[string][]string,
 ) *lister {
 
 	lister := &lister{
@@ -208,7 +218,7 @@ func newLister(
 		pollForTasksPeriodMin:         pollForTasksPeriodMin,
 		pollForTasksPeriodMax:         pollForTasksPeriodMax,
 		inflightTaskLimits:            inflightTaskLimits,
-		componentsByTaskType:          componentsByTaskType,
+		componentsByTaskTypes:         componentsByTaskTypes,
 	}
 	for i := 0; i < len(lister.channels); i++ {
 		lister.channels[i] = &channel{

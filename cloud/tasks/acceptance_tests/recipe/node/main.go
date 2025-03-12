@@ -100,6 +100,7 @@ func run(config *node_config.Config) error {
 	err = tasks.StartRunners(
 		ctx,
 		storage,
+		nil,
 		registry,
 		empty.NewRegistry(),
 		config.GetTasksConfig(),
