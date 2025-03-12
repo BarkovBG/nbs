@@ -3,12 +3,14 @@ package tasks
 import (
 	"context"
 	"math/rand"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ydb-platform/nbs/cloud/tasks/common"
 	"github.com/ydb-platform/nbs/cloud/tasks/logging"
+	"github.com/ydb-platform/nbs/cloud/tasks/persistence"
 	"github.com/ydb-platform/nbs/cloud/tasks/storage"
 )
 
@@ -20,15 +22,27 @@ type listTasksFunc = func(
 ) ([]storage.TaskInfo, error)
 
 type lister struct {
-	listTasks             listTasksFunc
-	channels              []*channel
-	tasksToListLimit      uint64
-	pollForTasksPeriodMin time.Duration
-	pollForTasksPeriodMax time.Duration
-	inflightTasks         sync.Map
-	inflightTasksByType   sync.Map
-	inflightTaskCount     uint32
-	inflightTaskLimits    map[string]int64 // by task type
+	listTasks                     listTasksFunc
+	availabilityMonitoringStorage *persistence.AvailabilityMonitoringStorageYDB
+	channels                      []*channel
+	tasksToListLimit              uint64
+	pollForTasksPeriodMin         time.Duration
+	pollForTasksPeriodMax         time.Duration
+	inflightTasks                 sync.Map
+	inflightTasksByType           sync.Map
+	inflightTaskCount             uint32
+	inflightTaskLimits            map[string]int64 // by task type
+	componentsByTaskType          map[string][]string
+}
+
+func (l *lister) canExecuteTaskWithComponents(availableComponents []string, taskType string) bool {
+	for _, component := range l.componentsByTaskType[taskType] {
+		if !slices.Contains(availableComponents, component) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (l *lister) loop(ctx context.Context) {
@@ -66,6 +80,7 @@ func (l *lister) loop(ctx context.Context) {
 		}
 
 		tasks, err := l.listTasks(ctx, l.tasksToListLimit)
+		availableComponents, err := l.availabilityMonitoringStorage.GetAvailableComponents(ctx)
 		if err == nil {
 			logging.Debug(ctx, "lister listed %v tasks", len(tasks))
 
@@ -89,6 +104,12 @@ func (l *lister) loop(ctx context.Context) {
 				if loaded {
 					taskIdx++
 					// This task is already executing, drop it.
+					continue
+				}
+
+				if !l.canExecuteTaskWithComponents(availableComponents, task.TaskType) {
+					logging.Info(ctx, "skipping")
+					// skipping
 					continue
 				}
 
@@ -170,20 +191,24 @@ func (l *lister) getInflightTaskCount() uint32 {
 func newLister(
 	ctx context.Context,
 	listTasks listTasksFunc,
+	availabilityMonitoringStorage *persistence.AvailabilityMonitoringStorageYDB,
 	channelsCount uint64,
 	tasksToListLimit uint64,
 	pollForTasksPeriodMin time.Duration,
 	pollForTasksPeriodMax time.Duration,
 	inflightTaskLimits map[string]int64,
+	componentsByTaskType map[string][]string,
 ) *lister {
 
 	lister := &lister{
-		listTasks:             listTasks,
-		channels:              make([]*channel, channelsCount),
-		tasksToListLimit:      tasksToListLimit,
-		pollForTasksPeriodMin: pollForTasksPeriodMin,
-		pollForTasksPeriodMax: pollForTasksPeriodMax,
-		inflightTaskLimits:    inflightTaskLimits,
+		listTasks:                     listTasks,
+		availabilityMonitoringStorage: availabilityMonitoringStorage,
+		channels:                      make([]*channel, channelsCount),
+		tasksToListLimit:              tasksToListLimit,
+		pollForTasksPeriodMin:         pollForTasksPeriodMin,
+		pollForTasksPeriodMax:         pollForTasksPeriodMax,
+		inflightTaskLimits:            inflightTaskLimits,
+		componentsByTaskType:          componentsByTaskType,
 	}
 	for i := 0; i < len(lister.channels); i++ {
 		lister.channels[i] = &channel{
