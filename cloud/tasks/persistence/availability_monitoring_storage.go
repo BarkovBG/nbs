@@ -253,6 +253,12 @@ func (s *AvailabilityMonitoringStorageYDB) UpdateSuccessRate(
 	})
 }
 
+func (s *AvailabilityMonitoringStorageYDB) GetAvailableComponents(
+	ctx context.Context,
+) ([]string, error) {
+	return []string{"aboba"}, nil
+}
+
 // Used in tests.
 func (s *AvailabilityMonitoringStorageYDB) GetAvailabilityMonitoringResults(
 	ctx context.Context,
