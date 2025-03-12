@@ -10,6 +10,7 @@ import (
 	"github.com/ydb-platform/nbs/cloud/tasks/headers"
 	"github.com/ydb-platform/nbs/cloud/tasks/logging"
 	"github.com/ydb-platform/nbs/cloud/tasks/metrics"
+	"github.com/ydb-platform/nbs/cloud/tasks/persistence"
 	"github.com/ydb-platform/nbs/cloud/tasks/storage"
 	"github.com/ydb-platform/nbs/cloud/tasks/tracing"
 )
@@ -839,6 +840,7 @@ func startHeartbeats(
 func StartRunners(
 	ctx context.Context,
 	taskStorage storage.Storage,
+	availabilityMonitoringStorage *persistence.AvailabilityMonitoringStorageYDB,
 	registry *Registry,
 	runnerMetricsRegistry metrics.Registry,
 	config *tasks_config.TasksConfig,
@@ -895,6 +897,10 @@ func StartRunners(
 	}
 
 	inflightTaskLimits := config.GetInflightTaskPerNodeLimits()
+	componentsByTaskTypes := make(map[string][]string)
+	for key, value := range config.GetComponentsByTaskTypes() {
+		componentsByTaskTypes[key] = value.Components
+	}
 
 	taskTypesForExecution := registry.TaskTypesForExecution()
 
@@ -907,11 +913,13 @@ func StartRunners(
 				taskTypesForExecution,
 			)
 		},
+		availabilityMonitoringStorage,
 		config.GetRunnersCount(),
 		config.GetTasksToListLimit(),
 		pollForTasksPeriodMin,
 		pollForTasksPeriodMax,
 		inflightTaskLimits,
+		componentsByTaskTypes,
 	)
 	listerReadyToCancel := newLister(
 		ctx,
@@ -922,11 +930,13 @@ func StartRunners(
 				taskTypesForExecution,
 			)
 		},
+		availabilityMonitoringStorage,
 		config.GetRunnersCount(),
 		config.GetTasksToListLimit(),
 		pollForTasksPeriodMin,
 		pollForTasksPeriodMax,
 		inflightTaskLimits,
+		componentsByTaskTypes,
 	)
 
 	err = startRunners(
@@ -961,11 +971,13 @@ func StartRunners(
 				taskTypesForExecution,
 			)
 		},
+		availabilityMonitoringStorage,
 		config.GetStalkingRunnersCount(),
 		config.GetTasksToListLimit(),
 		pollForStallingTasksPeriodMin,
 		pollForStallingTasksPeriodMax,
 		inflightTaskLimits,
+		componentsByTaskTypes,
 	)
 	listerStallingWhileCancelling := newLister(
 		ctx,
@@ -977,11 +989,13 @@ func StartRunners(
 				taskTypesForExecution,
 			)
 		},
+		availabilityMonitoringStorage,
 		config.GetStalkingRunnersCount(),
 		config.GetTasksToListLimit(),
 		pollForStallingTasksPeriodMin,
 		pollForStallingTasksPeriodMax,
 		inflightTaskLimits,
+		componentsByTaskTypes,
 	)
 
 	err = startStalkingRunners(

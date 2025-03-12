@@ -229,6 +229,7 @@ func (s *services) startRunnersWithMetricsRegistry(
 	return tasks.StartRunners(
 		ctx,
 		s.storage,
+		nil,
 		s.registry,
 		metricsRegistry,
 		s.config,

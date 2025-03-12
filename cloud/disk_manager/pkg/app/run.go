@@ -176,6 +176,11 @@ func run(
 		return err
 	}
 
+	availabilityMonitoringStorage := persistence.NewAvailabilityMonitoringStorage(
+		config.TasksConfig,
+		db,
+	)
+
 	var s3 *persistence.S3Client
 	var s3Bucket string
 
@@ -209,10 +214,6 @@ func run(
 			s3MetricsRegistry := mon.NewRegistry("s3_client")
 
 			availabilityMonitoringMetricsRegistry := mon.NewRegistry("availability_monitoring")
-			availabilityMonitoringStorage := persistence.NewAvailabilityMonitoringStorage(
-				config.TasksConfig,
-				db,
-			)
 			successRateReportingInterval, err := time.ParseDuration(
 				config.TasksConfig.GetAvailabilityMonitoringSuccessRateReportingInterval(),
 			)
@@ -314,6 +315,7 @@ func run(
 	controller := tasks.NewController(
 		ctx,
 		taskStorage,
+		availabilityMonitoringStorage,
 		taskRegistry,
 		runnerMetricsRegistry,
 		config.GetTasksConfig(),

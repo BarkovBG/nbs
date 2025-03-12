@@ -1419,16 +1419,19 @@ func testListerLoop(
 			ID: fmt.Sprintf("TaskID%v", i),
 		})
 	}
+
 	lister := newLister(
 		ctx,
 		func(ctx context.Context, limit uint64) ([]storage.TaskInfo, error) {
 			return tasks, nil
 		},
-		uint64(channelCount),   // channelsCount
-		100,                    // tasksToListLimit
-		50*time.Millisecond,    // pollForTasksPeriodMin
-		100*time.Millisecond,   // pollForTasksPeriodMax
-		make(map[string]int64), // inflightTaskLimits
+		nil,
+		uint64(channelCount),      // channelsCount
+		100,                       // tasksToListLimit
+		50*time.Millisecond,       // pollForTasksPeriodMin
+		100*time.Millisecond,      // pollForTasksPeriodMax
+		make(map[string]int64),    // inflightTaskLimits
+		make(map[string][]string), // componentsByTaskTypes
 	)
 
 	receivedTasks := make([]storage.TaskInfo, 0)
@@ -1501,11 +1504,13 @@ func TestListerLoopCancellingWhileReceiving(t *testing.T) {
 		func(ctx context.Context, limit uint64) ([]storage.TaskInfo, error) {
 			return tasks, nil
 		},
-		uint64(channelCount),   // channelsCount
-		100,                    // tasksToListLimit
-		50*time.Millisecond,    // pollForTasksPeriodMin
-		100*time.Millisecond,   // pollForTasksPeriodMax
-		make(map[string]int64), // inflightTaskLimits
+		nil,
+		uint64(channelCount),      // channelsCount
+		100,                       // tasksToListLimit
+		50*time.Millisecond,       // pollForTasksPeriodMin
+		100*time.Millisecond,      // pollForTasksPeriodMax
+		make(map[string]int64),    // inflightTaskLimits
+		make(map[string][]string), // componentsByTaskTypes
 	)
 
 	receivedTasks := make([]storage.TaskInfo, 0)
