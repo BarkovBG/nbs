@@ -738,6 +738,11 @@ func NewYDBClient(
 
 	if !config.GetDisableAuthentication() {
 		options = append(options, ydb.WithCredentials(h.creds))
+	} else {
+		ydbToken, exists := os.LookupEnv("YDB_TOKEN")
+		if exists {
+			options = append(options, ydb.WithAccessTokenCredentials(ydbToken))
+		}
 	}
 
 	if h.registry != nil {

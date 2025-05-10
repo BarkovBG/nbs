@@ -65,11 +65,7 @@ func NewS3Client(
 	)
 
 	sessionConfig := &aws.Config{
-		Credentials: aws_credentials.NewStaticCredentials(
-			credentials.ID,
-			credentials.Secret,
-			"", // token - only required for temporary security credentials retrieved via STS, we don't need that
-		),
+		Credentials:      aws_credentials.AnonymousCredentials,
 		Endpoint:         &endpoint,
 		Region:           &region,
 		S3ForcePathStyle: aws.Bool(true), // otherwise, we get DNS DDOS errors in tests
