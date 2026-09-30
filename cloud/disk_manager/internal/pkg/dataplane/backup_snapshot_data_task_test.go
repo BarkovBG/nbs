@@ -619,3 +619,103 @@ func TestBackupSnapshotDataTaskFailsOnDeletedSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, queue)
 }
+
+func TestBackupSnapshotDataTaskCancelClearsQueue(t *testing.T) {
+	ctx := test.NewContext()
+
+	storage, closeFunc := newStorage(t, ctx)
+	defer closeFunc()
+
+	follower := newTestFollower(t, ctx)
+	chunkID := createSnapshotWithChunk(t, ctx, storage, "snap1")
+	otherChunkID := createSnapshotWithChunk(t, ctx, storage, "snap2")
+
+	execCtx := newBackupExecutionContext(ctx)
+	task := newBackupSnapshotDataTask(storage, follower, "snap1")
+	task.batchSize = 1
+
+	err := task.Run(ctx, execCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+
+	completed := snapshot_storage.BackupChunkQueueEntry{
+		SnapshotID: "snap1",
+		ChunkID:    chunkID,
+		StoredInS3: true,
+	}
+	err = storage.ChunksBackupCompleted(
+		ctx,
+		[]snapshot_storage.BackupChunkQueueEntry{completed},
+	)
+	require.NoError(t, err)
+
+	other := snapshot_storage.BackupChunkQueueEntry{
+		SnapshotID: "snap2",
+		ChunkID:    otherChunkID,
+		StoredInS3: true,
+	}
+	err = enqueueBackupChunks(
+		ctx,
+		storage,
+		[]snapshot_storage.BackupChunkQueueEntry{
+			{SnapshotID: "snap1", ChunkID: "queued", StoredInS3: true},
+			other,
+		},
+	)
+	require.NoError(t, err)
+
+	err = task.Cancel(ctx, execCtx)
+	require.NoError(t, err)
+
+	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
+	require.NoError(t, err)
+	require.Equal(t, []snapshot_storage.BackupChunkQueueEntry{other}, queue)
+
+	backedUp, err := storage.GetBackedUpChunkCount(ctx, "snap1")
+	require.NoError(t, err)
+	require.Zero(t, backedUp)
+
+	// The completed chunk is forgotten too, so the next backup of the
+	// snapshot copies it again.
+	err = enqueueBackupChunks(
+		ctx,
+		storage,
+		[]snapshot_storage.BackupChunkQueueEntry{completed},
+	)
+	require.NoError(t, err)
+
+	queue, err = storage.GetQueuedChunksToBackup(ctx, 10)
+	require.NoError(t, err)
+	require.ElementsMatch(
+		t,
+		[]snapshot_storage.BackupChunkQueueEntry{completed, other},
+		queue,
+	)
+}
+
+func TestBackupSnapshotDataTaskDoesNotBackUpChunkMapOfDeletedSnapshot(
+	t *testing.T,
+) {
+
+	ctx := test.NewContext()
+
+	storage, closeFunc := newStorage(t, ctx)
+	defer closeFunc()
+
+	follower := newTestFollower(t, ctx)
+	createSnapshotWithChunk(t, ctx, storage, "snap1")
+
+	meta, err := storage.CheckSnapshotReady(ctx, "snap1")
+	require.NoError(t, err)
+
+	_, err = storage.DeletingSnapshot(ctx, "snap1", "deleteTaskID")
+	require.NoError(t, err)
+
+	execCtx := newBackupExecutionContext(ctx)
+	task := newBackupSnapshotDataTask(storage, follower, "snap1")
+
+	err = task.backupChunkMap(ctx, execCtx, meta)
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+
+	_, err = follower.getObject(ctx, backup.ChunkMapKey("snap1"))
+	require.Error(t, err)
+}

@@ -347,6 +347,61 @@ func (s *storageYDB) ClearCompletedBackupChunkQueueEntries(
 	return int(count), res.Err()
 }
 
+func (s *storageYDB) ClearBackupChunkQueueEntries(
+	ctx context.Context,
+	snapshotID string,
+	limit int,
+) (cleared int, err error) {
+
+	defer s.metrics.StatOperation("ClearBackupChunkQueueEntries")(&err)
+
+	// Every queued entry has a row in backup_chunks, so the keys taken from
+	// backup_chunks cover backup_chunk_queue too.
+	res, err := s.db.ExecuteRW(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $snapshot_id as Utf8;
+		declare $limit as Uint64;
+
+		$keys = (
+			select snapshot_id, chunk_id
+			from backup_chunks
+			where snapshot_id = $snapshot_id
+			limit $limit
+		);
+
+		select count(*) from $keys;
+
+		delete from backup_chunk_queue
+		on select * from $keys;
+
+		delete from backup_chunks
+		on select * from $keys;
+	`, s.tablesPath),
+		persistence.ValueParam(
+			"$snapshot_id",
+			persistence.UTF8Value(snapshotID),
+		),
+		persistence.ValueParam("$limit", persistence.Uint64Value(uint64(limit))),
+	)
+	if err != nil {
+		return 0, err
+	}
+	defer res.Close()
+
+	if !res.NextResultSet(ctx) || !res.NextRow() {
+		return 0, res.Err()
+	}
+
+	var count uint64
+	err = res.Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+
+	return int(count), res.Err()
+}
+
 func (s *storageYDB) GetBackupChunkQueueLength(
 	ctx context.Context,
 ) (count uint64, err error) {

@@ -63,7 +63,10 @@ func (t *backupSnapshotDataTask) Run(
 		return err
 	}
 
-	return t.clearCompletedBackupChunkQueueEntries(ctx, snapshotID)
+	return t.clearBackupChunkQueueEntries(
+		ctx,
+		t.storage.ClearCompletedBackupChunkQueueEntries,
+	)
 }
 
 func (t *backupSnapshotDataTask) Cancel(
@@ -71,10 +74,13 @@ func (t *backupSnapshotDataTask) Cancel(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	// TODO(https://github.com/ydb-platform/nbs/issues/7237):
-	// lock the snapshot while its chunks are copied and remove them from
-	// backup_chunk_queue on cancellation.
-	return nil
+	// The objects already written to the follower bucket are left there: the
+	// copy without a chunk map is incomplete, and the objects go away together
+	// with the snapshot.
+	return t.clearBackupChunkQueueEntries(
+		ctx,
+		t.storage.ClearBackupChunkQueueEntries,
+	)
 }
 
 func (t *backupSnapshotDataTask) GetMetadata(
@@ -215,23 +221,23 @@ func (t *backupSnapshotDataTask) waitForChunksBackupCompleted(
 	return nil
 }
 
-func (t *backupSnapshotDataTask) clearCompletedBackupChunkQueueEntries(
+func (t *backupSnapshotDataTask) clearBackupChunkQueueEntries(
 	ctx context.Context,
-	snapshotID string,
+	clearEntries func(
+		ctx context.Context,
+		snapshotID string,
+		limit int,
+	) (int, error),
 ) error {
 
 	for {
-		cleared, err := t.storage.ClearCompletedBackupChunkQueueEntries(
-			ctx,
-			snapshotID,
-			t.batchSize,
-		)
+		cleared, err := clearEntries(ctx, t.request.SnapshotId, t.batchSize)
 		if err != nil {
 			return err
 		}
 
 		// The storage clears fewer than batchSize entries only when no
-		// completed entries are left.
+		// entries to clear are left.
 		if cleared < t.batchSize {
 			return nil
 		}
@@ -282,6 +288,13 @@ func (t *backupSnapshotDataTask) backupChunkMap(
 	data, err := proto.Marshal(chunkMap)
 	if err != nil {
 		return errors.NewNonRetriableError(err)
+	}
+
+	// The chunk map marks the copy as complete, so it is not written for a
+	// snapshot that is being deleted.
+	err = t.storage.CheckSnapshotAlive(ctx, meta.ID)
+	if err != nil {
+		return err
 	}
 
 	err = t.backupS3.PutObject(
