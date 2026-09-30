@@ -163,7 +163,7 @@ func (s *storageYDB) getQueuedChunksToBackup(
 		pragma TablePathPrefix = "%v";
 		declare $limit as Uint64;
 
-		select snapshot_id, chunk_id, stored_in_s3
+		select snapshot_id, chunk_id, stored_in_s3, encrypted_dek
 		from backup_chunk_queue
 		limit $limit
 	`, s.tablesPath),
@@ -182,6 +182,10 @@ func (s *storageYDB) getQueuedChunksToBackup(
 				persistence.OptionalWithDefault("snapshot_id", &entry.SnapshotID),
 				persistence.OptionalWithDefault("chunk_id", &entry.ChunkID),
 				persistence.OptionalWithDefault("stored_in_s3", &entry.StoredInS3),
+				persistence.OptionalWithDefault(
+					"encrypted_dek",
+					&entry.EncryptedDEK,
+				),
 			)
 			if err != nil {
 				return nil, err
@@ -435,7 +439,8 @@ func backupChunkKeyListValue(
 }
 
 func backupChunkQueueEntryStructTypeString() string {
-	return "Struct<snapshot_id: Utf8, chunk_id: Utf8, stored_in_s3: Bool>"
+	return "Struct<snapshot_id: Utf8, chunk_id: Utf8, stored_in_s3: Bool, " +
+		"encrypted_dek: String>"
 }
 
 func backupChunkQueueEntryListValue(
@@ -456,6 +461,10 @@ func backupChunkQueueEntryListValue(
 			persistence.StructFieldValue(
 				"stored_in_s3",
 				persistence.BoolValue(entry.StoredInS3),
+			),
+			persistence.StructFieldValue(
+				"encrypted_dek",
+				persistence.StringValue(entry.EncryptedDEK),
 			),
 		))
 	}

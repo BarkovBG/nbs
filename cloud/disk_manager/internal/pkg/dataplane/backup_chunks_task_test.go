@@ -42,7 +42,12 @@ func TestBackupChunksTask(t *testing.T) {
 	chunkID := createSnapshotWithChunk(t, ctx, storage, "snap1")
 
 	entries := []snapshot_storage.BackupChunkQueueEntry{
-		{SnapshotID: "snap1", ChunkID: chunkID, StoredInS3: true},
+		{
+			SnapshotID:   "snap1",
+			ChunkID:      chunkID,
+			StoredInS3:   true,
+			EncryptedDEK: follower.encryptedDEK,
+		},
 	}
 	err := enqueueBackupChunks(ctx, storage, entries)
 	require.NoError(t, err)
@@ -65,6 +70,12 @@ func TestBackupChunksTask(t *testing.T) {
 	require.Equal(t, src.Data, object.Data)
 	require.Equal(t, *src.Metadata["Checksum"], *object.Metadata["Checksum"])
 
+	raw, err := follower.getRawObject(ctx, backup.ChunkKey(chunkID))
+	require.NoError(t, err)
+	require.NotEqual(t, src.Data, raw.Data)
+	require.Equal(t, "kek1", *raw.Metadata["Key-Id"])
+	require.Equal(t, *src.Metadata["Checksum"], *raw.Metadata["Checksum"])
+
 	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
 	require.NoError(t, err)
 	require.Empty(t, queue)
@@ -81,8 +92,18 @@ func TestBackupChunksTaskCopiesSeveralBatches(t *testing.T) {
 	chunk1 := createSnapshotWithChunk(t, ctx, storage, "snap2")
 
 	entries := []snapshot_storage.BackupChunkQueueEntry{
-		{SnapshotID: "snap1", ChunkID: chunk0, StoredInS3: true},
-		{SnapshotID: "snap2", ChunkID: chunk1, StoredInS3: true},
+		{
+			SnapshotID:   "snap1",
+			ChunkID:      chunk0,
+			StoredInS3:   true,
+			EncryptedDEK: follower.encryptedDEK,
+		},
+		{
+			SnapshotID:   "snap2",
+			ChunkID:      chunk1,
+			StoredInS3:   true,
+			EncryptedDEK: follower.encryptedDEK,
+		},
 	}
 	err := enqueueBackupChunks(ctx, storage, entries)
 	require.NoError(t, err)
@@ -114,13 +135,19 @@ func TestBackupChunksTaskGoesOnPastMissingChunk(t *testing.T) {
 	chunkID := createSnapshotWithChunk(t, ctx, storage, "snap2")
 
 	missing := snapshot_storage.BackupChunkQueueEntry{
-		SnapshotID: "snap1",
-		ChunkID:    "task.snap1.0",
-		StoredInS3: true,
+		SnapshotID:   "snap1",
+		ChunkID:      "task.snap1.0",
+		StoredInS3:   true,
+		EncryptedDEK: follower.encryptedDEK,
 	}
 	entries := []snapshot_storage.BackupChunkQueueEntry{
 		missing,
-		{SnapshotID: "snap2", ChunkID: chunkID, StoredInS3: true},
+		{
+			SnapshotID:   "snap2",
+			ChunkID:      chunkID,
+			StoredInS3:   true,
+			EncryptedDEK: follower.encryptedDEK,
+		},
 	}
 	err := enqueueBackupChunks(ctx, storage, entries)
 	require.NoError(t, err)

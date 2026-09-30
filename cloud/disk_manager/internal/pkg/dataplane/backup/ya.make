@@ -9,6 +9,7 @@ SRCS(
 GO_TEST_SRCS(
     keys_test.go
     meta_test.go
+    s3_test.go
 )
 
 END()
