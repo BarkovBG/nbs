@@ -70,7 +70,8 @@ type imageState struct {
 	encryptionMode    uint32
 	encryptionKeyHash []byte
 
-	status imageStatus
+	backupCompleted bool
+	status          imageStatus
 }
 
 func (s *imageState) toImageMeta() *ImageMeta {
@@ -96,7 +97,8 @@ func (s *imageState) toImageMeta() *ImageMeta {
 				KeyHash: s.encryptionKeyHash,
 			},
 		},
-		Ready: s.status == imageStatusReady,
+		Ready:           s.status == imageStatusReady,
+		BackupCompleted: s.backupCompleted,
 	}
 }
 
@@ -121,6 +123,7 @@ func (s *imageState) structValue() persistence.Value {
 		persistence.StructFieldValue("storage_size", persistence.Uint64Value(s.storageSize)),
 		persistence.StructFieldValue("encryption_mode", persistence.Uint32Value(s.encryptionMode)),
 		persistence.StructFieldValue("encryption_keyhash", persistence.StringValue(s.encryptionKeyHash)),
+		persistence.StructFieldValue("backup_completed", persistence.BoolValue(s.backupCompleted)),
 		persistence.StructFieldValue("status", persistence.Int64Value(int64(s.status))),
 	)
 }
@@ -142,6 +145,7 @@ func scanImageState(res persistence.Result) (state imageState, err error) {
 		persistence.OptionalWithDefault("deleting_at", &state.deletingAt),
 		persistence.OptionalWithDefault("deleted_at", &state.deletedAt),
 		persistence.OptionalWithDefault("use_dataplane_tasks", &state.useDataplaneTasks),
+		persistence.OptionalWithDefault("backup_completed", &state.backupCompleted),
 		persistence.OptionalWithDefault("status", &state.status),
 		persistence.OptionalWithDefault("size", &state.size),
 		persistence.OptionalWithDefault("storage_size", &state.storageSize),
@@ -192,6 +196,7 @@ func imageStateStructTypeString() string {
 		storage_size: Uint64,
 		encryption_mode: Uint32,
 		encryption_keyhash: String,
+		backup_completed: Bool,
 		status: Int64>`
 }
 
@@ -216,6 +221,7 @@ func imageStateTableDescription() persistence.CreateTableDescription {
 		persistence.WithColumn("storage_size", persistence.Optional(persistence.TypeUint64)),
 		persistence.WithColumn("encryption_mode", persistence.Optional(persistence.TypeUint32)),
 		persistence.WithColumn("encryption_keyhash", persistence.Optional(persistence.TypeString)),
+		persistence.WithColumn("backup_completed", persistence.Optional(persistence.TypeBool)),
 		persistence.WithColumn("status", persistence.Optional(persistence.TypeInt64)),
 		persistence.WithPrimaryKeyColumn("id"),
 	)
@@ -886,18 +892,121 @@ func (s *storageYDB) listImages(
 	)
 }
 
+func (s *storageYDB) enqueueImageBackup(
+	ctx context.Context,
+	session *persistence.Session,
+	imageID string,
+	backupID string,
+) error {
+
+	if len(imageID) == 0 || len(backupID) == 0 {
+		return errors.NewNonRetriableErrorf("empty image or backup ID")
+	}
+
+	tx, err := session.BeginRWTransaction(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	res, err := tx.Execute(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $id as Utf8;
+
+		select * from images where id = $id
+	`, s.imagesPath),
+		persistence.ValueParam("$id", persistence.UTF8Value(imageID)),
+	)
+	if err != nil {
+		return err
+	}
+	defer res.Close()
+
+	states, err := scanImageStates(ctx, res)
+	if err != nil {
+		return err
+	}
+	if err = res.Err(); err != nil {
+		return err
+	}
+	if len(states) == 0 {
+		return errors.NewNonRetriableErrorf(
+			"image with id %v is not found",
+			imageID,
+		)
+	}
+
+	state := states[0]
+	if state.status != imageStatusReady {
+		return errors.NewNonRetriableErrorf(
+			"image with id %v and status %v can't be backed up",
+			imageID,
+			imageStatusToString(state.status),
+		)
+	}
+	if state.backupCompleted {
+		return tx.Commit(ctx)
+	}
+
+	queued, err := tx.Execute(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $image_id as Utf8;
+
+		select image_id from backup_queue where image_id = $image_id
+	`, s.imagesPath),
+		persistence.ValueParam(
+			"$image_id",
+			persistence.UTF8Value(imageID),
+		),
+	)
+	if err != nil {
+		return err
+	}
+	defer queued.Close()
+
+	found := queued.NextResultSet(ctx) && queued.NextRow()
+	if err = queued.Err(); err != nil {
+		return err
+	}
+	if found {
+		return tx.Commit(ctx)
+	}
+
+	_, err = tx.Execute(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $image_id as Utf8;
+		declare $backup_id as Utf8;
+
+		upsert into backup_queue (image_id, backup_id)
+		values ($image_id, $backup_id)
+	`, s.imagesPath),
+		persistence.ValueParam(
+			"$image_id",
+			persistence.UTF8Value(imageID),
+		),
+		persistence.ValueParam("$backup_id", persistence.UTF8Value(backupID)),
+	)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (s *storageYDB) listImagesToBackup(
 	ctx context.Context,
 	session *persistence.Session,
 	limit int,
-) ([]string, error) {
+) ([]ImageBackupRequest, error) {
 
 	res, err := session.ExecuteRO(ctx, fmt.Sprintf(`
 		--!syntax_v1
 		pragma TablePathPrefix = "%v";
 		declare $limit as Uint64;
 
-		select image_id
+		select image_id, backup_id
 		from backup_queue
 		limit $limit
 	`, s.imagesPath),
@@ -908,40 +1017,60 @@ func (s *storageYDB) listImagesToBackup(
 	}
 	defer res.Close()
 
-	var ids []string
-
+	var backups []ImageBackupRequest
 	for res.NextResultSet(ctx) {
 		for res.NextRow() {
-			var id string
+			var backup ImageBackupRequest
 			err = res.ScanNamed(
-				persistence.OptionalWithDefault("image_id", &id),
+				persistence.OptionalWithDefault(
+					"image_id",
+					&backup.ImageID,
+				),
+				persistence.OptionalWithDefault("backup_id", &backup.BackupID),
 			)
 			if err != nil {
 				return nil, err
 			}
-
-			ids = append(ids, id)
+			backups = append(backups, backup)
 		}
 	}
-
-	return ids, nil
+	return backups, res.Err()
 }
 
-func (s *storageYDB) removeImageFromBackupQueue(
+func (s *storageYDB) finishImageBackup(
 	ctx context.Context,
 	session *persistence.Session,
 	imageID string,
+	backupID string,
+	completed bool,
 ) error {
 
 	_, err := session.ExecuteRW(ctx, fmt.Sprintf(`
 		--!syntax_v1
 		pragma TablePathPrefix = "%v";
 		declare $image_id as Utf8;
+		declare $backup_id as Utf8;
+		declare $completed as Bool;
+
+		$ids = (
+			select image_id as id from backup_queue
+			where image_id = $image_id
+				and COALESCE(backup_id, "") = $backup_id
+		);
+
+		update images on
+		select id, true as backup_completed from $ids where $completed;
 
 		delete from backup_queue
 		where image_id = $image_id
+			and COALESCE(backup_id, "") = $backup_id
 	`, s.imagesPath),
-		persistence.ValueParam("$image_id", persistence.UTF8Value(imageID)),
+		persistence.ValueParam(
+			"$image_id",
+			persistence.UTF8Value(imageID),
+		),
+		persistence.ValueParam("$backup_id", persistence.UTF8Value(backupID)),
+		persistence.ValueParam("$completed", persistence.BoolValue(completed)),
 	)
 	return err
 }
@@ -1148,33 +1277,54 @@ func (s *storageYDB) ListImages(
 	return ids, err
 }
 
-func (s *storageYDB) ListImagesToBackup(
-	ctx context.Context,
-	limit int,
-) ([]string, error) {
-
-	var ids []string
-
-	err := s.db.Execute(
-		ctx,
-		func(ctx context.Context, session *persistence.Session) error {
-			var err error
-			ids, err = s.listImagesToBackup(ctx, session, limit)
-			return err
-		},
-	)
-	return ids, err
-}
-
-func (s *storageYDB) ImageBackupScheduled(
+func (s *storageYDB) EnqueueImageBackup(
 	ctx context.Context,
 	imageID string,
+	backupID string,
 ) error {
 
 	return s.db.Execute(
 		ctx,
 		func(ctx context.Context, session *persistence.Session) error {
-			return s.removeImageFromBackupQueue(ctx, session, imageID)
+			return s.enqueueImageBackup(ctx, session, imageID, backupID)
+		},
+	)
+}
+
+func (s *storageYDB) ListImagesToBackup(
+	ctx context.Context,
+	limit int,
+) ([]ImageBackupRequest, error) {
+
+	var backups []ImageBackupRequest
+
+	err := s.db.Execute(
+		ctx,
+		func(ctx context.Context, session *persistence.Session) error {
+			var err error
+			backups, err = s.listImagesToBackup(ctx, session, limit)
+			return err
+		},
+	)
+	return backups, err
+}
+
+func (s *storageYDB) ImageBackupScheduled(
+	ctx context.Context,
+	imageID string,
+	backupID string,
+) error {
+
+	return s.db.Execute(
+		ctx,
+		func(ctx context.Context, session *persistence.Session) error {
+			return s.finishImageBackup(
+				ctx,
+				session,
+				imageID,
+				backupID,
+				true,
+			)
 		},
 	)
 }
@@ -1182,12 +1332,19 @@ func (s *storageYDB) ImageBackupScheduled(
 func (s *storageYDB) ImageBackupCancelled(
 	ctx context.Context,
 	imageID string,
+	backupID string,
 ) error {
 
 	return s.db.Execute(
 		ctx,
 		func(ctx context.Context, session *persistence.Session) error {
-			return s.removeImageFromBackupQueue(ctx, session, imageID)
+			return s.finishImageBackup(
+				ctx,
+				session,
+				imageID,
+				backupID,
+				false,
+			)
 		},
 	)
 }
@@ -1267,6 +1424,7 @@ func createImagesYDBTables(
 		folder,
 		"backup_queue",
 		persistence.NewCreateTableDescription(
+			persistence.WithColumn("backup_id", persistence.Optional(persistence.TypeUTF8)),
 			persistence.WithColumn("image_id", persistence.Optional(persistence.TypeUTF8)),
 			persistence.WithPrimaryKeyColumn("image_id"),
 		),

@@ -33,20 +33,26 @@ func (t *scheduleBackupImageTasks) Run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	imageIDs, err := t.storage.ListImagesToBackup(ctx, t.limit)
+	backups, err := t.storage.ListImagesToBackup(ctx, t.limit)
 	if err != nil {
 		return err
 	}
 
-	for _, imageID := range imageIDs {
-		idempotencyKey := fmt.Sprintf("backup_image_%v", imageID)
+	for _, backup := range backups {
+		// Preserve the task key for legacy queue entries. New attempts need a
+		// distinct key so they do not reuse a previously cancelled task.
+		idempotencyKey := fmt.Sprintf("backup_image_%v", backup.ImageID)
+		if len(backup.BackupID) != 0 {
+			idempotencyKey += "_" + backup.BackupID
+		}
 
 		_, err := t.scheduler.ScheduleTask(
 			headers.SetIncomingIdempotencyKey(ctx, idempotencyKey),
 			"images.BackupImage",
 			"",
 			&protos.BackupImageRequest{
-				ImageId: imageID,
+				ImageId:  backup.ImageID,
+				BackupId: backup.BackupID,
 			},
 		)
 		if err != nil {

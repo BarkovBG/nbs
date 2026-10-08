@@ -53,6 +53,7 @@ type ImageMeta struct {
 	Size              uint64                `json:"size"`
 	StorageSize       uint64                `json:"storage_size"`
 	Encryption        *types.EncryptionDesc `json:"encryption"`
+	BackupCompleted   bool                  `json:"backup_completed"`
 	Ready             bool                  `json:"ready"`
 }
 
@@ -125,12 +126,31 @@ type SnapshotBackupID struct {
 	SnapshotID string
 }
 
+type BackupRequest struct {
+	ResourceID string
+	BackupID   string
+}
+
 type SnapshotBackupRequest struct {
 	SnapshotID string
 	BackupID   string
 }
 
+type ImageBackupRequest struct {
+	ImageID  string
+	BackupID string
+}
+
 type Storage interface {
+	EnqueueBackupBatch(
+		ctx context.Context,
+		kind string,
+		afterID string,
+		createdBefore time.Time,
+		limit int,
+		backupID string,
+	) ([]BackupRequest, error)
+
 	// Returns disk if action has been accepted by storage and nil otherwise.
 	CreateDisk(ctx context.Context, disk DiskMeta) (*DiskMeta, error)
 
@@ -192,11 +212,28 @@ type Storage interface {
 		creatingBefore time.Time,
 	) ([]string, error)
 
-	ListImagesToBackup(ctx context.Context, limit int) ([]string, error)
+	EnqueueImageBackup(
+		ctx context.Context,
+		imageID string,
+		backupID string,
+	) error
 
-	ImageBackupScheduled(ctx context.Context, imageID string) error
+	ListImagesToBackup(
+		ctx context.Context,
+		limit int,
+	) ([]ImageBackupRequest, error)
 
-	ImageBackupCancelled(ctx context.Context, imageID string) error
+	ImageBackupScheduled(
+		ctx context.Context,
+		imageID string,
+		backupID string,
+	) error
+
+	ImageBackupCancelled(
+		ctx context.Context,
+		imageID string,
+		backupID string,
+	) error
 
 	GetImageBackupDeleteQueue(ctx context.Context, limit int) ([]string, error)
 

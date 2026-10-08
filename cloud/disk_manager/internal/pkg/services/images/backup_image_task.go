@@ -14,7 +14,6 @@ import (
 	"github.com/ydb-platform/nbs/cloud/tasks"
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
 	"github.com/ydb-platform/nbs/cloud/tasks/headers"
-	"github.com/ydb-platform/nbs/cloud/tasks/persistence"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -22,7 +21,6 @@ import (
 type backupImageTask struct {
 	scheduler tasks.Scheduler
 	storage   resources.Storage
-	backupS3  *backup.S3
 	request   *protos.BackupImageRequest
 	state     *protos.BackupImageTaskState
 }
@@ -47,73 +45,92 @@ func (t *backupImageTask) Run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	imageID := t.request.ImageId
+	if len(t.state.DataplaneTaskID) == 0 {
+		if t.state.DataplaneRequest == nil {
+			meta, err := t.storage.GetImageMeta(ctx, t.request.ImageId)
+			if err != nil {
+				return err
+			}
+			if meta == nil || !meta.Ready {
+				return t.storage.ImageBackupCancelled(
+					ctx,
+					t.request.ImageId,
+					t.request.BackupId,
+				)
+			}
+			imageMeta, err := backup.NewImageMeta(*meta)
+			if err != nil {
+				return err
+			}
+			data, err := json.Marshal(imageMeta)
+			if err != nil {
+				return errors.NewNonRetriableError(err)
+			}
+			t.state.DataplaneRequest = &dataplane_protos.BackupSnapshotDataRequest{
+				SnapshotId: t.request.ImageId,
+				MetaKey:    backup.ImageMetaKey(t.request.ImageId),
+				Meta:       data,
+			}
+			// Persist the exact request before scheduling. Cancel can then recover
+			// the child even if scheduling succeeds but saving its ID fails.
+			err = execCtx.SaveState(ctx)
+			if err != nil {
+				return err
+			}
+		}
+		err := t.scheduleDataplaneTask(ctx, execCtx)
+		if err != nil {
+			return err
+		}
+	}
 
-	meta, err := t.storage.GetImageMeta(ctx, imageID)
+	_, err := t.scheduler.WaitTask(ctx, execCtx, t.state.DataplaneTaskID)
 	if err != nil {
 		return err
 	}
-
-	if meta == nil || !meta.Ready {
-		return t.storage.ImageBackupCancelled(ctx, imageID)
-	}
-
-	imageMeta, err := backup.NewImageMeta(*meta)
-	if err != nil {
-		return err
-	}
-
-	data, err := json.Marshal(imageMeta)
-	if err != nil {
-		return errors.NewNonRetriableError(err)
-	}
-
-	err = t.backupS3.PutObject(
+	return t.storage.ImageBackupScheduled(
 		ctx,
-		backup.ImageMetaKey(imageID),
-		persistence.S3Object{Data: data},
+		t.request.ImageId,
+		t.request.BackupId,
 	)
-	if err != nil {
-		return err
-	}
-
-	idempotencyKey := fmt.Sprintf("%v_%v_backup", execCtx.GetTaskID(), imageID)
-
-	taskID, err := t.scheduler.ScheduleTask(
-		headers.SetIncomingIdempotencyKey(ctx, idempotencyKey),
-		"dataplane.BackupSnapshotData",
-		"",
-		&dataplane_protos.BackupSnapshotDataRequest{
-			SnapshotId: imageID,
-		},
-	)
-	if err != nil {
-		return err
-	}
-
-	t.state.DataplaneTaskID = taskID
-
-	err = execCtx.SaveState(ctx)
-	if err != nil {
-		return err
-	}
-
-	_, err = t.scheduler.WaitTask(ctx, execCtx, taskID)
-	if err != nil {
-		return err
-	}
-
-	return t.storage.ImageBackupScheduled(ctx, imageID)
 }
 
 func (t *backupImageTask) Cancel(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
-) error {
+) (err error) {
 
-	// TODO(https://github.com/ydb-platform/nbs/issues/7237):
-	// roll back the objects already written to the follower bucket.
-	return t.storage.ImageBackupCancelled(ctx, t.request.ImageId)
+	// Cancellation must not be marked complete while cleanup has failed.
+	defer func() {
+		if err != nil && !errors.Is(err, errors.NewInterruptExecutionError()) {
+			err = errors.NewRetriableErrorf("failed to cancel snapshot backup: %v", err)
+		}
+	}()
+
+	if len(t.state.DataplaneTaskID) == 0 && t.state.DataplaneRequest != nil {
+		err := t.scheduleDataplaneTask(ctx, execCtx)
+		if err != nil {
+			return err
+		}
+	}
+	if len(t.state.DataplaneTaskID) != 0 {
+		_, err := t.scheduler.CancelTask(ctx, t.state.DataplaneTaskID)
+		if err != nil {
+			return err
+		}
+		err = t.scheduler.WaitTaskEnded(ctx, t.state.DataplaneTaskID)
+		if err != nil {
+			return err
+		}
+	}
+
+	// DP preserves a pending chunk map for deletion to clean up interrupted
+	// copies. Shared chunks remain available to live source resources.
+	return t.storage.ImageBackupCancelled(
+		ctx,
+		t.request.ImageId,
+		t.request.BackupId,
+	)
 }
 
 func (t *backupImageTask) GetMetadata(
@@ -125,4 +142,25 @@ func (t *backupImageTask) GetMetadata(
 
 func (t *backupImageTask) GetResponse() proto.Message {
 	return &empty.Empty{}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+func (t *backupImageTask) scheduleDataplaneTask(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
+
+	key := fmt.Sprintf("%v_%v_backup", execCtx.GetTaskID(), t.request.ImageId)
+	taskID, err := t.scheduler.ScheduleTask(
+		headers.SetIncomingIdempotencyKey(ctx, key),
+		"dataplane.BackupSnapshotData",
+		"",
+		t.state.DataplaneRequest,
+	)
+	if err != nil {
+		return err
+	}
+	t.state.DataplaneTaskID = taskID
+	return execCtx.SaveState(ctx)
 }

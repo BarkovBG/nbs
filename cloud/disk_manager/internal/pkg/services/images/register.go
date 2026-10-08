@@ -110,7 +110,6 @@ func RegisterForExecution(
 			return &backupImageTask{
 				scheduler: taskScheduler,
 				storage:   storage,
-				backupS3:  backupS3,
 			}
 		})
 		if err != nil {

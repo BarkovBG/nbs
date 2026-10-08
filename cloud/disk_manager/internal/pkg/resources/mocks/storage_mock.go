@@ -164,30 +164,42 @@ func (s *StorageMock) ListImages(
 	return args.Get(0).([]string), args.Error(1)
 }
 
+func (s *StorageMock) EnqueueImageBackup(
+	ctx context.Context,
+	imageID string,
+	backupID string,
+) error {
+
+	args := s.Called(ctx, imageID, backupID)
+	return args.Error(0)
+}
+
 func (s *StorageMock) ListImagesToBackup(
 	ctx context.Context,
 	limit int,
-) ([]string, error) {
+) ([]resources.ImageBackupRequest, error) {
 
 	args := s.Called(ctx, limit)
-	return args.Get(0).([]string), args.Error(1)
+	return args.Get(0).([]resources.ImageBackupRequest), args.Error(1)
 }
 
 func (s *StorageMock) ImageBackupScheduled(
 	ctx context.Context,
 	imageID string,
+	backupID string,
 ) error {
 
-	args := s.Called(ctx, imageID)
+	args := s.Called(ctx, imageID, backupID)
 	return args.Error(0)
 }
 
 func (s *StorageMock) ImageBackupCancelled(
 	ctx context.Context,
 	imageID string,
+	backupID string,
 ) error {
 
-	args := s.Called(ctx, imageID)
+	args := s.Called(ctx, imageID, backupID)
 	return args.Error(0)
 }
 
@@ -648,4 +660,17 @@ func NewStorageMock() *StorageMock {
 // Ensure that StorageMock implements resources.Storage.
 func assertStorageMockIsStorage(arg *StorageMock) resources.Storage {
 	return arg
+}
+
+func (s *StorageMock) EnqueueBackupBatch(
+	ctx context.Context,
+	kind string,
+	afterID string,
+	createdBefore time.Time,
+	limit int,
+	backupID string,
+) ([]resources.BackupRequest, error) {
+
+	args := s.Called(ctx, kind, afterID, createdBefore, limit, backupID)
+	return args.Get(0).([]resources.BackupRequest), args.Error(1)
 }

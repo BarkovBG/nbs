@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources"
 	resources_mocks "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources/mocks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/images/protos"
 	"github.com/ydb-platform/nbs/cloud/tasks/headers"
@@ -26,21 +27,32 @@ func TestScheduleBackupImageTasks(t *testing.T) {
 	execCtx := tasks_mocks.NewExecutionContextMock()
 
 	storage.On("ListImagesToBackup", mock.Anything, 2).Return(
-		[]string{"image1", "image2"},
+		[]resources.ImageBackupRequest{
+			{ImageID: "snap1"},
+			{ImageID: "snap2", BackupID: "attempt"},
+		},
 		nil,
 	)
 
-	for _, imageID := range []string{"image1", "image2"} {
-		id := imageID
+	for _, backup := range []resources.ImageBackupRequest{
+		{ImageID: "snap1"},
+		{ImageID: "snap2", BackupID: "attempt"},
+	} {
+		id := backup.ImageID
+		backupID := backup.BackupID
+		key := "backup_image_" + id
+		if backupID != "" {
+			key += "_" + backupID
+		}
 		scheduler.On(
 			"ScheduleTask",
 			mock.MatchedBy(func(ctx context.Context) bool {
-				return headers.GetIdempotencyKey(ctx) == "backup_image_"+id
+				return headers.GetIdempotencyKey(ctx) == key
 			}),
 			"images.BackupImage",
 			"",
 			mock.MatchedBy(func(request *protos.BackupImageRequest) bool {
-				return request.ImageId == id
+				return request.ImageId == id && request.BackupId == backupID
 			}),
 		).Return(id+"_task", nil)
 	}

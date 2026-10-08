@@ -1,6 +1,7 @@
 GO_LIBRARY()
 
 SRCS(
+    backup.go
     common.go
     disks.go
     filesystems.go
@@ -12,6 +13,7 @@ SRCS(
 )
 
 GO_TEST_SRCS(
+    backup_test.go
     common_test.go
     disks_test.go
     filesystems_test.go
