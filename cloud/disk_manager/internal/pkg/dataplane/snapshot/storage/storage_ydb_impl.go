@@ -1665,6 +1665,7 @@ func (s *storageYDB) enqueueBackupChunks(
 	for _, entry := range entries {
 		if !found.Has(entry.ChunkID) {
 			toEnqueue = append(toEnqueue, entry)
+			found.Add(entry.ChunkID)
 		}
 	}
 
@@ -2096,4 +2097,29 @@ func (s *storageYDB) DrainSnapshotBackup(
 		return task_errors.NewInterruptExecutionError()
 	}
 	return nil
+}
+
+func (s *storageYDB) HasQueuedChunksToBackup(
+	ctx context.Context,
+	snapshotID string,
+) (pending bool, err error) {
+
+	defer s.metrics.StatOperation("HasQueuedChunksToBackup")(&err)
+
+	res, err := s.db.ExecuteRO(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $snapshot_id as Utf8;
+
+		select chunk_id from backup_chunk_queue
+		where snapshot_id = $snapshot_id limit 1;
+	`, s.tablesPath),
+		persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)),
+	)
+	if err != nil {
+		return false, err
+	}
+	defer res.Close()
+	pending = res.NextResultSet(ctx) && res.NextRow()
+	return pending, res.Err()
 }

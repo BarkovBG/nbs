@@ -130,8 +130,8 @@ func (t *backupSnapshotTask) Cancel(
 		}
 	}
 
-	// TODO(https://github.com/ydb-platform/nbs/issues/7237):
-	// roll back the objects already written to the follower bucket.
+	// DP preserves a pending chunk map for deletion to clean up interrupted
+	// copies. Shared chunks remain available to live source resources.
 	return t.storage.SnapshotBackupCancelled(
 		ctx,
 		t.request.SnapshotId,

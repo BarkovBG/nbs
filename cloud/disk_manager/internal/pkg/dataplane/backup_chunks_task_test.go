@@ -1,17 +1,24 @@
 package dataplane
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/backup"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/protos"
 	snapshot_storage "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/chunks"
+	storage_mocks "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/mocks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/test"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/monitoring/metrics"
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
 	"github.com/ydb-platform/nbs/cloud/tasks/mocks"
+	"github.com/ydb-platform/nbs/cloud/tasks/persistence"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -179,4 +186,29 @@ func TestBackupChunksTaskRecoversClaimsAfterRestart(t *testing.T) {
 	require.NoError(t, storage.DrainSnapshotBackup(ctx, "snap1", "backup", 10))
 	_, err = follower.getObject(ctx, backup.ChunkKey(chunkID))
 	require.Error(t, err)
+}
+
+func TestBackupChunksTaskChecksFollowerBeforeReadingSource(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusForbidden, http.StatusServiceUnavailable} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodHead, r.Method)
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+			client, err := persistence.NewS3Client(server.URL, "region", persistence.NewS3Credentials("test", "test"), time.Second, metrics.NewEmptyRegistry(), 0, nil, nil)
+			require.NoError(t, err)
+			storage := storage_mocks.NewStorageMock()
+			task := &backupChunksTask{storage: storage, backupS3: backup.NewS3(client, "bucket", "prefix"), registry: metrics.NewEmptyRegistry()}
+			err = task.copyChunk(test.NewContext(), snapshot_storage.BackupChunkQueueEntry{SnapshotID: "snapshot", ChunkID: "chunk"})
+			if status == http.StatusOK {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+			// No expectations: any source read would fail this test. Errors on
+			// HEAD must also prevent reads/PUT and completion of the queue entry.
+			storage.AssertExpectations(t)
+		})
+	}
 }

@@ -133,6 +133,14 @@ func (t *backupChunksTask) copyChunk(
 	entry storage.BackupChunkQueueEntry,
 ) error {
 
+	exists, err := t.backupS3.ObjectExists(ctx, backup.ChunkKey(entry.ChunkID))
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+
 	chunkBlob, err := t.storage.ReadChunkBlob(
 		ctx,
 		entry.ChunkID,

@@ -13,6 +13,7 @@ import (
 	storage_protos "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/protos"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/test"
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
+	"github.com/ydb-platform/nbs/cloud/tasks/mocks"
 	"github.com/ydb-platform/nbs/cloud/tasks/persistence"
 )
 
@@ -201,4 +202,31 @@ func TestDeleteBackupSnapshotDataTaskDeletesMissingChunk(t *testing.T) {
 
 	_, err = follower.getObject(ctx, backup.ChunkMapKey("snap1"))
 	require.Error(t, err)
+}
+
+func TestDeleteBackupSnapshotDataTaskCleansCancelledCopy(t *testing.T) {
+	ctx := test.NewContext()
+	storage, closeFunc := newStorage(t, ctx)
+	defer closeFunc()
+	follower := newTestFollower(t, ctx)
+	chunkID := createSnapshotWithChunk(t, ctx, storage, "snapshot")
+	copyTask := newBackupSnapshotDataTask(storage, follower, "snapshot")
+	execCtx := newBackupExecutionContext(ctx)
+	err := copyTask.Run(ctx, execCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	workerCtx := mocks.NewExecutionContextMock()
+	workerCtx.On("GetTaskID").Return("worker")
+	err = newBackupChunksTask(storage, follower).Run(ctx, workerCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	require.NoError(t, copyTask.Cancel(ctx, execCtx))
+	_, err = follower.getObject(ctx, backup.ChunkMapKey("snapshot"))
+	require.Error(t, err)
+	_, err = follower.getObject(ctx, backup.PendingChunkMapKey("snapshot"))
+	require.NoError(t, err)
+	finishSnapshotDeletion(t, ctx, storage, "snapshot")
+	require.NoError(t, newDeleteBackupSnapshotDataTask(storage, follower, "snapshot").Run(ctx, execCtx))
+	for _, key := range []string{backup.ChunkKey(chunkID), backup.PendingChunkMapKey("snapshot")} {
+		_, err = follower.getObject(ctx, key)
+		require.Error(t, err)
+	}
 }

@@ -2,6 +2,7 @@ package dataplane
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/golang/protobuf/proto"
@@ -224,7 +225,6 @@ func TestBackupSnapshotDataTask(t *testing.T) {
 
 	err = task.Run(ctx, execCtx)
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
-	require.EqualValues(t, 1, task.state.EnqueuedChunkCount)
 
 	err = storage.ChunksBackupCompleted(ctx, queue)
 	require.NoError(t, err)
@@ -257,7 +257,7 @@ func TestBackupSnapshotDataTask(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestBackupSnapshotDataTaskEnqueuesOnlyOwnChunks(t *testing.T) {
+func TestBackupSnapshotDataTaskBacksUpInheritedChunksAfterCreatorDeletion(t *testing.T) {
 	ctx := test.NewContext()
 
 	storage, closeFunc := newStorage(t, ctx)
@@ -336,29 +336,55 @@ func TestBackupSnapshotDataTaskEnqueuesOnlyOwnChunks(t *testing.T) {
 	)
 	require.NoError(t, err)
 
+	// C inherits both A's and B's chunks. Neither ancestor has a backup,
+	// and both may disappear before backfilling C.
+	_, err = storage.CreateSnapshot(ctx, snapshot_storage.SnapshotMeta{
+		ID: "snap3", Disk: disk, CheckpointID: "checkpoint3",
+	})
+	require.NoError(t, err)
+	for index, id := range []string{chunk0, chunk1} {
+		require.NoError(t, storage.ShallowCopyChunk(ctx, snapshot_storage.ChunkMapEntry{
+			ChunkIndex: uint32(index), ChunkID: id, StoredInS3: true,
+		}, "snap3"))
+	}
+	require.NoError(t, storage.SnapshotCreated(ctx, "snap3", 8192, 8192, 2, nil))
+	finishSnapshotDeletion(t, ctx, storage, "snap1")
+	finishSnapshotDeletion(t, ctx, storage, "snap2")
+
 	execCtx := newBackupExecutionContext(ctx)
-	task := newBackupSnapshotDataTask(storage, follower, "snap2")
+	task := newBackupSnapshotDataTask(storage, follower, "snap3")
 
 	err = task.Run(ctx, execCtx)
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 
 	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
 	require.NoError(t, err)
-	require.Equal(
+	require.ElementsMatch(
 		t,
 		[]snapshot_storage.BackupChunkQueueEntry{
-			{SnapshotID: "snap2", ChunkID: chunk1, StoredInS3: true},
+			{SnapshotID: "snap3", ChunkID: chunk0, StoredInS3: true},
+			{SnapshotID: "snap3", ChunkID: chunk1, StoredInS3: true},
 		},
 		queue,
 	)
 
-	err = storage.ChunksBackupCompleted(ctx, queue)
-	require.NoError(t, err)
+	workerCtx := mocks.NewExecutionContextMock()
+	workerCtx.On("GetTaskID").Return("worker")
+	err = newBackupChunksTask(storage, follower).Run(ctx, workerCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	for _, id := range []string{chunk0, chunk1} {
+		object, err := follower.getObject(ctx, backup.ChunkKey(id))
+		require.NoError(t, err)
+		blob, err := storage.ReadChunkBlob(ctx, id, true)
+		require.NoError(t, err)
+		require.Equal(t, blob.Data, object.Data)
+		require.Equal(t, *chunks.NewS3Object(blob).Metadata["Checksum"], *object.Metadata["Checksum"])
+	}
 
 	err = task.Run(ctx, execCtx)
 	require.NoError(t, err)
 
-	chunkMap := readBackupChunkMap(t, ctx, follower, "snap2")
+	chunkMap := readBackupChunkMap(t, ctx, follower, "snap3")
 	require.Equal(t, []string{chunk0, chunk1}, chunkMap.ChunkIds)
 }
 
@@ -410,7 +436,6 @@ func TestBackupSnapshotDataTaskEnqueuesInBatches(t *testing.T) {
 
 	err = task.Run(ctx, execCtx)
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
-	require.EqualValues(t, 2, task.state.EnqueuedChunkCount)
 	require.EqualValues(t, 2, task.state.MilestoneChunkIndex)
 
 	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
@@ -436,7 +461,6 @@ func TestBackupSnapshotDataTaskEnqueuesInBatches(t *testing.T) {
 	resumed := newBackupSnapshotDataTask(storage, follower, "snap1")
 	resumed.batchSize = 1
 	resumed.state.MilestoneChunkIndex = 1
-	resumed.state.EnqueuedChunkCount = 1
 
 	for i := 0; i < 2; i++ {
 		err = resumed.Run(ctx, execCtx)
@@ -444,7 +468,6 @@ func TestBackupSnapshotDataTaskEnqueuesInBatches(t *testing.T) {
 	}
 	err = resumed.Run(ctx, execCtx)
 	require.NoError(t, err)
-	require.EqualValues(t, 2, resumed.state.EnqueuedChunkCount)
 
 	queue, err = storage.GetQueuedChunksToBackup(ctx, 10)
 	require.NoError(t, err)
@@ -582,7 +605,7 @@ func TestBackupSnapshotDataTaskFailsOnChunkIndexOutOfRange(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestBackupSnapshotDataTaskEnqueuesNothingForShallowCopy(t *testing.T) {
+func TestBackupSnapshotDataTaskBacksUpShallowCopyWithoutCreatorBackup(t *testing.T) {
 	ctx := test.NewContext()
 
 	storage, closeFunc := newStorage(t, ctx)
@@ -591,8 +614,7 @@ func TestBackupSnapshotDataTaskEnqueuesNothingForShallowCopy(t *testing.T) {
 	follower := newTestFollower(t, ctx)
 	chunk0 := createSnapshotWithChunk(t, ctx, storage, "snap1")
 
-	// An image made from a snapshot owns no chunks, all of them are copied by
-	// the backup of that snapshot.
+	// The source has never been backed up. The image must copy its data itself.
 	_, err := storage.CreateSnapshot(
 		ctx,
 		snapshot_storage.SnapshotMeta{ID: "image1"},
@@ -624,6 +646,13 @@ func TestBackupSnapshotDataTaskEnqueuesNothingForShallowCopy(t *testing.T) {
 	task := newBackupSnapshotDataTask(storage, follower, "image1")
 
 	err = task.Run(ctx, execCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	workerCtx := mocks.NewExecutionContextMock()
+	workerCtx.On("GetTaskID").Return("worker")
+	err = newBackupChunksTask(storage, follower).Run(ctx, workerCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	require.NoError(t, task.Run(ctx, execCtx))
+	_, err = follower.getObject(ctx, backup.ChunkKey(chunk0))
 	require.NoError(t, err)
 
 	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
@@ -706,4 +735,45 @@ func TestBackupSnapshotDataTaskCancellationRetriesCleanupErrors(t *testing.T) {
 	require.False(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
 	storage.AssertNotCalled(t, "ReleaseSnapshotForBackup", mock.Anything, "snap1", "backup")
 	storage.AssertExpectations(t)
+}
+
+func TestBackupSnapshotDataTaskHandlesRepeatedChunkIDs(t *testing.T) {
+	for _, batchSize := range []int{1, 1000} {
+		t.Run(fmt.Sprint(batchSize), func(t *testing.T) {
+			ctx := test.NewContext()
+			storage, closeFunc := newStorage(t, ctx)
+			defer closeFunc()
+			follower := newTestFollower(t, ctx)
+			chunkID := createSnapshotWithChunk(t, ctx, storage, "source")
+			_, err := storage.CreateSnapshot(ctx, snapshot_storage.SnapshotMeta{ID: "copy"})
+			require.NoError(t, err)
+			for index := uint32(0); index < 2; index++ {
+				require.NoError(t, storage.ShallowCopyChunk(ctx, snapshot_storage.ChunkMapEntry{
+					ChunkIndex: index, ChunkID: chunkID, StoredInS3: true,
+				}, "copy"))
+			}
+			require.NoError(t, storage.SnapshotCreated(ctx, "copy", 12288, 8192, 3, nil))
+			task := newBackupSnapshotDataTask(storage, follower, "copy")
+			task.batchSize = batchSize
+			execCtx := newBackupExecutionContext(ctx)
+			err = task.Run(ctx, execCtx)
+			require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+			queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
+			require.NoError(t, err)
+			require.Len(t, queue, 1)
+			workerCtx := mocks.NewExecutionContextMock()
+			workerCtx.On("GetTaskID").Return("worker")
+			err = newBackupChunksTask(storage, follower).Run(ctx, workerCtx)
+			require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+			for i := 0; i < 3; i++ {
+				err = task.Run(ctx, execCtx)
+				if err == nil {
+					break
+				}
+				require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+			}
+			require.NoError(t, err)
+			require.Equal(t, []string{chunkID, chunkID, ""}, readBackupChunkMap(t, ctx, follower, "copy").ChunkIds)
+		})
+	}
 }

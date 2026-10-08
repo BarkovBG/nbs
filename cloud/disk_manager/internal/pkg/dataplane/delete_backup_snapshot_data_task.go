@@ -65,7 +65,11 @@ func (t *deleteBackupSnapshotDataTask) Run(
 		return err
 	}
 
-	return t.backupS3.DeleteChunkMap(ctx, snapshotID)
+	err = t.backupS3.DeleteChunkMap(ctx, snapshotID)
+	if err != nil {
+		return err
+	}
+	return t.backupS3.DeleteObject(ctx, backup.PendingChunkMapKey(snapshotID))
 }
 
 func (t *deleteBackupSnapshotDataTask) Cancel(
@@ -96,9 +100,10 @@ func (t *deleteBackupSnapshotDataTask) readChunkIDs(
 
 	object, err := t.backupS3.GetObject(ctx, backup.ChunkMapKey(snapshotID))
 	if errors.As(err, &persistence.ObjectNotFoundError{}) {
-		// No chunk map: the snapshot was not backed up, or a previous
-		// attempt already removed the map after the chunks.
-		return nil, nil
+		object, err = t.backupS3.GetObject(ctx, backup.PendingChunkMapKey(snapshotID))
+		if errors.As(err, &persistence.ObjectNotFoundError{}) {
+			return nil, nil
+		}
 	}
 
 	if err != nil {

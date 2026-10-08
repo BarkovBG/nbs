@@ -206,6 +206,8 @@ type Storage interface {
 		limit int,
 	) error
 
+	HasQueuedChunksToBackup(ctx context.Context, snapshotID string) (bool, error)
+
 	GetBackedUpChunkCount(
 		ctx context.Context,
 		snapshotID string,
