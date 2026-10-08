@@ -2099,27 +2099,77 @@ func (s *storageYDB) DrainSnapshotBackup(
 	return nil
 }
 
-func (s *storageYDB) HasQueuedChunksToBackup(
+func (s *storageYDB) CheckBackupChunksCompleted(
 	ctx context.Context,
 	snapshotID string,
-) (pending bool, err error) {
+) (err error) {
 
-	defer s.metrics.StatOperation("HasQueuedChunksToBackup")(&err)
+	defer s.metrics.StatOperation("CheckBackupChunksCompleted")(&err)
 
+	// Read failure and pending status together: checking them separately can
+	// miss a failure committed between the two reads and publish an incomplete map.
 	res, err := s.db.ExecuteRO(ctx, fmt.Sprintf(`
 		--!syntax_v1
 		pragma TablePathPrefix = "%v";
 		declare $snapshot_id as Utf8;
+		declare $completed as Int64;
 
-		select chunk_id from backup_chunk_queue
-		where snapshot_id = $snapshot_id limit 1;
+		select chunk_id, status from backup_chunks
+		where snapshot_id = $snapshot_id and status != $completed
+		order by status desc limit 1;
 	`, s.tablesPath),
 		persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)),
+		persistence.ValueParam("$completed", persistence.Int64Value(int64(backupChunkStatusCompleted))),
 	)
 	if err != nil {
-		return false, err
+		return err
 	}
 	defer res.Close()
-	pending = res.NextResultSet(ctx) && res.NextRow()
-	return pending, res.Err()
+	if !res.NextResultSet(ctx) || !res.NextRow() {
+		return res.Err()
+	}
+	var chunkID string
+	var status int64
+	err = res.ScanNamed(
+		persistence.OptionalWithDefault("chunk_id", &chunkID),
+		persistence.OptionalWithDefault("status", &status),
+	)
+	if err != nil {
+		return err
+	}
+	if res.Err() != nil {
+		return res.Err()
+	}
+	if status == int64(backupChunkStatusFailed) {
+		return task_errors.NewNonRetriableErrorf("failed to back up chunk %v of snapshot %v", chunkID, snapshotID)
+	}
+	return task_errors.NewInterruptExecutionError()
+}
+
+func (s *storageYDB) ChunkBackupFailed(
+	ctx context.Context,
+	entry BackupChunkQueueEntry,
+) (err error) {
+
+	defer s.metrics.StatOperation("ChunkBackupFailed")(&err)
+
+	_, err = s.db.ExecuteRW(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $snapshot_id as Utf8;
+		declare $chunk_id as Utf8;
+		declare $failed as Int64;
+		declare $completed as Int64;
+
+		update backup_chunks set status = $failed
+		where snapshot_id = $snapshot_id and chunk_id = $chunk_id and status != $completed;
+		delete from backup_chunk_queue
+		where snapshot_id = $snapshot_id and chunk_id = $chunk_id;
+	`, s.tablesPath),
+		persistence.ValueParam("$snapshot_id", persistence.UTF8Value(entry.SnapshotID)),
+		persistence.ValueParam("$chunk_id", persistence.UTF8Value(entry.ChunkID)),
+		persistence.ValueParam("$failed", persistence.Int64Value(int64(backupChunkStatusFailed))),
+		persistence.ValueParam("$completed", persistence.Int64Value(int64(backupChunkStatusCompleted))),
+	)
+	return err
 }

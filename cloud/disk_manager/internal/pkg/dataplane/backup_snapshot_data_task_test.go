@@ -777,3 +777,40 @@ func TestBackupSnapshotDataTaskHandlesRepeatedChunkIDs(t *testing.T) {
 		})
 	}
 }
+
+type failingBackupChunkStorage struct {
+	snapshot_storage.Storage
+}
+
+func (s failingBackupChunkStorage) ReadChunkBlob(
+	ctx context.Context,
+	chunkID string,
+	storedInS3 bool,
+) (chunks.ChunkBlob, error) {
+
+	return chunks.ChunkBlob{}, errors.NewNonRetriableErrorf("source chunk is corrupt")
+}
+
+func TestBackupSnapshotDataTaskFailsAndReleasesHoldOnPermanentChunkError(t *testing.T) {
+	ctx := test.NewContext()
+	storage, closeFunc := newStorage(t, ctx)
+	defer closeFunc()
+	follower := newTestFollower(t, ctx)
+	createSnapshotWithChunk(t, ctx, storage, "snapshot")
+	task := newBackupSnapshotDataTask(storage, follower, "snapshot")
+	execCtx := newBackupExecutionContext(ctx)
+	err := task.Run(ctx, execCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	workerCtx := mocks.NewExecutionContextMock()
+	workerCtx.On("GetTaskID").Return("worker")
+	worker := newBackupChunksTask(failingBackupChunkStorage{Storage: storage}, follower)
+	err = worker.Run(ctx, workerCtx)
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+	err = task.Run(ctx, execCtx)
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+	_, err = follower.getObject(ctx, backup.ChunkMapKey("snapshot"))
+	require.Error(t, err)
+	require.NoError(t, task.Cancel(ctx, execCtx))
+	_, err = storage.DeletingSnapshot(ctx, "snapshot", "delete")
+	require.NoError(t, err)
+}

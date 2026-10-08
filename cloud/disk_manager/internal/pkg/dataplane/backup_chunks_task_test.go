@@ -145,18 +145,18 @@ func TestBackupChunksTaskGoesOnPastMissingChunk(t *testing.T) {
 
 	err = task.Run(ctx, execCtx)
 	require.Error(t, err)
-	require.False(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 
 	_, err = follower.getObject(ctx, backup.ChunkKey(chunkID))
 	require.NoError(t, err)
 
 	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
 	require.NoError(t, err)
-	require.Equal(
-		t,
-		[]snapshot_storage.BackupChunkQueueEntry{missing},
-		queue,
-	)
+	require.Empty(t, queue)
+	err = storage.CheckBackupChunksCompleted(ctx, "snap1")
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+	require.NoError(t, storage.CheckBackupChunksCompleted(ctx, "snap2"))
+
 }
 
 func TestBackupChunksTaskRecoversClaimsAfterRestart(t *testing.T) {

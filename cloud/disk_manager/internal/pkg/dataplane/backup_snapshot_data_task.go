@@ -257,21 +257,11 @@ func (t *backupSnapshotDataTask) waitForChunksBackupCompleted(
 	snapshotID string,
 ) error {
 
-	pending, err := t.storage.HasQueuedChunksToBackup(ctx, snapshotID)
-	if err != nil {
-		return err
+	err := t.storage.CheckBackupChunksCompleted(ctx, snapshotID)
+	if errors.Is(err, errors.NewInterruptExecutionError()) {
+		logging.Debug(ctx, "Backup of snapshot with id %v is waiting for its chunks to finish backing up", snapshotID)
 	}
-
-	if pending {
-		logging.Debug(
-			ctx,
-			"Backup of snapshot with id %v is waiting for its chunks to finish backing up",
-			snapshotID,
-		)
-		return errors.NewInterruptExecutionError()
-	}
-
-	return nil
+	return err
 }
 
 func (t *backupSnapshotDataTask) prepareChunkMap(

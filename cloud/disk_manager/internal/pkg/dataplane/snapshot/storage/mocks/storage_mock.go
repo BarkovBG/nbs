@@ -388,11 +388,10 @@ func (s *StorageMock) DrainSnapshotBackup(
 	return s.Called(ctx, snapshotID, taskID, limit).Error(0)
 }
 
-func (s *StorageMock) HasQueuedChunksToBackup(
-	ctx context.Context,
-	snapshotID string,
-) (bool, error) {
+func (s *StorageMock) CheckBackupChunksCompleted(ctx context.Context, snapshotID string) error {
+	return s.Called(ctx, snapshotID).Error(0)
+}
 
-	args := s.Called(ctx, snapshotID)
-	return args.Bool(0), args.Error(1)
+func (s *StorageMock) ChunkBackupFailed(ctx context.Context, entry storage.BackupChunkQueueEntry) error {
+	return s.Called(ctx, entry).Error(0)
 }

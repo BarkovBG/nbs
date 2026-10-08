@@ -200,11 +200,17 @@ func (t *backupChunksTask) copyChunks(
 				if err != nil {
 					logging.Warn(
 						groupCtx,
-						"Failed to copy chunk %v of snapshot %v, will retry: %v",
+						"Failed to copy chunk %v of snapshot %v: %v",
 						entry.ChunkID,
 						entry.SnapshotID,
 						err,
 					)
+					if errors.Is(err, errors.NewEmptyNonRetriableError()) {
+						markErr := t.storage.ChunkBackupFailed(groupCtx, entry)
+						if markErr != nil {
+							err = markErr
+						}
+					}
 					copyErrors <- err
 					continue
 				}

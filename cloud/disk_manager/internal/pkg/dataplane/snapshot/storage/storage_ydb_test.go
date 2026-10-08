@@ -2268,3 +2268,26 @@ func TestClaimBackupChunksRacesWithDrain(t *testing.T) {
 		require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, id, "backup"))
 	}
 }
+
+func TestBackupChunkFailureDoesNotOverwriteSuccess(t *testing.T) {
+	f := createFixture(t)
+	defer f.teardown()
+	entry := BackupChunkQueueEntry{SnapshotID: "snapshot", ChunkID: "chunk"}
+	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snapshot", []BackupChunkQueueEntry{entry}))
+	require.NoError(t, f.storage.ChunksBackupCompleted(f.ctx, []BackupChunkQueueEntry{entry}))
+	// A duplicate worker's late failure must preserve recorded success.
+	require.NoError(t, f.storage.ChunkBackupFailed(f.ctx, entry))
+	require.NoError(t, f.storage.CheckBackupChunksCompleted(f.ctx, "snapshot"))
+	failed := BackupChunkQueueEntry{SnapshotID: "snapshot", ChunkID: "failed"}
+	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snapshot", []BackupChunkQueueEntry{failed}))
+	require.NoError(t, f.storage.ChunkBackupFailed(f.ctx, failed))
+	err := f.storage.CheckBackupChunksCompleted(f.ctx, "snapshot")
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+	queue, err := f.storage.GetQueuedChunksToBackup(f.ctx, 10)
+	require.NoError(t, err)
+	require.Empty(t, queue)
+	// Conversely, a completed duplicate write is sufficient to recover a
+	// failure, as long as the snapshot task has not cancelled the attempt.
+	require.NoError(t, f.storage.ChunksBackupCompleted(f.ctx, []BackupChunkQueueEntry{failed}))
+	require.NoError(t, f.storage.CheckBackupChunksCompleted(f.ctx, "snapshot"))
+}
