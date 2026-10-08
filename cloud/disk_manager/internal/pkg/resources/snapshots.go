@@ -68,7 +68,6 @@ type snapshotState struct {
 	storageSize       uint64
 	backupCompleted   bool
 	backupTaskID      string
-	backupStarted     bool
 	encryptionMode    uint32
 	encryptionKeyHash []byte
 
@@ -103,7 +102,6 @@ func (s *snapshotState) toSnapshotMeta() *SnapshotMeta {
 		Ready:           s.status == snapshotStatusReady,
 		BackupCompleted: s.backupCompleted,
 		BackupTaskID:    s.backupTaskID,
-		BackupStarted:   s.backupStarted,
 	}
 }
 
@@ -133,7 +131,6 @@ func (s *snapshotState) structValue() persistence.Value {
 			persistence.BoolValue(s.backupCompleted),
 		),
 		persistence.StructFieldValue("backup_task_id", persistence.UTF8Value(s.backupTaskID)),
-		persistence.StructFieldValue("backup_started", persistence.BoolValue(s.backupStarted)),
 		persistence.StructFieldValue("status", persistence.Int64Value(int64(s.status))),
 	)
 }
@@ -163,7 +160,6 @@ func scanSnapshotState(res persistence.Result) (state snapshotState, err error) 
 			&state.backupCompleted,
 		),
 		persistence.OptionalWithDefault("backup_task_id", &state.backupTaskID),
-		persistence.OptionalWithDefault("backup_started", &state.backupStarted),
 		persistence.OptionalWithDefault("status", &state.status),
 	)
 	return
@@ -212,7 +208,6 @@ func snapshotStateStructTypeString() string {
 		encryption_keyhash: String,
 		backup_completed: Bool,
         backup_task_id: Utf8,
-        backup_started: Bool,
 		status: Int64>`
 }
 
@@ -242,7 +237,6 @@ func snapshotStateTableDescription() persistence.CreateTableDescription {
 			persistence.Optional(persistence.TypeBool),
 		),
 		persistence.WithColumn("backup_task_id", persistence.Optional(persistence.TypeUTF8)),
-		persistence.WithColumn("backup_started", persistence.Optional(persistence.TypeBool)),
 		persistence.WithColumn("status", persistence.Optional(persistence.TypeInt64)),
 		persistence.WithPrimaryKeyColumn("id"),
 		persistence.WithSecondaryKeyColumn("folder_id"),
@@ -564,7 +558,7 @@ func (s *storageYDB) snapshotCreated(
 
 			upsert into backup_queue (snapshot_id)
             select $snapshot_id as snapshot_id from backup_folders
-            where folder_id = $folder_id
+            where folder_id = $folder_id and COALESCE(enabled, false)
 		`, s.snapshotsPath),
 			persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)),
 			persistence.ValueParam("$folder_id", persistence.UTF8Value(state.folderID)),
@@ -1379,10 +1373,9 @@ func dropSnapshotsYDBTables(
 	}
 	logging.Info(ctx, "Dropped backup_queue table")
 
-	for _, table := range []string{"backup_plans", "backup_folders"} {
-		if err := db.DropTable(ctx, folder, table); err != nil {
-			return err
-		}
+	err = db.DropTable(ctx, folder, "backup_folders")
+	if err != nil {
+		return err
 	}
 	logging.Info(ctx, "Dropped tables for snapshots")
 

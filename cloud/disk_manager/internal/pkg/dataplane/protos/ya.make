@@ -3,7 +3,6 @@ PROTO_LIBRARY()
 ONLY_TAGS(GO_PROTO)
 
 SRCS(
-    prepare_snapshot_backup_task.proto
     backup_chunk_map.proto
     backup_chunks_task.proto
     backup_snapshot_data_task.proto
@@ -17,6 +16,7 @@ SRCS(
     delete_snapshot_task.proto
     migrate_snapshot_task.proto
     migrate_snapshot_database_task.proto
+    release_snapshot_backup_task.proto
     replicate_disk_task.proto
     transfer_from_disk_to_disk_task.proto
     transfer_from_snapshot_to_disk_task.proto

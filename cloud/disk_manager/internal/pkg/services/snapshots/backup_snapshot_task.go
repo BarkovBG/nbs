@@ -71,9 +71,14 @@ func (t *backupSnapshotTask) Run(ctx context.Context, execCtx tasks.ExecutionCon
 		return t.storage.ReleaseSnapshotBackup(ctx, t.request.SnapshotId, owner, true)
 	}
 	if t.state.DataplaneRequest == nil {
+		// Old unscheduled tasks have no folder coordinator. Leave them for
+		// the new folder pass instead of accepting an unowned attempt.
+		if t.request.CoordinatorId == "" {
+			return t.storage.SnapshotBackupCancelled(ctx, t.request.SnapshotId, t.request.BackupId)
+		}
 		// The reservation is durable before scheduling any DP work. A retry of
 		// an accepted owner is allowed when Delete has since marked deleting.
-		meta, err := t.storage.ReserveSnapshotBackup(ctx, t.request.SnapshotId, owner, true)
+		meta, err := t.storage.ReserveSnapshotBackup(ctx, t.request.SnapshotId, owner, t.request.CoordinatorId)
 		if err != nil {
 			return err
 		}
@@ -142,7 +147,7 @@ func (t *backupSnapshotTask) Cancel(ctx context.Context, execCtx tasks.Execution
 			return err
 		}
 	}
-	// A preparation may have installed the same hold before this task started.
+	// Recover cleanup even if the DP child ID was lost after scheduling.
 	id, err := t.scheduler.ScheduleTask(
 		headers.SetIncomingIdempotencyKey(ctx, t.ownerID(execCtx)+"_release"),
 		"dataplane.ReleaseSnapshotBackup", "", &dataplane_protos.ReleaseSnapshotBackupRequest{SnapshotId: t.request.SnapshotId, OwnerId: t.ownerID(execCtx)},

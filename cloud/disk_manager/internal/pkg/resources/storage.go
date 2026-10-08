@@ -72,7 +72,6 @@ type SnapshotMeta struct {
 	Encryption        *types.EncryptionDesc `json:"encryption"`
 	Ready             bool                  `json:"ready"`
 	BackupTaskID      string                `json:"backup_task_id"`
-	BackupStarted     bool                  `json:"backup_started"`
 	BackupCompleted   bool                  `json:"backup_completed"`
 }
 
@@ -233,13 +232,8 @@ type Storage interface {
 	ReleaseSnapshotBackupFolder(ctx context.Context, folderID, taskID string) error
 	SetSnapshotBackupFolder(ctx context.Context, folderID, generation string, enabled bool) error
 	ListSnapshotBackupFolders(ctx context.Context) ([]SnapshotBackupFolder, error)
-	SetSnapshotBackupFolderPrepared(ctx context.Context, folderID, generation string, prepared bool) error
-	ListSnapshotBackupCandidates(ctx context.Context, folderID, afterID string, before time.Time, limit int) ([]string, error)
-	GetSnapshotBackupPlan(ctx context.Context, folderID, snapshotID string) (*SnapshotBackupPlan, error)
-	SaveSnapshotBackupPlan(ctx context.Context, plan SnapshotBackupPlan) error
-	ListSnapshotBackupPlans(ctx context.Context, folderID string, limit int, eligible bool, afterID string) ([]SnapshotBackupPlan, error)
-	RemoveSnapshotBackupPlan(ctx context.Context, folderID, snapshotID, ownerID string) error
-	ReserveSnapshotBackup(ctx context.Context, snapshotID, ownerID string, start bool) (*SnapshotMeta, error)
+	ListSnapshotBackupCandidates(ctx context.Context, folderID, afterID string, limit int) ([]string, error)
+	ReserveSnapshotBackup(ctx context.Context, snapshotID, ownerID, coordinatorID string) (*SnapshotMeta, error)
 	ReleaseSnapshotBackup(ctx context.Context, snapshotID, ownerID string, completed bool) error
 
 	EnqueueSnapshotBackup(

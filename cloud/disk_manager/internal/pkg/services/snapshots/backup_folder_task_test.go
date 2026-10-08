@@ -2,29 +2,20 @@ package snapshots
 
 import (
 	"context"
-	"fmt"
 	"testing"
-	"time"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	dataplane_protos "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/protos"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources"
 	resources_mocks "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources/mocks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/snapshots/protos"
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
+	"github.com/ydb-platform/nbs/cloud/tasks/headers"
 	tasks_mocks "github.com/ydb-platform/nbs/cloud/tasks/mocks"
 )
 
-func preparedBackupPlan(t *testing.T, id, base string) resources.SnapshotBackupPlan {
-	state, err := proto.Marshal(&protos.SnapshotBackupPlanState{Prepared: true, PrepareRequested: true, PrepareTaskId: "prepare_" + id})
-	require.NoError(t, err)
-	return resources.SnapshotBackupPlan{FolderID: "folder", SnapshotID: id, OwnerID: "coordinator_0_" + id, CoordinatorID: "coordinator", BaseSnapshotID: base, Prepared: true, State: state}
-}
-
-func TestBackupFolderPreparesOldSetBeforeCopyingAndThenTakesNewReady(t *testing.T) {
+func TestBackupFolderStartsFirstCopyWithoutPreparingOtherSnapshots(t *testing.T) {
 	ctx := context.Background()
 	storage := resources_mocks.NewStorageMock()
 	scheduler := tasks_mocks.NewSchedulerMock()
@@ -33,97 +24,109 @@ func TestBackupFolderPreparesOldSetBeforeCopyingAndThenTakesNewReady(t *testing.
 	execCtx.On("SaveState", ctx).Return(nil)
 	storage.On("ListSnapshotBackupFolders", ctx).Return([]resources.SnapshotBackupFolder{{FolderID: "folder", Generation: "generation"}}, nil)
 	storage.On("ClaimSnapshotBackupFolder", ctx, "folder", "generation", "coordinator").Return(true, nil)
-	storage.On("SaveSnapshotBackupPlan", ctx, mock.Anything).Return(nil)
-	storage.On("SetSnapshotBackupFolderPrepared", ctx, "folder", "generation", false).Return(nil).Once()
-	folderPrepared := false
-	var events []string
-	storage.On("SetSnapshotBackupFolderPrepared", ctx, "folder", "generation", true).Run(func(mock.Arguments) {
-		folderPrepared = true
-		events = append(events, "prepared-folder")
-	}).Return(nil).Once()
-	storage.On("ListSnapshotBackupCandidates", ctx, "folder", "", mock.Anything, snapshotBackfillPageSize).Return([]string{"a", "b"}, nil).Once()
-	storage.On("ListSnapshotBackupCandidates", ctx, "folder", "b", mock.Anything, snapshotBackfillPageSize).Return([]string(nil), nil).Once()
-	a := preparedBackupPlan(t, "a", "")
-	b := preparedBackupPlan(t, "b", "a")
-	newer := preparedBackupPlan(t, "new", "b")
-	newer.OwnerID = "coordinator_1_new"
-	storage.On("ListSnapshotBackupPlans", ctx, "folder", snapshotBackfillPageSize, false, "").Return([]resources.SnapshotBackupPlan{a, b}, nil).Once()
-	storage.On("ListSnapshotBackupPlans", ctx, "folder", snapshotBackfillPageSize, false, "b").Return([]resources.SnapshotBackupPlan(nil), nil).Once()
-	for _, p := range []resources.SnapshotBackupPlan{a, b} {
-		storage.On("ListSnapshotBackupPlans", ctx, "folder", 1, true, "").Return([]resources.SnapshotBackupPlan{p}, nil).Once()
-	}
-	storage.On("ListSnapshotBackupPlans", ctx, "folder", 1, true, "").Return([]resources.SnapshotBackupPlan(nil), nil).Once()
-	storage.On("ListSnapshotBackupPlans", ctx, "folder", 1, false, "").Return([]resources.SnapshotBackupPlan(nil), nil).Once()
-	storage.On("ListSnapshotBackupCandidates", ctx, "folder", "", mock.Anything, 1).Run(func(mock.Arguments) {
-		require.Equal(t, []string{"prepare-a", "prepare-b", "prepared-folder", "copy-a", "release-a", "copy-b", "release-b"}, events)
-	}).Return([]string{"new"}, nil).Once()
-	storage.On("ListSnapshotBackupPlans", ctx, "folder", 1, true, "").Return([]resources.SnapshotBackupPlan{newer}, nil).Once()
-	storage.On("ListSnapshotBackupPlans", ctx, "folder", 1, true, "").Return([]resources.SnapshotBackupPlan(nil), nil).Once()
-	storage.On("ListSnapshotBackupPlans", ctx, "folder", 1, false, "").Return([]resources.SnapshotBackupPlan(nil), nil).Once()
-	storage.On("ListSnapshotBackupCandidates", ctx, "folder", "", mock.Anything, 1).Return([]string(nil), nil).Once()
-	for _, p := range []resources.SnapshotBackupPlan{a, b, newer} {
-		id, owner, base := p.SnapshotID, p.OwnerID, p.BaseSnapshotID
-		storage.On("GetSnapshotBackupPlan", ctx, "folder", id).Return((*resources.SnapshotBackupPlan)(nil), nil).Once()
-		storage.On("GetSnapshotMeta", ctx, id).Return(&resources.SnapshotMeta{ID: id, FolderID: "folder", Ready: true, CreatingAt: time.Now()}, nil).Once()
-		storage.On("ReserveSnapshotBackup", ctx, id, owner, false).Return(&resources.SnapshotMeta{ID: id, Ready: true}, nil).Once()
-		scheduler.On("ScheduleTask", mock.Anything, "dataplane.PrepareSnapshotBackup", "", mock.MatchedBy(func(r *dataplane_protos.PrepareSnapshotBackupRequest) bool {
-			return r.SnapshotId == id && r.OwnerId == owner
-		})).Return("prepare_"+id, nil).Once()
-		scheduler.On("WaitTask", ctx, execCtx, "prepare_"+id).Run(func(mock.Arguments) {
-			events = append(events, "prepare-"+id)
-		}).Return(&dataplane_protos.PrepareSnapshotBackupResponse{BaseSnapshotId: base}, nil).Once()
-		scheduler.On("ScheduleTask", mock.Anything, "snapshots.BackupSnapshot", "", mock.MatchedBy(func(r *protos.BackupSnapshotRequest) bool { return r.SnapshotId == id && r.BackupId == owner })).Run(func(mock.Arguments) {
-			require.True(t, folderPrepared)
-			events = append(events, "copy-"+id)
-		}).Return("copy_"+id, nil).Once()
-		scheduler.On("WaitTask", ctx, execCtx, "copy_"+id).Return(&protos.BackupSnapshotResponse{Completed: true}, nil).Once()
-		scheduler.On("WaitTaskEnded", ctx, "copy_"+id).Return(nil).Once()
-		scheduler.On("CancelTask", ctx, "prepare_"+id).Return("", nil).Once()
-		scheduler.On("WaitTaskEnded", ctx, "prepare_"+id).Return(nil).Once()
-		scheduler.On("ScheduleTask", mock.Anything, "dataplane.ReleaseSnapshotBackup", "", mock.MatchedBy(func(r *dataplane_protos.ReleaseSnapshotBackupRequest) bool {
-			return r.SnapshotId == id && r.OwnerId == owner
-		})).Return("release_"+id, nil).Once()
-		scheduler.On("WaitTask", ctx, execCtx, "release_"+id).Run(func(mock.Arguments) {
-			events = append(events, "release-"+id)
-		}).Return(&empty.Empty{}, nil).Once()
-		storage.On("ReleaseSnapshotBackup", ctx, id, owner, true).Return(nil).Once()
-		storage.On("RemoveSnapshotBackupPlan", ctx, "folder", id, owner).Return(nil).Once()
-	}
+	storage.On("ListSnapshotBackupCandidates", ctx, "folder", "", 1).Return([]string{"a"}, nil).Once()
+	scheduler.On("ScheduleTask", mock.Anything, "snapshots.BackupSnapshot", "", mock.MatchedBy(func(r *protos.BackupSnapshotRequest) bool {
+		return r.SnapshotId == "a" && r.BackupId == "coordinator_1_a" && r.CoordinatorId == "coordinator"
+	})).Return("copy-a", nil).Once()
+	scheduler.On("WaitTask", ctx, execCtx, "copy-a").Return((*protos.BackupSnapshotResponse)(nil), errors.NewInterruptExecutionError()).Once()
 	task := &backupFolderTask{storage: storage, scheduler: scheduler, request: &protos.BackupFolderRequest{FolderId: "folder", Generation: "generation"}, state: &protos.BackupFolderState{}}
-	err := task.Run(ctx, execCtx)
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()), fmt.Sprint(err))
-	require.True(t, task.state.InitialPassComplete)
-	require.Equal(t, []string{"prepare-a", "prepare-b", "prepared-folder", "copy-a", "release-a", "copy-b", "release-b", "prepare-new", "copy-new", "release-new"}, events)
+	require.True(t, errors.Is(task.Run(ctx, execCtx), errors.NewInterruptExecutionError()))
+	require.Equal(t, "a", task.state.SnapshotId)
+	require.Equal(t, "copy-a", task.state.BackupTaskId)
+	require.Empty(t, task.state.AfterId)
+	storage.AssertNotCalled(t, "ListSnapshotBackupCandidates", ctx, "folder", "a", 1)
+	// Once the first copy is fully finished, the next ready resource is taken.
+	scheduler.On("WaitTask", ctx, execCtx, "copy-a").Return(&protos.BackupSnapshotResponse{Completed: true}, nil).Once()
+	storage.On("ListSnapshotBackupCandidates", ctx, "folder", "a", 1).Return([]string{"b"}, nil).Once()
+	scheduler.On("ScheduleTask", mock.Anything, "snapshots.BackupSnapshot", "", mock.MatchedBy(func(r *protos.BackupSnapshotRequest) bool {
+		return r.SnapshotId == "b" && r.BackupId == "coordinator_2_b"
+	})).Return("copy-b", nil).Once()
+	scheduler.On("WaitTask", ctx, execCtx, "copy-b").Return(&protos.BackupSnapshotResponse{Completed: true}, nil).Once()
+	storage.On("ListSnapshotBackupCandidates", ctx, "folder", "b", 1).Return([]string(nil), nil).Once()
+	storage.On("ListSnapshotBackupCandidates", ctx, "folder", "", 1).Return([]string(nil), nil).Once()
+	require.True(t, errors.Is(task.Run(ctx, execCtx), errors.NewInterruptExecutionError()))
+	require.Empty(t, task.state.SnapshotId)
 	mock.AssertExpectationsForObjects(t, storage, scheduler, execCtx)
 }
 
-func TestBackupFolderRemovalFinishesAcceptedCopyBeforeRelease(t *testing.T) {
+func TestBackupFolderRecoversChildWhoseIDWasNotSaved(t *testing.T) {
 	ctx := context.Background()
 	storage := resources_mocks.NewStorageMock()
 	scheduler := tasks_mocks.NewSchedulerMock()
 	execCtx := tasks_mocks.NewExecutionContextMock()
 	execCtx.On("GetTaskID").Return("coordinator")
-	p := preparedBackupPlan(t, "a", "")
-	state := &protos.SnapshotBackupPlanState{Prepared: true, PrepareTaskId: "prepare_a", CopyRequested: true}
-	data, err := proto.Marshal(state)
-	require.NoError(t, err)
-	p.State = data
-	storage.On("ListSnapshotBackupFolders", ctx).Return([]resources.SnapshotBackupFolder(nil), nil)
-	storage.On("ListSnapshotBackupPlans", ctx, "folder", snapshotBackfillPageSize, false, "").Return([]resources.SnapshotBackupPlan{p}, nil).Once()
-	storage.On("ListSnapshotBackupPlans", ctx, "folder", snapshotBackfillPageSize, false, "").Return([]resources.SnapshotBackupPlan(nil), nil).Once()
-	storage.On("SaveSnapshotBackupPlan", ctx, mock.Anything).Return(nil)
-	scheduler.On("ScheduleTask", mock.Anything, "snapshots.BackupSnapshot", "", mock.MatchedBy(func(r *protos.BackupSnapshotRequest) bool { return r.BackupId == p.OwnerID })).Return("copy_a", nil).Once()
-	scheduler.On("WaitTask", ctx, execCtx, "copy_a").Return(&protos.BackupSnapshotResponse{Completed: true}, nil).Once()
-	scheduler.On("WaitTaskEnded", ctx, "copy_a").Return(nil).Once()
-	scheduler.On("CancelTask", ctx, "prepare_a").Return("", nil).Once()
-	scheduler.On("WaitTaskEnded", ctx, "prepare_a").Return(nil).Once()
-	scheduler.On("ScheduleTask", mock.Anything, "dataplane.ReleaseSnapshotBackup", "", mock.Anything).Return("release_a", nil).Once()
-	scheduler.On("WaitTask", ctx, execCtx, "release_a").Return(&empty.Empty{}, nil).Once()
-	storage.On("ReleaseSnapshotBackup", ctx, "a", p.OwnerID, true).Return(nil).Once()
-	storage.On("RemoveSnapshotBackupPlan", ctx, "folder", "a", p.OwnerID).Return(nil).Once()
-	storage.On("ReleaseSnapshotBackupFolder", ctx, "folder", "coordinator").Return(nil).Once()
+	storage.On("ListSnapshotBackupFolders", ctx).Return([]resources.SnapshotBackupFolder{{FolderID: "folder", Generation: "generation"}}, nil)
+	storage.On("ClaimSnapshotBackupFolder", ctx, "folder", "generation", "coordinator").Return(true, nil)
+	storage.On("ListSnapshotBackupCandidates", ctx, "folder", "", 1).Return([]string{"a"}, nil).Once()
 	task := &backupFolderTask{storage: storage, scheduler: scheduler, request: &protos.BackupFolderRequest{FolderId: "folder", Generation: "generation"}, state: &protos.BackupFolderState{}}
-	require.NoError(t, task.Run(ctx, execCtx))
-	scheduler.AssertNotCalled(t, "CancelTask", ctx, "copy_a")
+	var saved []byte
+	execCtx.On("SaveState", ctx).Run(func(mock.Arguments) {
+		var err error
+		saved, err = task.Save()
+		require.NoError(t, err)
+	}).Return(nil).Once()
+	execCtx.On("SaveState", ctx).Return(errors.NewRetriableErrorf("lost child checkpoint")).Once()
+	scheduler.On("ScheduleTask", mock.MatchedBy(func(ctx context.Context) bool {
+		return headers.GetIdempotencyKey(ctx) == "backup_snapshot_a_coordinator_1_a"
+	}), "snapshots.BackupSnapshot", "", mock.MatchedBy(func(r *protos.BackupSnapshotRequest) bool {
+		return r.SnapshotId == "a" && r.BackupId == "coordinator_1_a" && r.CoordinatorId == "coordinator"
+	})).Return("same-child", nil).Twice()
+	require.True(t, errors.Is(task.Run(ctx, execCtx), errors.NewEmptyRetriableError()))
+	serialized, err := proto.Marshal(task.request)
+	require.NoError(t, err)
+	resumed := &backupFolderTask{storage: storage, scheduler: scheduler}
+	require.NoError(t, resumed.Load(serialized, saved))
+	require.Empty(t, resumed.state.BackupTaskId)
+	resumedCtx := tasks_mocks.NewExecutionContextMock()
+	resumedCtx.On("GetTaskID").Return("coordinator")
+	resumedCtx.On("SaveState", ctx).Return(nil)
+	scheduler.On("WaitTask", ctx, resumedCtx, "same-child").Return(&protos.BackupSnapshotResponse{Completed: true}, nil).Once()
+	storage.On("ListSnapshotBackupCandidates", ctx, "folder", "a", 1).Return([]string(nil), nil).Once()
+	storage.On("ListSnapshotBackupCandidates", ctx, "folder", "", 1).Return([]string(nil), nil).Once()
+	require.True(t, errors.Is(resumed.Run(ctx, resumedCtx), errors.NewInterruptExecutionError()))
+	mock.AssertExpectationsForObjects(t, storage, scheduler, execCtx, resumedCtx)
+}
+
+func TestBackupFolderDisableFinishesCurrentChildBeforeReleasingCoordinator(t *testing.T) {
+	for _, completed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "excluded-before-admission", true: "accepted-copy"}[completed], func(t *testing.T) {
+			ctx := context.Background()
+			storage := resources_mocks.NewStorageMock()
+			scheduler := tasks_mocks.NewSchedulerMock()
+			execCtx := tasks_mocks.NewExecutionContextMock()
+			execCtx.On("GetTaskID").Return("coordinator")
+			execCtx.On("SaveState", ctx).Return(nil)
+			storage.On("ListSnapshotBackupFolders", ctx).Return([]resources.SnapshotBackupFolder(nil), nil).Once()
+			scheduler.On("ScheduleTask", mock.Anything, "snapshots.BackupSnapshot", "", mock.MatchedBy(func(r *protos.BackupSnapshotRequest) bool {
+				return r.BackupId == "owner" && r.CoordinatorId == "coordinator"
+			})).Return("copy-a", nil).Once()
+			scheduler.On("WaitTask", ctx, execCtx, "copy-a").Return(&protos.BackupSnapshotResponse{Completed: completed}, nil).Once()
+			storage.On("ReleaseSnapshotBackupFolder", ctx, "folder", "coordinator").Return(nil).Once()
+			task := &backupFolderTask{storage: storage, scheduler: scheduler, request: &protos.BackupFolderRequest{FolderId: "folder", Generation: "generation"}, state: &protos.BackupFolderState{SnapshotId: "a", OwnerId: "owner"}}
+			require.NoError(t, task.Run(ctx, execCtx))
+			scheduler.AssertNotCalled(t, "CancelTask", mock.Anything, mock.Anything)
+			storage.AssertNotCalled(t, "ListSnapshotBackupCandidates", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+			mock.AssertExpectationsForObjects(t, storage, scheduler, execCtx)
+		})
+	}
+}
+
+func TestBackupFolderCancellationWaitsForChildCleanup(t *testing.T) {
+	ctx := context.Background()
+	storage := resources_mocks.NewStorageMock()
+	scheduler := tasks_mocks.NewSchedulerMock()
+	execCtx := tasks_mocks.NewExecutionContextMock()
+	execCtx.On("GetTaskID").Return("coordinator")
+	execCtx.On("SaveState", ctx).Return(nil)
+	storage.On("SetSnapshotBackupFolder", ctx, "folder", "generation", false).Return(nil)
+	scheduler.On("ScheduleTask", mock.Anything, "snapshots.BackupSnapshot", "", mock.Anything).Return("copy-a", nil).Once()
+	scheduler.On("CancelTask", ctx, "copy-a").Return("", nil)
+	scheduler.On("WaitTaskEnded", ctx, "copy-a").Return(errors.NewInterruptExecutionError()).Once()
+	scheduler.On("WaitTaskEnded", ctx, "copy-a").Return(nil).Once()
+	task := &backupFolderTask{storage: storage, scheduler: scheduler, request: &protos.BackupFolderRequest{FolderId: "folder", Generation: "generation"}, state: &protos.BackupFolderState{SnapshotId: "a", OwnerId: "owner"}}
+	require.True(t, errors.Is(task.Cancel(ctx, execCtx), errors.NewInterruptExecutionError()))
+	storage.AssertNotCalled(t, "ReleaseSnapshotBackupFolder", mock.Anything, mock.Anything, mock.Anything)
+	storage.On("ReleaseSnapshotBackupFolder", ctx, "folder", "coordinator").Return(nil).Once()
+	require.NoError(t, task.Cancel(ctx, execCtx))
 	mock.AssertExpectationsForObjects(t, storage, scheduler, execCtx)
 }

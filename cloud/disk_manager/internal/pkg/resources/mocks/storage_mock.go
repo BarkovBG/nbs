@@ -622,47 +622,16 @@ func (s *StorageMock) ListSnapshotBackupFolders(ctx context.Context) ([]resource
 	return a.Get(0).([]resources.SnapshotBackupFolder), a.Error(1)
 }
 
-func (s *StorageMock) SetSnapshotBackupFolderPrepared(ctx context.Context, folderID, generation string, prepared bool) error {
-	a := s.Called(ctx, folderID, generation, prepared)
-	return a.Error(0)
-}
-
-func (s *StorageMock) ListSnapshotBackupCandidates(ctx context.Context, folderID, afterID string, before time.Time, limit int) ([]string, error) {
-	a := s.Called(ctx, folderID, afterID, before, limit)
+func (s *StorageMock) ListSnapshotBackupCandidates(ctx context.Context, folderID, afterID string, limit int) ([]string, error) {
+	a := s.Called(ctx, folderID, afterID, limit)
 	if a.Get(0) == nil {
 		return nil, a.Error(1)
 	}
 	return a.Get(0).([]string), a.Error(1)
 }
 
-func (s *StorageMock) GetSnapshotBackupPlan(ctx context.Context, folderID, snapshotID string) (*resources.SnapshotBackupPlan, error) {
-	a := s.Called(ctx, folderID, snapshotID)
-	if a.Get(0) == nil {
-		return nil, a.Error(1)
-	}
-	return a.Get(0).(*resources.SnapshotBackupPlan), a.Error(1)
-}
-
-func (s *StorageMock) SaveSnapshotBackupPlan(ctx context.Context, plan resources.SnapshotBackupPlan) error {
-	a := s.Called(ctx, plan)
-	return a.Error(0)
-}
-
-func (s *StorageMock) ListSnapshotBackupPlans(ctx context.Context, folderID string, limit int, eligible bool, afterID string) ([]resources.SnapshotBackupPlan, error) {
-	a := s.Called(ctx, folderID, limit, eligible, afterID)
-	if a.Get(0) == nil {
-		return nil, a.Error(1)
-	}
-	return a.Get(0).([]resources.SnapshotBackupPlan), a.Error(1)
-}
-
-func (s *StorageMock) RemoveSnapshotBackupPlan(ctx context.Context, folderID, snapshotID, ownerID string) error {
-	a := s.Called(ctx, folderID, snapshotID, ownerID)
-	return a.Error(0)
-}
-
-func (s *StorageMock) ReserveSnapshotBackup(ctx context.Context, snapshotID, ownerID string, start bool) (*resources.SnapshotMeta, error) {
-	a := s.Called(ctx, snapshotID, ownerID, start)
+func (s *StorageMock) ReserveSnapshotBackup(ctx context.Context, snapshotID, ownerID, coordinatorID string) (*resources.SnapshotMeta, error) {
+	a := s.Called(ctx, snapshotID, ownerID, coordinatorID)
 	if a.Get(0) == nil {
 		return nil, a.Error(1)
 	}

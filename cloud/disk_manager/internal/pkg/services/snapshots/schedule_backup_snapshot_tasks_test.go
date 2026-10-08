@@ -28,14 +28,14 @@ func TestScheduleBackupSnapshotTasks(t *testing.T) {
 
 	storage.On("ListSnapshotBackupFolders", mock.Anything).Return(
 		[]resources.SnapshotBackupFolder{
-			{FolderID: "folder1"},
+			{FolderID: "folder1", Generation: "first"},
 			{FolderID: "folder2", Generation: "generation"},
 		},
 		nil,
 	)
 
 	for _, backup := range []resources.SnapshotBackupFolder{
-		{FolderID: "folder1"},
+		{FolderID: "folder1", Generation: "first"},
 		{FolderID: "folder2", Generation: "generation"},
 	} {
 		id := backup.FolderID

@@ -39,15 +39,15 @@ func TestBackupSnapshotTaskKeepsAcceptedMetadataAndDEK(t *testing.T) {
 				execCtx := tasks_mocks.NewExecutionContextMock()
 				execCtx.On("SaveState", mock.Anything).Return(nil)
 				execCtx.On("GetTaskID").Return("task")
-				meta := &resources.SnapshotMeta{ID: "snapshot", FolderID: "folder", Disk: &types.Disk{DiskId: "disk", ZoneId: "zone"}, Ready: !deleting, BackupTaskID: "owner", BackupStarted: true}
-				storage.On("ReserveSnapshotBackup", mock.Anything, "snapshot", "owner", true).Return(meta, nil).Once()
+				meta := &resources.SnapshotMeta{ID: "snapshot", FolderID: "folder", Disk: &types.Disk{DiskId: "disk", ZoneId: "zone"}, Ready: !deleting, BackupTaskID: "owner"}
+				storage.On("ReserveSnapshotBackup", mock.Anything, "snapshot", "owner", "coordinator").Return(meta, nil).Once()
 				storage.On("ReleaseSnapshotBackup", mock.Anything, "snapshot", "owner", true).Return(nil)
 				var request *dataplane_protos.BackupSnapshotDataRequest
 				scheduler.On("ScheduleTask", mock.Anything, "dataplane.BackupSnapshotData", "", mock.Anything).Run(func(a mock.Arguments) {
 					request = proto.Clone(a.Get(3).(*dataplane_protos.BackupSnapshotDataRequest)).(*dataplane_protos.BackupSnapshotDataRequest)
 				}).Return("child", nil).Once()
 				scheduler.On("WaitTask", mock.Anything, execCtx, "child").Return(&empty.Empty{}, nil).Once()
-				task := &backupSnapshotTask{scheduler: scheduler, storage: storage, backupS3: follower, request: &protos.BackupSnapshotRequest{SnapshotId: "snapshot", BackupId: "owner"}, state: &protos.BackupSnapshotTaskState{}}
+				task := &backupSnapshotTask{scheduler: scheduler, storage: storage, backupS3: follower, request: &protos.BackupSnapshotRequest{SnapshotId: "snapshot", BackupId: "owner", CoordinatorId: "coordinator"}, state: &protos.BackupSnapshotTaskState{}}
 				require.NoError(t, task.Run(ctx, execCtx))
 				require.Equal(t, "owner", request.OwnerId)
 				require.Equal(t, backup.SnapshotMetaKey("disk", "snapshot"), request.MetaKey)
@@ -88,7 +88,7 @@ func TestBackupSnapshotTaskRestoresExactRequestAfterSchedulingCrash(t *testing.T
 		return bytes.Equal(r.EncryptedDek, dek) && bytes.Equal(r.Meta, []byte("saved"))
 	})).Return("same-child", nil)
 	scheduler.On("WaitTask", mock.Anything, execCtx, "same-child").Return(&empty.Empty{}, nil)
-	task := &backupSnapshotTask{scheduler: scheduler, storage: storage, backupS3: follower, request: &protos.BackupSnapshotRequest{SnapshotId: "snapshot", BackupId: "owner"}, state: &protos.BackupSnapshotTaskState{DataplaneRequest: request, EncryptedDek: dek}}
+	task := &backupSnapshotTask{scheduler: scheduler, storage: storage, backupS3: follower, request: &protos.BackupSnapshotRequest{SnapshotId: "snapshot", BackupId: "owner", CoordinatorId: "coordinator"}, state: &protos.BackupSnapshotTaskState{DataplaneRequest: request, EncryptedDek: dek}}
 	require.NoError(t, task.Run(ctx, execCtx))
 	storage.AssertNotCalled(t, "ReserveSnapshotBackup", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	mock.AssertExpectationsForObjects(t, storage, scheduler)
@@ -99,9 +99,9 @@ func TestBackupSnapshotTaskDoesNotCopyDeletingCandidate(t *testing.T) {
 	storage := resources_mocks.NewStorageMock()
 	scheduler := tasks_mocks.NewSchedulerMock()
 	execCtx := tasks_mocks.NewExecutionContextMock()
-	storage.On("ReserveSnapshotBackup", mock.Anything, "snapshot", "owner", true).Return((*resources.SnapshotMeta)(nil), nil)
+	storage.On("ReserveSnapshotBackup", mock.Anything, "snapshot", "owner", "coordinator").Return((*resources.SnapshotMeta)(nil), nil)
 	storage.On("SnapshotBackupCancelled", mock.Anything, "snapshot", "owner").Return(nil)
-	task := &backupSnapshotTask{scheduler: scheduler, storage: storage, request: &protos.BackupSnapshotRequest{SnapshotId: "snapshot", BackupId: "owner"}, state: &protos.BackupSnapshotTaskState{}}
+	task := &backupSnapshotTask{scheduler: scheduler, storage: storage, request: &protos.BackupSnapshotRequest{SnapshotId: "snapshot", BackupId: "owner", CoordinatorId: "coordinator"}, state: &protos.BackupSnapshotTaskState{}}
 	require.NoError(t, task.Run(ctx, execCtx))
 	require.False(t, task.GetResponse().(*protos.BackupSnapshotResponse).Completed)
 	scheduler.AssertNotCalled(t, "ScheduleTask", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
@@ -122,7 +122,7 @@ func TestBackupSnapshotTaskCancellationWaitsForUnknownChild(t *testing.T) {
 	scheduler.On("ScheduleTask", mock.Anything, "dataplane.ReleaseSnapshotBackup", "", mock.Anything).Return("release", nil)
 	scheduler.On("WaitTask", mock.Anything, execCtx, "release").Return(&empty.Empty{}, nil)
 	storage.On("ReleaseSnapshotBackup", mock.Anything, "snapshot", "owner", false).Return(nil).Once()
-	task := &backupSnapshotTask{scheduler: scheduler, storage: storage, request: &protos.BackupSnapshotRequest{SnapshotId: "snapshot", BackupId: "owner"}, state: &protos.BackupSnapshotTaskState{DataplaneRequest: &dataplane_protos.BackupSnapshotDataRequest{SnapshotId: "snapshot", OwnerId: "owner"}}}
+	task := &backupSnapshotTask{scheduler: scheduler, storage: storage, request: &protos.BackupSnapshotRequest{SnapshotId: "snapshot", BackupId: "owner", CoordinatorId: "coordinator"}, state: &protos.BackupSnapshotTaskState{DataplaneRequest: &dataplane_protos.BackupSnapshotDataRequest{SnapshotId: "snapshot", OwnerId: "owner"}}}
 	err := task.Cancel(ctx, execCtx)
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 	storage.AssertNotCalled(t, "ReleaseSnapshotBackup", mock.Anything, mock.Anything, mock.Anything, mock.Anything)

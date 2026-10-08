@@ -774,6 +774,11 @@ func TestSnapshotBackupHoldPreservesInheritedChunks(t *testing.T) {
 			require.Equal(t, []byte("abc"), blob.Data)
 			err = f.storage.ReleaseSnapshotForBackup(f.ctx, "copy", "backup")
 			require.NoError(t, err)
+			_, err = f.storage.DeletingSnapshot(f.ctx, "copy", "delete")
+			require.NoError(t, err)
+			require.NoError(t, f.storage.DeleteSnapshotData(f.ctx, "copy"))
+			_, err = f.storage.ReadChunkBlob(f.ctx, chunkID, testCase.useS3)
+			require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
 		})
 	}
 }
