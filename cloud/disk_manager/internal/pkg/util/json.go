@@ -10,6 +10,7 @@ import (
 	filesystem_scrubbing_protos "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/filesystem/scrubbing/protos"
 	filesystem_snapshot_protos "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/filesystem/snapshot/protos"
 	dataplane_protos "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/protos"
+	backups_protos "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/backups/protos"
 	disk_protos "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/disks/protos"
 	filesystem_protos "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/filesystem/protos"
 	filesystem_snapshot_service_protos "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/filesystem_snapshot/protos"
@@ -25,6 +26,10 @@ import (
 ////////////////////////////////////////////////////////////////////////////////
 
 var requestProtoByTaskType = map[string]func() proto.Message{
+	"backups.Backfill":                              func() proto.Message { return &backups_protos.BackfillRequest{} },
+	"snapshots.BackupSnapshot":                      func() proto.Message { return &snapshot_protos.BackupSnapshotRequest{} },
+	"images.BackupImage":                            func() proto.Message { return &images_protos.BackupImageRequest{} },
+	"dataplane.BackupSnapshotData":                  func() proto.Message { return &dataplane_protos.BackupSnapshotDataRequest{} },
 	"dataplane.CreateSnapshotFromDisk":              func() proto.Message { return &dataplane_protos.CreateSnapshotFromDiskRequest{} },
 	"dataplane.CreateSnapshotFromSnapshot":          func() proto.Message { return &dataplane_protos.CreateSnapshotFromSnapshotRequest{} },
 	"dataplane.CreateSnapshotFromURL":               func() proto.Message { return &dataplane_protos.CreateSnapshotFromURLRequest{} },
@@ -81,6 +86,10 @@ var requestProtoByTaskType = map[string]func() proto.Message{
 }
 
 var stateProtoByTaskType = map[string]func() proto.Message{
+	"backups.Backfill":                              func() proto.Message { return &backups_protos.BackfillState{} },
+	"snapshots.BackupSnapshot":                      func() proto.Message { return &snapshot_protos.BackupSnapshotTaskState{} },
+	"images.BackupImage":                            func() proto.Message { return &images_protos.BackupImageTaskState{} },
+	"dataplane.BackupSnapshotData":                  func() proto.Message { return &dataplane_protos.BackupSnapshotDataTaskState{} },
 	"cells.CollectClusterCapacity":                  func() proto.Message { return &cells_protos.CollectClusterCapacityTaskState{} },
 	"dataplane.CollectSnapshots":                    func() proto.Message { return &dataplane_protos.CollectSnapshotsTaskState{} },
 	"dataplane.CreateSnapshotFromDisk":              func() proto.Message { return &dataplane_protos.CreateSnapshotFromDiskTaskState{} },

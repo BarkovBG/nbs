@@ -505,6 +505,7 @@ func newSnapshotsCmd(
 	}
 
 	cmd.AddCommand(
+		newBackfillCmd(clientConfig, serverConfig, "snapshots"),
 		newGetSnapshotCmd(clientConfig, serverConfig),
 		newListSnapshotsCmd(clientConfig, serverConfig),
 		newBackupSnapshotCmd(clientConfig, serverConfig),

@@ -288,6 +288,7 @@ func newImagesCmd(
 	}
 
 	cmd.AddCommand(
+		newBackfillCmd(clientConfig, serverConfig, "images"),
 		newGetImageCmd(clientConfig, serverConfig),
 		newListImagesCmd(clientConfig, serverConfig),
 		newCreateImageCmd(clientConfig),

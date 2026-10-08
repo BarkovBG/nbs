@@ -1,6 +1,7 @@
 GO_LIBRARY()
 
 SRCS(
+    backfill.go
     common.go
     disks.go
     filesystem.go

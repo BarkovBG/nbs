@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package backups;
+
+option go_package = "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/backups/protos";
+
+message BackfillRequest {
+    string ResourceKind = 1;
+    uint32 BatchSize = 2;
+    int64 CreatedBeforeMicros = 3;
+}
+
+message BackfillEntry {
+    string ResourceId = 1;
+    string BackupId = 2;
+    string TaskId = 3;
+}
+
+message BackfillState {
+    string AfterId = 1;
+    repeated BackfillEntry Pending = 2;
+    uint64 Processed = 3;
+    uint64 Skipped = 4;
+}
+
+message BackfillProgress {
+    string AfterId = 1;
+    uint64 Processed = 2;
+    uint64 Skipped = 3;
+    uint32 Pending = 4;
+}

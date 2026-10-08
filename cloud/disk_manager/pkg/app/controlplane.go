@@ -18,6 +18,7 @@ import (
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/monitoring"
 	performance_config "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/performance/config"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources"
+	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/backups"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/disks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/filesystem"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/filesystem_snapshot"
@@ -198,6 +199,13 @@ func registerControlplaneTasks(
 	if err != nil {
 		logging.Error(ctx, "Failed to register disk tasks: %v", err)
 		return err
+	}
+
+	if backupS3 != nil {
+		err = backups.RegisterForExecution(taskRegistry, taskScheduler, resourceStorage)
+		if err != nil {
+			return err
+		}
 	}
 
 	logging.Info(ctx, "Registering image tasks")

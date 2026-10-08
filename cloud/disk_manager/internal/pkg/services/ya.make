@@ -1,4 +1,5 @@
 RECURSE(
+    backups
     disks
     common
     filesystem
