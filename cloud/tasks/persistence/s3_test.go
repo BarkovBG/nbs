@@ -3,12 +3,14 @@ package persistence
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
 	"github.com/ydb-platform/nbs/cloud/tasks/metrics/mocks"
@@ -202,6 +204,70 @@ func TestS3TokenAuthTransportShouldNotSetAuthorizationHeaderForHTTP(t *testing.T
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+func TestS3ObjectExists(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		status int
+		exists bool
+		fails  bool
+	}{
+		{name: "exists", status: http.StatusOK, exists: true},
+		{name: "missing", status: http.StatusNotFound},
+		{name: "forbidden", status: http.StatusForbidden, fails: true},
+		{
+			name:   "unavailable",
+			status: http.StatusServiceUnavailable,
+			fails:  true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, http.MethodHead, r.Method)
+					assert.Equal(t, "/bucket/prefix/chunks/chunk", r.URL.Path)
+					w.WriteHeader(testCase.status)
+				},
+			))
+			defer server.Close()
+
+			client, err := NewS3Client(
+				server.URL,
+				"region",
+				NewS3Credentials("test", "test"),
+				time.Second,
+				mocks.NewRegistryMock(),
+				0,
+				nil,
+				nil,
+			)
+			require.NoError(t, err)
+
+			exists, err := client.ObjectExists(
+				newContext(),
+				"bucket",
+				"prefix/chunks/chunk",
+			)
+			require.Equal(t, testCase.exists, exists)
+			if testCase.fails {
+				require.True(t, errors.Is(err, errors.NewEmptyRetriableError()))
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestS3ObjectExistsWithCanceledContext(t *testing.T) {
+	client, err := newS3Client(mocks.NewRegistryMock(), time.Second)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(newContext())
+	cancel()
+
+	exists, err := client.ObjectExists(ctx, "bucket", "chunk")
+	require.False(t, exists)
+	require.True(t, errors.Is(err, errors.NewEmptyRetriableError()))
+}
 
 func TestS3ShouldSendErrorCanceledMetric(t *testing.T) {
 	ctx, cancel := context.WithCancel(newContext())

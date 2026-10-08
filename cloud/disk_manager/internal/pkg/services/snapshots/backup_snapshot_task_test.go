@@ -3,9 +3,10 @@ package snapshots
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"testing"
-	"time"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -16,285 +17,130 @@ import (
 	resources_mocks "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources/mocks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/snapshots/protos"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/types"
+	"github.com/ydb-platform/nbs/cloud/tasks/errors"
 	tasks_mocks "github.com/ydb-platform/nbs/cloud/tasks/mocks"
 )
 
-////////////////////////////////////////////////////////////////////////////////
-
-const backupTestBucket = "snapshots-backup"
-
-func TestBackupSnapshotTask(t *testing.T) {
-	ctx := test.NewContext()
-
-	s3, err := test.NewS3Client()
-	require.NoError(t, err)
-
-	exists, err := s3.BucketExists(ctx, backupTestBucket)
-	require.NoError(t, err)
-	if !exists {
-		err = s3.CreateBucket(ctx, backupTestBucket)
-		require.NoError(t, err)
+func TestBackupSnapshotTaskKeepsAcceptedMetadataAndDEK(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		for _, deleting := range []bool{false, true} {
+			t.Run(fmt.Sprintf("encrypted=%v/deleting=%v", encrypted, deleting), func(t *testing.T) {
+				ctx := test.NewContext()
+				kekID := ""
+				var kek []byte
+				if encrypted {
+					kekID = "key"
+					kek = make([]byte, 32)
+				}
+				follower, err := backup.NewS3(nil, "bucket", "prefix", kekID, kek)
+				require.NoError(t, err)
+				storage := resources_mocks.NewStorageMock()
+				scheduler := tasks_mocks.NewSchedulerMock()
+				execCtx := tasks_mocks.NewExecutionContextMock()
+				execCtx.On("SaveState", mock.Anything).Return(nil)
+				execCtx.On("GetTaskID").Return("task")
+				meta := &resources.SnapshotMeta{ID: "snapshot", FolderID: "folder", Disk: &types.Disk{DiskId: "disk", ZoneId: "zone"}, Ready: !deleting, BackupTaskID: "owner", BackupStarted: true}
+				storage.On("ReserveSnapshotBackup", mock.Anything, "snapshot", "owner", true).Return(meta, nil).Once()
+				storage.On("ReleaseSnapshotBackup", mock.Anything, "snapshot", "owner", true).Return(nil)
+				var request *dataplane_protos.BackupSnapshotDataRequest
+				scheduler.On("ScheduleTask", mock.Anything, "dataplane.BackupSnapshotData", "", mock.Anything).Run(func(a mock.Arguments) {
+					request = proto.Clone(a.Get(3).(*dataplane_protos.BackupSnapshotDataRequest)).(*dataplane_protos.BackupSnapshotDataRequest)
+				}).Return("child", nil).Once()
+				scheduler.On("WaitTask", mock.Anything, execCtx, "child").Return(&empty.Empty{}, nil).Once()
+				task := &backupSnapshotTask{scheduler: scheduler, storage: storage, backupS3: follower, request: &protos.BackupSnapshotRequest{SnapshotId: "snapshot", BackupId: "owner"}, state: &protos.BackupSnapshotTaskState{}}
+				require.NoError(t, task.Run(ctx, execCtx))
+				require.Equal(t, "owner", request.OwnerId)
+				require.Equal(t, backup.SnapshotMetaKey("disk", "snapshot"), request.MetaKey)
+				require.Equal(t, encrypted, len(request.EncryptedDek) != 0)
+				require.NoError(t, follower.CheckEncryptedDEK(request.EncryptedDek))
+				var savedMeta backup.SnapshotMeta
+				require.NoError(t, json.Unmarshal(request.Meta, &savedMeta))
+				require.Equal(t, "snapshot", savedMeta.ID)
+				require.Equal(t, "folder", savedMeta.FolderID)
+				saved, err := task.Save()
+				require.NoError(t, err)
+				serialized, err := proto.Marshal(task.request)
+				require.NoError(t, err)
+				resumed := &backupSnapshotTask{scheduler: scheduler, storage: storage, backupS3: follower}
+				require.NoError(t, resumed.Load(serialized, saved))
+				require.NoError(t, resumed.Run(ctx, execCtx))
+				require.True(t, resumed.GetResponse().(*protos.BackupSnapshotResponse).Completed)
+				mock.AssertExpectationsForObjects(t, storage, scheduler, execCtx)
+			})
+		}
 	}
-
-	creatingAt := time.Date(2026, 8, 31, 10, 0, 0, 0, time.UTC)
-	snapshot := &resources.SnapshotMeta{
-		ID:           "snap1",
-		FolderID:     "folder",
-		Disk:         &types.Disk{ZoneId: "zone", DiskId: "disk1"},
-		CheckpointID: "cp1",
-		CreateTaskID: "task1",
-		CreatingAt:   creatingAt,
-		CreatedBy:    "user",
-		Size:         8192,
-		StorageSize:  4096,
-		Encryption: &types.EncryptionDesc{
-			Mode: types.EncryptionMode_ENCRYPTION_AES_XTS,
-			Key:  &types.EncryptionDesc_KeyHash{KeyHash: []byte("hash")},
-		},
-		Ready: true,
-	}
-
-	storage := resources_mocks.NewStorageMock()
-	scheduler := tasks_mocks.NewSchedulerMock()
-	execCtx := tasks_mocks.NewExecutionContextMock()
-	var scheduledDEK []byte
-
-	storage.On("GetSnapshotMeta", mock.Anything, "snap1").Return(snapshot, nil)
-	storage.On("SnapshotBackupScheduled", mock.Anything, "snap1").Return(nil)
-	execCtx.On("GetTaskID").Return("backup1")
-	execCtx.On("SaveState", mock.Anything).Return(nil)
-	scheduler.On(
-		"ScheduleTask",
-		mock.Anything,
-		"dataplane.BackupSnapshotData",
-		"",
-		mock.MatchedBy(func(request *dataplane_protos.BackupSnapshotDataRequest) bool {
-			dek := request.EncryptedDek
-			scheduledDEK = append([]byte(nil), dek...)
-			return request.SnapshotId == "snap1" &&
-				len(request.EncryptedDek) != 0
-		}),
-	).Return("dataplane1", nil)
-	scheduler.On(
-		"WaitTask",
-		mock.Anything,
-		execCtx,
-		"dataplane1",
-	).Return(&empty.Empty{}, nil)
-
-	backupS3, err := backup.NewS3(
-		s3,
-		backupTestBucket,
-		t.Name(),
-		"kek1",
-		make([]byte, 32),
-	)
-	require.NoError(t, err)
-
-	task := &backupSnapshotTask{
-		scheduler: scheduler,
-		storage:   storage,
-		backupS3:  backupS3,
-		request:   &protos.BackupSnapshotRequest{SnapshotId: "snap1"},
-		state:     &protos.BackupSnapshotTaskState{},
-	}
-
-	err = task.Run(ctx, execCtx)
-	require.NoError(t, err)
-	require.Equal(t, "dataplane1", task.state.DataplaneTaskID)
-	require.Equal(t, task.state.EncryptedDek, scheduledDEK)
-	execCtx.AssertNumberOfCalls(t, "SaveState", 2)
-	mock.AssertExpectationsForObjects(t, storage, scheduler, execCtx)
-
-	object, err := backupS3.GetObject(
-		ctx,
-		backup.SnapshotMetaKey("disk1", "snap1"),
-	)
-	require.NoError(t, err)
-
-	var meta backup.SnapshotMeta
-	require.NoError(t, json.Unmarshal(object.Data, &meta))
-	require.Equal(
-		t,
-		backup.SnapshotMeta{
-			ID:                "snap1",
-			FolderID:          "folder",
-			ZoneID:            "zone",
-			DiskID:            "disk1",
-			CheckpointID:      "cp1",
-			CreateTaskID:      "task1",
-			CreatingAt:        creatingAt,
-			CreatedBy:         "user",
-			Size:              8192,
-			StorageSize:       4096,
-			EncryptionMode:    uint32(types.EncryptionMode_ENCRYPTION_AES_XTS),
-			EncryptionKeyHash: []byte("hash"),
-		},
-		meta,
-	)
 }
 
-func TestBackupSnapshotTaskReusesEncryptedDEK(t *testing.T) {
+func TestBackupSnapshotTaskRestoresExactRequestAfterSchedulingCrash(t *testing.T) {
 	ctx := test.NewContext()
-
-	s3, err := test.NewS3Client()
+	follower, err := backup.NewS3(nil, "bucket", "prefix", "key", make([]byte, 32))
 	require.NoError(t, err)
-
-	exists, err := s3.BucketExists(ctx, backupTestBucket)
+	dek, err := follower.NewEncryptedDEK()
 	require.NoError(t, err)
-	if !exists {
-		err = s3.CreateBucket(ctx, backupTestBucket)
-		require.NoError(t, err)
-	}
-
-	snapshot := &resources.SnapshotMeta{
-		ID:    "snap1",
-		Disk:  &types.Disk{ZoneId: "zone", DiskId: "disk1"},
-		Ready: true,
-	}
-
 	storage := resources_mocks.NewStorageMock()
 	scheduler := tasks_mocks.NewSchedulerMock()
 	execCtx := tasks_mocks.NewExecutionContextMock()
-
-	backupS3, err := backup.NewS3(
-		s3,
-		backupTestBucket,
-		t.Name(),
-		"kek1",
-		make([]byte, 32),
-	)
-	require.NoError(t, err)
-
-	preset, err := backupS3.NewEncryptedDEK()
-	require.NoError(t, err)
-
-	storage.On(
-		"GetSnapshotMeta",
-		mock.Anything,
-		"snap1",
-	).Return(snapshot, nil)
-	storage.On(
-		"SnapshotBackupScheduled",
-		mock.Anything,
-		"snap1",
-	).Return(nil)
-	execCtx.On("GetTaskID").Return("backup1")
+	execCtx.On("GetTaskID").Return("task")
 	execCtx.On("SaveState", mock.Anything).Return(nil)
-	scheduler.On(
-		"ScheduleTask",
-		mock.Anything,
-		"dataplane.BackupSnapshotData",
-		"",
-		mock.MatchedBy(func(
-			request *dataplane_protos.BackupSnapshotDataRequest,
-		) bool {
-			return request.SnapshotId == "snap1" &&
-				bytes.Equal(request.EncryptedDek, preset)
-		}),
-	).Return("dataplane1", nil)
-	scheduler.On(
-		"WaitTask",
-		mock.Anything,
-		execCtx,
-		"dataplane1",
-	).Return(&empty.Empty{}, nil)
-
-	task := &backupSnapshotTask{
-		scheduler: scheduler,
-		storage:   storage,
-		backupS3:  backupS3,
-		request:   &protos.BackupSnapshotRequest{SnapshotId: "snap1"},
-		state: &protos.BackupSnapshotTaskState{
-			EncryptedDek: preset,
-		},
-	}
-
-	err = task.Run(ctx, execCtx)
-	require.NoError(t, err)
-	require.Equal(t, preset, task.state.EncryptedDek)
-	execCtx.AssertNumberOfCalls(t, "SaveState", 1)
-	mock.AssertExpectationsForObjects(t, storage, scheduler, execCtx)
+	storage.On("ReleaseSnapshotBackup", mock.Anything, "snapshot", "owner", true).Return(nil)
+	request := &dataplane_protos.BackupSnapshotDataRequest{SnapshotId: "snapshot", OwnerId: "owner", EncryptedDek: dek, MetaKey: "meta", Meta: []byte("saved")}
+	scheduler.On("ScheduleTask", mock.Anything, "dataplane.BackupSnapshotData", "", mock.MatchedBy(func(r *dataplane_protos.BackupSnapshotDataRequest) bool {
+		return bytes.Equal(r.EncryptedDek, dek) && bytes.Equal(r.Meta, []byte("saved"))
+	})).Return("same-child", nil)
+	scheduler.On("WaitTask", mock.Anything, execCtx, "same-child").Return(&empty.Empty{}, nil)
+	task := &backupSnapshotTask{scheduler: scheduler, storage: storage, backupS3: follower, request: &protos.BackupSnapshotRequest{SnapshotId: "snapshot", BackupId: "owner"}, state: &protos.BackupSnapshotTaskState{DataplaneRequest: request, EncryptedDek: dek}}
+	require.NoError(t, task.Run(ctx, execCtx))
+	storage.AssertNotCalled(t, "ReserveSnapshotBackup", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	mock.AssertExpectationsForObjects(t, storage, scheduler)
 }
 
-func TestBackupSnapshotTaskWithoutEncryption(t *testing.T) {
+func TestBackupSnapshotTaskDoesNotCopyDeletingCandidate(t *testing.T) {
 	ctx := test.NewContext()
-
-	s3, err := test.NewS3Client()
-	require.NoError(t, err)
-
-	exists, err := s3.BucketExists(ctx, backupTestBucket)
-	require.NoError(t, err)
-	if !exists {
-		err = s3.CreateBucket(ctx, backupTestBucket)
-		require.NoError(t, err)
-	}
-
-	snapshot := &resources.SnapshotMeta{
-		ID:    "snap1",
-		Disk:  &types.Disk{ZoneId: "zone", DiskId: "disk1"},
-		Ready: true,
-	}
-
 	storage := resources_mocks.NewStorageMock()
 	scheduler := tasks_mocks.NewSchedulerMock()
 	execCtx := tasks_mocks.NewExecutionContextMock()
+	storage.On("ReserveSnapshotBackup", mock.Anything, "snapshot", "owner", true).Return((*resources.SnapshotMeta)(nil), nil)
+	storage.On("SnapshotBackupCancelled", mock.Anything, "snapshot", "owner").Return(nil)
+	task := &backupSnapshotTask{scheduler: scheduler, storage: storage, request: &protos.BackupSnapshotRequest{SnapshotId: "snapshot", BackupId: "owner"}, state: &protos.BackupSnapshotTaskState{}}
+	require.NoError(t, task.Run(ctx, execCtx))
+	require.False(t, task.GetResponse().(*protos.BackupSnapshotResponse).Completed)
+	scheduler.AssertNotCalled(t, "ScheduleTask", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	storage.AssertExpectations(t)
+}
 
-	backupS3, err := backup.NewS3(s3, backupTestBucket, t.Name(), "", nil)
-	require.NoError(t, err)
-
-	storage.On(
-		"GetSnapshotMeta",
-		mock.Anything,
-		"snap1",
-	).Return(snapshot, nil)
-	storage.On(
-		"SnapshotBackupScheduled",
-		mock.Anything,
-		"snap1",
-	).Return(nil)
-	execCtx.On("GetTaskID").Return("backup1")
+func TestBackupSnapshotTaskCancellationWaitsForUnknownChild(t *testing.T) {
+	ctx := test.NewContext()
+	storage := resources_mocks.NewStorageMock()
+	scheduler := tasks_mocks.NewSchedulerMock()
+	execCtx := tasks_mocks.NewExecutionContextMock()
+	execCtx.On("GetTaskID").Return("task")
 	execCtx.On("SaveState", mock.Anything).Return(nil)
-	scheduler.On(
-		"ScheduleTask",
-		mock.Anything,
-		"dataplane.BackupSnapshotData",
-		"",
-		mock.MatchedBy(func(
-			request *dataplane_protos.BackupSnapshotDataRequest,
-		) bool {
-			return request.SnapshotId == "snap1" &&
-				len(request.EncryptedDek) == 0
-		}),
-	).Return("dataplane1", nil)
-	scheduler.On(
-		"WaitTask",
-		mock.Anything,
-		execCtx,
-		"dataplane1",
-	).Return(&empty.Empty{}, nil)
+	scheduler.On("ScheduleTask", mock.Anything, "dataplane.BackupSnapshotData", "", mock.Anything).Return("child", nil)
+	scheduler.On("CancelTask", mock.Anything, "child").Return("", nil)
+	scheduler.On("WaitTaskEnded", mock.Anything, "child").Return(errors.NewInterruptExecutionError()).Once()
+	scheduler.On("WaitTaskEnded", mock.Anything, "child").Return(nil).Once()
+	scheduler.On("ScheduleTask", mock.Anything, "dataplane.ReleaseSnapshotBackup", "", mock.Anything).Return("release", nil)
+	scheduler.On("WaitTask", mock.Anything, execCtx, "release").Return(&empty.Empty{}, nil)
+	storage.On("ReleaseSnapshotBackup", mock.Anything, "snapshot", "owner", false).Return(nil).Once()
+	task := &backupSnapshotTask{scheduler: scheduler, storage: storage, request: &protos.BackupSnapshotRequest{SnapshotId: "snapshot", BackupId: "owner"}, state: &protos.BackupSnapshotTaskState{DataplaneRequest: &dataplane_protos.BackupSnapshotDataRequest{SnapshotId: "snapshot", OwnerId: "owner"}}}
+	err := task.Cancel(ctx, execCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	storage.AssertNotCalled(t, "ReleaseSnapshotBackup", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	require.NoError(t, task.Cancel(ctx, execCtx))
+	mock.AssertExpectationsForObjects(t, storage, scheduler)
+}
 
-	task := &backupSnapshotTask{
-		scheduler: scheduler,
-		storage:   storage,
-		backupS3:  backupS3,
-		request:   &protos.BackupSnapshotRequest{SnapshotId: "snap1"},
-		state:     &protos.BackupSnapshotTaskState{},
-	}
-
-	err = task.Run(ctx, execCtx)
-	require.NoError(t, err)
-	require.Empty(t, task.state.EncryptedDek)
-	execCtx.AssertNumberOfCalls(t, "SaveState", 1)
-	mock.AssertExpectationsForObjects(t, storage, scheduler, execCtx)
-
-	key := backup.SnapshotMetaKey("disk1", "snap1")
-	object, err := backupS3.GetObject(ctx, key)
-	require.NoError(t, err)
-
-	raw, err := s3.GetObject(ctx, backupTestBucket, backupS3.Key(key))
-	require.NoError(t, err)
-	require.Equal(t, object.Data, raw.Data)
-	require.Nil(t, raw.Metadata["Key-Id"])
-	require.Nil(t, raw.Metadata["Encrypted-Dek"])
+func TestBackupSnapshotTaskDoesNotCertifyLegacyChild(t *testing.T) {
+	ctx := test.NewContext()
+	storage := resources_mocks.NewStorageMock()
+	scheduler := tasks_mocks.NewSchedulerMock()
+	execCtx := tasks_mocks.NewExecutionContextMock()
+	execCtx.On("GetTaskID").Return("legacy")
+	scheduler.On("WaitTask", ctx, execCtx, "legacy-child").Return(&empty.Empty{}, nil)
+	storage.On("SnapshotBackupCancelled", ctx, "snapshot", "").Return(nil)
+	task := &backupSnapshotTask{storage: storage, scheduler: scheduler, request: &protos.BackupSnapshotRequest{SnapshotId: "snapshot"}, state: &protos.BackupSnapshotTaskState{DataplaneTaskID: "legacy-child"}}
+	require.NoError(t, task.Run(ctx, execCtx))
+	require.False(t, task.GetResponse().(*protos.BackupSnapshotResponse).Completed)
+	storage.AssertNotCalled(t, "ReleaseSnapshotBackup", mock.Anything, mock.Anything, mock.Anything, true)
+	mock.AssertExpectationsForObjects(t, storage, scheduler)
 }

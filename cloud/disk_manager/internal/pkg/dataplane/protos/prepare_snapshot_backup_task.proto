@@ -1,0 +1,20 @@
+syntax = "proto3";
+package dataplane;
+option go_package = "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/protos";
+
+message PrepareSnapshotBackupRequest {
+    string SnapshotId = 1;
+    string OwnerId = 2;
+}
+message PrepareSnapshotBackupState {
+    uint32 NextChunkIndex = 1;
+    bool Prepared = 2;
+    string BaseSnapshotId = 3;
+}
+message PrepareSnapshotBackupResponse {
+    string BaseSnapshotId = 1;
+}
+message ReleaseSnapshotBackupRequest {
+    string SnapshotId = 1;
+    string OwnerId = 2;
+}

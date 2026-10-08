@@ -292,30 +292,42 @@ func (s *StorageMock) ListSnapshots(
 	return args.Get(0).([]string), args.Error(1)
 }
 
+func (s *StorageMock) EnqueueSnapshotBackup(
+	ctx context.Context,
+	snapshotID string,
+	backupID string,
+) error {
+
+	args := s.Called(ctx, snapshotID, backupID)
+	return args.Error(0)
+}
+
 func (s *StorageMock) ListSnapshotsToBackup(
 	ctx context.Context,
 	limit int,
-) ([]string, error) {
+) ([]resources.SnapshotBackupRequest, error) {
 
 	args := s.Called(ctx, limit)
-	return args.Get(0).([]string), args.Error(1)
+	return args.Get(0).([]resources.SnapshotBackupRequest), args.Error(1)
 }
 
 func (s *StorageMock) SnapshotBackupScheduled(
 	ctx context.Context,
 	snapshotID string,
+	backupID string,
 ) error {
 
-	args := s.Called(ctx, snapshotID)
+	args := s.Called(ctx, snapshotID, backupID)
 	return args.Error(0)
 }
 
 func (s *StorageMock) SnapshotBackupCancelled(
 	ctx context.Context,
 	snapshotID string,
+	backupID string,
 ) error {
 
-	args := s.Called(ctx, snapshotID)
+	args := s.Called(ctx, snapshotID, backupID)
 	return args.Error(0)
 }
 
@@ -600,4 +612,77 @@ func NewStorageMock() *StorageMock {
 // Ensure that StorageMock implements resources.Storage.
 func assertStorageMockIsStorage(arg *StorageMock) resources.Storage {
 	return arg
+}
+
+func (s *StorageMock) ListSnapshotBackupFolders(ctx context.Context) ([]resources.SnapshotBackupFolder, error) {
+	a := s.Called(ctx)
+	if a.Get(0) == nil {
+		return nil, a.Error(1)
+	}
+	return a.Get(0).([]resources.SnapshotBackupFolder), a.Error(1)
+}
+
+func (s *StorageMock) SetSnapshotBackupFolderPrepared(ctx context.Context, folderID, generation string, prepared bool) error {
+	a := s.Called(ctx, folderID, generation, prepared)
+	return a.Error(0)
+}
+
+func (s *StorageMock) ListSnapshotBackupCandidates(ctx context.Context, folderID, afterID string, before time.Time, limit int) ([]string, error) {
+	a := s.Called(ctx, folderID, afterID, before, limit)
+	if a.Get(0) == nil {
+		return nil, a.Error(1)
+	}
+	return a.Get(0).([]string), a.Error(1)
+}
+
+func (s *StorageMock) GetSnapshotBackupPlan(ctx context.Context, folderID, snapshotID string) (*resources.SnapshotBackupPlan, error) {
+	a := s.Called(ctx, folderID, snapshotID)
+	if a.Get(0) == nil {
+		return nil, a.Error(1)
+	}
+	return a.Get(0).(*resources.SnapshotBackupPlan), a.Error(1)
+}
+
+func (s *StorageMock) SaveSnapshotBackupPlan(ctx context.Context, plan resources.SnapshotBackupPlan) error {
+	a := s.Called(ctx, plan)
+	return a.Error(0)
+}
+
+func (s *StorageMock) ListSnapshotBackupPlans(ctx context.Context, folderID string, limit int, eligible bool, afterID string) ([]resources.SnapshotBackupPlan, error) {
+	a := s.Called(ctx, folderID, limit, eligible, afterID)
+	if a.Get(0) == nil {
+		return nil, a.Error(1)
+	}
+	return a.Get(0).([]resources.SnapshotBackupPlan), a.Error(1)
+}
+
+func (s *StorageMock) RemoveSnapshotBackupPlan(ctx context.Context, folderID, snapshotID, ownerID string) error {
+	a := s.Called(ctx, folderID, snapshotID, ownerID)
+	return a.Error(0)
+}
+
+func (s *StorageMock) ReserveSnapshotBackup(ctx context.Context, snapshotID, ownerID string, start bool) (*resources.SnapshotMeta, error) {
+	a := s.Called(ctx, snapshotID, ownerID, start)
+	if a.Get(0) == nil {
+		return nil, a.Error(1)
+	}
+	return a.Get(0).(*resources.SnapshotMeta), a.Error(1)
+}
+
+func (s *StorageMock) ReleaseSnapshotBackup(ctx context.Context, snapshotID, ownerID string, completed bool) error {
+	a := s.Called(ctx, snapshotID, ownerID, completed)
+	return a.Error(0)
+}
+
+func (s *StorageMock) ClaimSnapshotBackupFolder(ctx context.Context, folderID, generation, taskID string) (bool, error) {
+	a := s.Called(ctx, folderID, generation, taskID)
+	return a.Bool(0), a.Error(1)
+}
+
+func (s *StorageMock) ReleaseSnapshotBackupFolder(ctx context.Context, folderID, taskID string) error {
+	return s.Called(ctx, folderID, taskID).Error(0)
+}
+
+func (s *StorageMock) SetSnapshotBackupFolder(ctx context.Context, folderID, generation string, enabled bool) error {
+	return s.Called(ctx, folderID, generation, enabled).Error(0)
 }

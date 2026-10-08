@@ -4,13 +4,21 @@ package snapshots;
 
 option go_package = "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/snapshots/protos";
 
+import "cloud/disk_manager/internal/pkg/dataplane/protos/backup_snapshot_data_task.proto";
+
 ////////////////////////////////////////////////////////////////////////////////
 
 message BackupSnapshotRequest {
     string SnapshotId = 1;
+    string BackupId = 2;
+    bytes EncryptedDek = 3;
 }
 
 message BackupSnapshotTaskState {
     string DataplaneTaskID = 1;
     bytes EncryptedDek = 2;
+    dataplane.BackupSnapshotDataRequest DataplaneRequest = 3;
+    bool Finished = 4;
 }
+
+message BackupSnapshotResponse { bool Completed = 1; }

@@ -293,3 +293,59 @@ func (l lz4BlockModeCompressor) decompress(data []byte, result []byte) error {
 	_, err := l.codec.Decode(result, data)
 	return err
 }
+
+// DecompressToBytes preserves the actual decoded length for checksum validation
+// of raw blobs, whose callers do not already have a disk-sized output buffer.
+func DecompressToBytes(format string, data []byte, limit int) ([]byte, error) {
+	c, err := newCompressor(format)
+	if err != nil {
+		return nil, err
+	}
+	var decoded []byte
+	switch c := c.(type) {
+	case *nullCompressor:
+		decoded = data
+	case *lz4Compressor:
+		decoded, err = io.ReadAll(io.LimitReader(lz4.NewReader(bytes.NewReader(data)), int64(limit)+1))
+	case *gzipCompressor:
+		var reader *gzip.Reader
+		reader, err = gzip.NewReader(bytes.NewReader(data))
+		if err == nil {
+			decoded, err = io.ReadAll(io.LimitReader(reader, int64(limit)+1))
+			reader.Close()
+		}
+	case *zstdCompressor:
+		decoded, err = decodeBlobBlock(c.codec, data, limit)
+	case *lz4BlockModeCompressor:
+		decoded, err = decodeBlobBlock(c.codec, data, limit)
+	case *zstdCgoCompressor:
+		decoded, err = zstdcgo.Decompress(nil, data)
+	default:
+		return nil, errors.NewNonRetriableErrorf("unsupported blob compression %q", format)
+	}
+	if err != nil {
+		return nil, errors.NewNonRetriableError(err)
+	}
+	if len(decoded) > limit {
+		return nil, errors.NewNonRetriableErrorf("decoded chunk exceeds %v bytes", limit)
+	}
+	return decoded, nil
+}
+
+func decodeBlobBlock(codec blockcodecs.Codec, data []byte, limit int) ([]byte, error) {
+	length, err := codec.DecodedLen(data)
+	if err != nil {
+		return nil, err
+	}
+	if length < 0 || length > limit {
+		return nil, errors.NewNonRetriableErrorf("invalid decoded chunk length %v", length)
+	}
+	decoded, err := codec.Decode(make([]byte, length), data)
+	if err != nil {
+		return nil, err
+	}
+	if len(decoded) != length {
+		return nil, errors.NewNonRetriableErrorf("decoded chunk length mismatch: expected %v, actual %v", length, len(decoded))
+	}
+	return decoded, nil
+}

@@ -151,6 +151,25 @@ type Storage interface {
 
 	UnlockSnapshot(ctx context.Context, snapshotID string, lockTaskID string) error
 
+	// HoldSnapshotForBackup prevents deletion of a ready snapshot until the
+	// owning task releases it. The hold does not expire automatically.
+	HoldSnapshotForBackup(
+		ctx context.Context,
+		snapshotID string,
+		taskID string,
+	) error
+
+	// ReleaseSnapshotForBackup releases only the matching task's hold.
+	// Callers must retain it across retries and release it after success or
+	// cancellation, once all backup workers have stopped using the snapshot.
+	CheckSnapshotBackupOwner(ctx context.Context, snapshotID, ownerID string) error
+
+	ReleaseSnapshotForBackup(
+		ctx context.Context,
+		snapshotID string,
+		taskID string,
+	) error
+
 	GetSnapshotMeta(
 		ctx context.Context,
 		snapshotID string,
@@ -163,6 +182,10 @@ type Storage interface {
 
 	ListSnapshots(ctx context.Context) (tasks_common.StringSet, error)
 
+	RequeueBackupChunk(ctx context.Context, ownerID string, entry BackupChunkQueueEntry) error
+
+	EnqueueBackupChunksForOwner(ctx context.Context, snapshotID, ownerID string, entries []BackupChunkQueueEntry) error
+
 	EnqueueBackupChunks(
 		ctx context.Context,
 		snapshotID string,
@@ -173,6 +196,25 @@ type Storage interface {
 		ctx context.Context,
 		limit int,
 	) ([]BackupChunkQueueEntry, error)
+
+	// Claim only entries still in the queue and register their worker before IO.
+	ClaimBackupChunks(
+		ctx context.Context,
+		taskID string,
+		entries []BackupChunkQueueEntry,
+	) ([]BackupChunkQueueEntry, error)
+	ReleaseBackupChunkClaims(ctx context.Context, taskID string) error
+
+	// Remove pending work and wait for claimed workers before releasing the hold.
+	DrainSnapshotBackup(
+		ctx context.Context,
+		snapshotID string,
+		taskID string,
+		limit int,
+	) error
+
+	CheckBackupChunksCompleted(ctx context.Context, snapshotID string) error
+	ChunkBackupFailed(ctx context.Context, entry BackupChunkQueueEntry) error
 
 	GetBackedUpChunkCount(
 		ctx context.Context,

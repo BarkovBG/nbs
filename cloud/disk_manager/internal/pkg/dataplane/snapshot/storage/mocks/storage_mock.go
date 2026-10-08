@@ -237,6 +237,26 @@ func (s *StorageMock) UnlockSnapshot(
 	return args.Error(0)
 }
 
+func (s *StorageMock) HoldSnapshotForBackup(
+	ctx context.Context,
+	snapshotID string,
+	taskID string,
+) error {
+
+	args := s.Called(ctx, snapshotID, taskID)
+	return args.Error(0)
+}
+
+func (s *StorageMock) ReleaseSnapshotForBackup(
+	ctx context.Context,
+	snapshotID string,
+	taskID string,
+) error {
+
+	args := s.Called(ctx, snapshotID, taskID)
+	return args.Error(0)
+}
+
 func (s *StorageMock) GetSnapshotMeta(
 	ctx context.Context,
 	snapshotID string,
@@ -329,4 +349,52 @@ func (s *StorageMock) GetBackupChunkQueueLength(
 // Ensure that StorageMock implements storage.Storage.
 func assertStorageMockIsStorage(arg *StorageMock) storage.Storage {
 	return arg
+}
+
+func (s *StorageMock) ClaimBackupChunks(
+	ctx context.Context,
+	taskID string,
+	entries []storage.BackupChunkQueueEntry,
+) ([]storage.BackupChunkQueueEntry, error) {
+
+	args := s.Called(ctx, taskID, entries)
+	return args.Get(0).([]storage.BackupChunkQueueEntry), args.Error(1)
+}
+
+func (s *StorageMock) ReleaseBackupChunkClaims(
+	ctx context.Context,
+	taskID string,
+) error {
+
+	return s.Called(ctx, taskID).Error(0)
+}
+
+func (s *StorageMock) DrainSnapshotBackup(
+	ctx context.Context,
+	snapshotID string,
+	taskID string,
+	limit int,
+) error {
+
+	return s.Called(ctx, snapshotID, taskID, limit).Error(0)
+}
+
+func (s *StorageMock) CheckBackupChunksCompleted(ctx context.Context, snapshotID string) error {
+	return s.Called(ctx, snapshotID).Error(0)
+}
+
+func (s *StorageMock) ChunkBackupFailed(ctx context.Context, entry storage.BackupChunkQueueEntry) error {
+	return s.Called(ctx, entry).Error(0)
+}
+
+func (s *StorageMock) EnqueueBackupChunksForOwner(ctx context.Context, snapshotID, ownerID string, entries []storage.BackupChunkQueueEntry) error {
+	return s.Called(ctx, snapshotID, ownerID, entries).Error(0)
+}
+
+func (s *StorageMock) CheckSnapshotBackupOwner(ctx context.Context, snapshotID, ownerID string) error {
+	return s.Called(ctx, snapshotID, ownerID).Error(0)
+}
+
+func (s *StorageMock) RequeueBackupChunk(ctx context.Context, ownerID string, entry storage.BackupChunkQueueEntry) error {
+	return s.Called(ctx, ownerID, entry).Error(0)
 }

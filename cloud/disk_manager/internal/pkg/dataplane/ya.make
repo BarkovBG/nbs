@@ -1,6 +1,7 @@
 GO_LIBRARY()
 
 SRCS(
+    prepare_snapshot_backup_task.go
     backup_chunks_task.go
     backup_snapshot_data_task.go
     collect_snapshot_metrics_task.go
@@ -22,6 +23,7 @@ SRCS(
 )
 
 GO_TEST_SRCS(
+    prepare_snapshot_backup_task_test.go
     collect_snapshots_task_test.go
     replicate_disk_task_test.go
 )

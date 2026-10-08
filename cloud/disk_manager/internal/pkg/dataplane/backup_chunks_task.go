@@ -1,6 +1,7 @@
 package dataplane
 
 import (
+	"bytes"
 	"context"
 	"math/rand"
 
@@ -46,6 +47,14 @@ func (t *backupChunksTask) Run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
+	// A restarted execution has no local IO from its previous batch. Clear
+	// claims left by an interrupted invocation before starting another batch.
+	taskID := execCtx.GetTaskID()
+	err := t.storage.ReleaseBackupChunkClaims(ctx, taskID)
+	if err != nil {
+		return err
+	}
+
 	for {
 		entries, err := t.storage.GetQueuedChunksToBackup(
 			ctx,
@@ -64,14 +73,30 @@ func (t *backupChunksTask) Run(
 		})
 		entries = entries[:min(len(entries), t.batchSize)]
 
-		copied, err := t.copyChunks(ctx, entries)
-		if len(copied) == 0 {
-			return err
-		}
-
-		err = t.storage.ChunksBackupCompleted(ctx, copied)
+		entries, err = t.storage.ClaimBackupChunks(ctx, taskID, entries)
 		if err != nil {
 			return err
+		}
+		if len(entries) == 0 {
+			continue
+		}
+
+		copied, copyErr := t.copyChunks(ctx, entries)
+		if len(copied) != 0 {
+			err = t.storage.ChunksBackupCompleted(ctx, copied)
+			if err != nil {
+				return err
+			}
+		}
+
+		// copyChunks joins every goroutine, including on errors. Retain the
+		// claims until both object writes and completion updates have stopped.
+		err = t.storage.ReleaseBackupChunkClaims(ctx, taskID)
+		if err != nil {
+			return err
+		}
+		if len(copied) == 0 {
+			return copyErr
 		}
 	}
 }
@@ -79,9 +104,16 @@ func (t *backupChunksTask) Run(
 func (t *backupChunksTask) Cancel(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
-) error {
+) (err error) {
 
-	return nil
+	// Cancellation must not be marked complete while cleanup has failed.
+	defer func() {
+		if err != nil && !errors.Is(err, errors.NewInterruptExecutionError()) {
+			err = errors.NewRetriableErrorf("failed to cancel backup worker: %v", err)
+		}
+	}()
+
+	return t.storage.ReleaseBackupChunkClaims(ctx, execCtx.GetTaskID())
 }
 
 func (t *backupChunksTask) GetMetadata(
@@ -102,13 +134,30 @@ func (t *backupChunksTask) copyChunk(
 	entry storage.BackupChunkQueueEntry,
 ) error {
 
-	chunkBlob, err := t.storage.ReadChunkBlob(
-		ctx,
-		entry.ChunkID,
-		entry.StoredInS3,
-	)
+	chunkBlob, err := t.storage.ReadChunkBlob(ctx, entry.ChunkID, entry.StoredInS3)
 	if err != nil {
 		return err
+	}
+	expected := chunks.NewS3Object(chunkBlob)
+	exists, err := t.backupS3.ObjectExists(ctx, backup.ChunkKey(entry.ChunkID))
+	if err != nil {
+		return err
+	}
+	if exists {
+		object, err := t.backupS3.GetObject(ctx, backup.ChunkKey(entry.ChunkID))
+		if err != nil && errors.Is(err, errors.NewEmptyRetriableError()) {
+			return err
+		}
+		equal := err == nil && bytes.Equal(object.Data, expected.Data)
+		for key, value := range expected.Metadata {
+			actual := object.Metadata[key]
+			if value == nil || actual == nil || *value != *actual {
+				equal = false
+			}
+		}
+		if equal {
+			return nil
+		}
 	}
 
 	err = t.backupS3.PutObject(
@@ -162,11 +211,17 @@ func (t *backupChunksTask) copyChunks(
 				if err != nil {
 					logging.Warn(
 						groupCtx,
-						"Failed to copy chunk %v of snapshot %v, will retry: %v",
+						"Failed to copy chunk %v of snapshot %v: %v",
 						entry.ChunkID,
 						entry.SnapshotID,
 						err,
 					)
+					if errors.Is(err, errors.NewEmptyNonRetriableError()) {
+						markErr := t.storage.ChunkBackupFailed(groupCtx, entry)
+						if markErr != nil {
+							err = markErr
+						}
+					}
 					copyErrors <- err
 					continue
 				}
