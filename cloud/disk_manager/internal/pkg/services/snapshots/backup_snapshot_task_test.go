@@ -24,6 +24,14 @@ import (
 const backupTestBucket = "snapshots-backup"
 
 func TestBackupSnapshotTask(t *testing.T) {
+	for _, backupID := range []string{"", "manual"} {
+		t.Run("backupID="+backupID, func(t *testing.T) {
+			testBackupSnapshotTask(t, backupID)
+		})
+	}
+}
+
+func testBackupSnapshotTask(t *testing.T, backupID string) {
 	ctx := test.NewContext()
 
 	s3, err := test.NewS3Client()
@@ -60,7 +68,9 @@ func TestBackupSnapshotTask(t *testing.T) {
 	var scheduledDEK []byte
 
 	storage.On("GetSnapshotMeta", mock.Anything, "snap1").Return(snapshot, nil)
-	storage.On("SnapshotBackupScheduled", mock.Anything, "snap1").Return(nil)
+	storage.On(
+		"SnapshotBackupScheduled", mock.Anything, "snap1", backupID,
+	).Return(nil)
 	execCtx.On("GetTaskID").Return("backup1")
 	execCtx.On("SaveState", mock.Anything).Return(nil)
 	scheduler.On(
@@ -95,8 +105,11 @@ func TestBackupSnapshotTask(t *testing.T) {
 		scheduler: scheduler,
 		storage:   storage,
 		backupS3:  backupS3,
-		request:   &protos.BackupSnapshotRequest{SnapshotId: "snap1"},
-		state:     &protos.BackupSnapshotTaskState{},
+		request: &protos.BackupSnapshotRequest{
+			SnapshotId: "snap1",
+			BackupId:   backupID,
+		},
+		state: &protos.BackupSnapshotTaskState{},
 	}
 
 	err = task.Run(ctx, execCtx)
@@ -178,6 +191,7 @@ func TestBackupSnapshotTaskReusesEncryptedDEK(t *testing.T) {
 		"SnapshotBackupScheduled",
 		mock.Anything,
 		"snap1",
+		"",
 	).Return(nil)
 	execCtx.On("GetTaskID").Return("backup1")
 	execCtx.On("SaveState", mock.Anything).Return(nil)
@@ -252,6 +266,7 @@ func TestBackupSnapshotTaskWithoutEncryption(t *testing.T) {
 		"SnapshotBackupScheduled",
 		mock.Anything,
 		"snap1",
+		"",
 	).Return(nil)
 	execCtx.On("GetTaskID").Return("backup1")
 	execCtx.On("SaveState", mock.Anything).Return(nil)
@@ -297,4 +312,46 @@ func TestBackupSnapshotTaskWithoutEncryption(t *testing.T) {
 	require.Equal(t, object.Data, raw.Data)
 	require.Nil(t, raw.Metadata["Key-Id"])
 	require.Nil(t, raw.Metadata["Encrypted-Dek"])
+}
+
+func TestBackupSnapshotTaskCancellationUsesBackupID(t *testing.T) {
+	ctx := test.NewContext()
+	storage := resources_mocks.NewStorageMock()
+	storage.On(
+		"SnapshotBackupCancelled", mock.Anything, "snap1", "attempt",
+	).Return(nil).Once()
+
+	task := &backupSnapshotTask{
+		storage: storage,
+		request: &protos.BackupSnapshotRequest{
+			SnapshotId: "snap1",
+			BackupId:   "attempt",
+		},
+	}
+	err := task.Cancel(ctx, tasks_mocks.NewExecutionContextMock())
+	require.NoError(t, err)
+	storage.AssertExpectations(t)
+}
+
+func TestBackupSnapshotTaskDoesNotBackUpDeletingSnapshot(t *testing.T) {
+	ctx := test.NewContext()
+	storage := resources_mocks.NewStorageMock()
+	storage.On("GetSnapshotMeta", mock.Anything, "snap1").Return(
+		&resources.SnapshotMeta{ID: "snap1", Ready: false},
+		nil,
+	).Once()
+	storage.On(
+		"SnapshotBackupCancelled", mock.Anything, "snap1", "attempt",
+	).Return(nil).Once()
+
+	task := &backupSnapshotTask{
+		storage: storage,
+		request: &protos.BackupSnapshotRequest{
+			SnapshotId: "snap1",
+			BackupId:   "attempt",
+		},
+	}
+	err := task.Run(ctx, tasks_mocks.NewExecutionContextMock())
+	require.NoError(t, err)
+	storage.AssertExpectations(t)
 }
