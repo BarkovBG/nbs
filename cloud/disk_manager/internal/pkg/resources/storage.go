@@ -124,6 +124,11 @@ type SnapshotBackupID struct {
 	SnapshotID string
 }
 
+type SnapshotBackupRequest struct {
+	SnapshotID string
+	BackupID   string
+}
+
 type Storage interface {
 	// Returns disk if action has been accepted by storage and nil otherwise.
 	CreateDisk(ctx context.Context, disk DiskMeta) (*DiskMeta, error)
@@ -230,11 +235,28 @@ type Storage interface {
 		creatingBefore time.Time,
 	) ([]string, error)
 
-	ListSnapshotsToBackup(ctx context.Context, limit int) ([]string, error)
+	EnqueueSnapshotBackup(
+		ctx context.Context,
+		snapshotID string,
+		backupID string,
+	) error
 
-	SnapshotBackupScheduled(ctx context.Context, snapshotID string) error
+	ListSnapshotsToBackup(
+		ctx context.Context,
+		limit int,
+	) ([]SnapshotBackupRequest, error)
 
-	SnapshotBackupCancelled(ctx context.Context, snapshotID string) error
+	SnapshotBackupScheduled(
+		ctx context.Context,
+		snapshotID string,
+		backupID string,
+	) error
+
+	SnapshotBackupCancelled(
+		ctx context.Context,
+		snapshotID string,
+		backupID string,
+	) error
 
 	GetSnapshotBackupDeleteQueue(
 		ctx context.Context,

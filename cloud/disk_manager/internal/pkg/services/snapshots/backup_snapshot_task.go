@@ -55,7 +55,11 @@ func (t *backupSnapshotTask) Run(
 	}
 
 	if meta == nil || !meta.Ready {
-		return t.storage.SnapshotBackupCancelled(ctx, snapshotID)
+		return t.storage.SnapshotBackupCancelled(
+			ctx,
+			snapshotID,
+			t.request.BackupId,
+		)
 	}
 
 	if meta.Disk == nil {
@@ -114,7 +118,11 @@ func (t *backupSnapshotTask) Run(
 		return err
 	}
 
-	return t.storage.SnapshotBackupScheduled(ctx, snapshotID)
+	return t.storage.SnapshotBackupScheduled(
+		ctx,
+		snapshotID,
+		t.request.BackupId,
+	)
 }
 
 func (t *backupSnapshotTask) Cancel(
@@ -124,7 +132,11 @@ func (t *backupSnapshotTask) Cancel(
 
 	// TODO(https://github.com/ydb-platform/nbs/issues/7237):
 	// roll back the objects already written to the follower bucket.
-	return t.storage.SnapshotBackupCancelled(ctx, t.request.SnapshotId)
+	return t.storage.SnapshotBackupCancelled(
+		ctx,
+		t.request.SnapshotId,
+		t.request.BackupId,
+	)
 }
 
 func (t *backupSnapshotTask) GetMetadata(

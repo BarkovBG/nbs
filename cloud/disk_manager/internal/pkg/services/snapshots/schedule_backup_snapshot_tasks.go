@@ -33,20 +33,24 @@ func (t *scheduleBackupSnapshotTasks) Run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	snapshotIDs, err := t.storage.ListSnapshotsToBackup(ctx, t.limit)
+	backups, err := t.storage.ListSnapshotsToBackup(ctx, t.limit)
 	if err != nil {
 		return err
 	}
 
-	for _, snapshotID := range snapshotIDs {
-		idempotencyKey := fmt.Sprintf("backup_snapshot_%v", snapshotID)
+	for _, backup := range backups {
+		idempotencyKey := fmt.Sprintf("backup_snapshot_%v", backup.SnapshotID)
+		if len(backup.BackupID) != 0 {
+			idempotencyKey += "_" + backup.BackupID
+		}
 
 		_, err := t.scheduler.ScheduleTask(
 			headers.SetIncomingIdempotencyKey(ctx, idempotencyKey),
 			"snapshots.BackupSnapshot",
 			"",
 			&protos.BackupSnapshotRequest{
-				SnapshotId: snapshotID,
+				SnapshotId: backup.SnapshotID,
+				BackupId:   backup.BackupID,
 			},
 		)
 		if err != nil {
