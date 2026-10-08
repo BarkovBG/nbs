@@ -71,6 +71,7 @@ type SnapshotMeta struct {
 	StorageSize       uint64                `json:"storage_size"`
 	Encryption        *types.EncryptionDesc `json:"encryption"`
 	Ready             bool                  `json:"ready"`
+	BackupCompleted   bool                  `json:"backup_completed"`
 }
 
 type FilesystemMeta struct {

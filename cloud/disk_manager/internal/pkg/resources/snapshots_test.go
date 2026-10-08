@@ -521,6 +521,10 @@ func newSnapshotBackupTestStorage(t *testing.T) (context.Context, *storageYDB) {
 func TestEnqueueSnapshotBackupIsIdempotent(t *testing.T) {
 	ctx, storage := newSnapshotBackupTestStorage(t)
 
+	meta, err := storage.GetSnapshotMeta(ctx, "snapshot")
+	require.NoError(t, err)
+	require.False(t, meta.BackupCompleted)
+
 	queue, err := storage.ListSnapshotsToBackup(ctx, 10)
 	require.NoError(t, err)
 	require.Empty(t, queue)
@@ -535,8 +539,16 @@ func TestEnqueueSnapshotBackupIsIdempotent(t *testing.T) {
 		SnapshotID: "snapshot", BackupID: "first",
 	}}, queue)
 
+	meta, err = storage.GetSnapshotMeta(ctx, "snapshot")
+	require.NoError(t, err)
+	require.False(t, meta.BackupCompleted)
+
 	err = storage.SnapshotBackupScheduled(ctx, "snapshot", "first")
 	require.NoError(t, err)
+	meta, err = storage.GetSnapshotMeta(ctx, "snapshot")
+	require.NoError(t, err)
+	require.True(t, meta.BackupCompleted)
+
 	err = storage.SnapshotBackupCancelled(ctx, "snapshot", "first")
 	require.NoError(t, err)
 	err = storage.EnqueueSnapshotBackup(ctx, "snapshot", "third")
@@ -544,6 +556,9 @@ func TestEnqueueSnapshotBackupIsIdempotent(t *testing.T) {
 	queue, err = storage.ListSnapshotsToBackup(ctx, 10)
 	require.NoError(t, err)
 	require.Empty(t, queue)
+	meta, err = storage.GetSnapshotMeta(ctx, "snapshot")
+	require.NoError(t, err)
+	require.True(t, meta.BackupCompleted)
 }
 
 func TestEnqueueSnapshotBackupAfterCancellation(t *testing.T) {
@@ -553,6 +568,10 @@ func TestEnqueueSnapshotBackupAfterCancellation(t *testing.T) {
 	require.NoError(t, err)
 	err = storage.SnapshotBackupCancelled(ctx, "snapshot", "first")
 	require.NoError(t, err)
+	meta, err := storage.GetSnapshotMeta(ctx, "snapshot")
+	require.NoError(t, err)
+	require.False(t, meta.BackupCompleted)
+
 	err = storage.EnqueueSnapshotBackup(ctx, "snapshot", "second")
 	require.NoError(t, err)
 
@@ -567,6 +586,9 @@ func TestEnqueueSnapshotBackupAfterCancellation(t *testing.T) {
 	require.Equal(t, []SnapshotBackupRequest{{
 		SnapshotID: "snapshot", BackupID: "second",
 	}}, queue)
+	meta, err = storage.GetSnapshotMeta(ctx, "snapshot")
+	require.NoError(t, err)
+	require.False(t, meta.BackupCompleted)
 
 	err = storage.SnapshotBackupCancelled(ctx, "snapshot", "second")
 	require.NoError(t, err)

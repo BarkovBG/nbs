@@ -150,12 +150,17 @@ type Storage interface {
 
 	UnlockSnapshot(ctx context.Context, snapshotID string, lockTaskID string) error
 
+	// HoldSnapshotForBackup prevents deletion of a ready snapshot until the
+	// owning task releases it. The hold does not expire automatically.
 	HoldSnapshotForBackup(
 		ctx context.Context,
 		snapshotID string,
 		taskID string,
 	) error
 
+	// ReleaseSnapshotForBackup releases only the matching task's hold.
+	// Callers must retain it across retries and release it after success or
+	// cancellation, once all backup workers have stopped using the snapshot.
 	ReleaseSnapshotForBackup(
 		ctx context.Context,
 		snapshotID string,

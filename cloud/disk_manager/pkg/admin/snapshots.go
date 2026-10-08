@@ -230,6 +230,10 @@ func newBackupSnapshotCmd(
 	cmd := &cobra.Command{
 		Use:   "backup",
 		Short: "Enqueue a snapshot backup; repeated requests are successful",
+		Long: "Enqueue a snapshot backup and return OK without waiting for completion. " +
+			"Use snapshots get --id <id> to check backup_completed: true means " +
+			"the backup task completed successfully; false means no recorded success " +
+			"and does not distinguish pending, failed, or never requested backups.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return c.run()
 		},

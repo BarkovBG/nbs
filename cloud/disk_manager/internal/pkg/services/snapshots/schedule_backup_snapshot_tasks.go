@@ -39,6 +39,8 @@ func (t *scheduleBackupSnapshotTasks) Run(
 	}
 
 	for _, backup := range backups {
+		// Preserve the task key for legacy queue entries. New attempts need a
+		// distinct key so they do not reuse a previously cancelled task.
 		idempotencyKey := fmt.Sprintf("backup_snapshot_%v", backup.SnapshotID)
 		if len(backup.BackupID) != 0 {
 			idempotencyKey += "_" + backup.BackupID
