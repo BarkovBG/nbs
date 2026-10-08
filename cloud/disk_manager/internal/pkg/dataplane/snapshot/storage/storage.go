@@ -150,6 +150,18 @@ type Storage interface {
 
 	UnlockSnapshot(ctx context.Context, snapshotID string, lockTaskID string) error
 
+	HoldSnapshotForBackup(
+		ctx context.Context,
+		snapshotID string,
+		taskID string,
+	) error
+
+	ReleaseSnapshotForBackup(
+		ctx context.Context,
+		snapshotID string,
+		taskID string,
+	) error
+
 	GetSnapshotMeta(
 		ctx context.Context,
 		snapshotID string,

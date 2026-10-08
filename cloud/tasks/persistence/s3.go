@@ -292,6 +292,36 @@ func (c *S3Client) BucketExists(
 	return true, nil
 }
 
+func (c *S3Client) ObjectExists(
+	ctx context.Context,
+	bucket string,
+	key string,
+) (exists bool, err error) {
+
+	ctx = withComponentLoggingField(ctx)
+	ctx, cancel := context.WithTimeout(ctx, c.callTimeout)
+	defer cancel()
+
+	defer c.metrics.StatCall(ctx, "HeadObject", bucket, key)(&err)
+
+	_, err = c.s3.HeadObjectWithContext(ctx, &aws_s3.HeadObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+	})
+	if err == nil {
+		return true, nil
+	}
+
+	if aerr, ok := err.(awserr.Error); ok {
+		switch aerr.Code() {
+		case "NotFound", aws_s3.ErrCodeNoSuchKey:
+			return false, nil
+		}
+	}
+
+	return false, wrapError(err)
+}
+
 func (c *S3Client) GetObject(
 	ctx context.Context,
 	bucket string,

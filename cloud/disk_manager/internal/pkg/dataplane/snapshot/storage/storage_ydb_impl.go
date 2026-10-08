@@ -479,6 +479,10 @@ func (s *storageYDB) deletingSnapshot(
 			return state.toSnapshotMeta(), err
 		}
 
+		if len(state.backupTaskID) != 0 {
+			return nil, task_errors.NewInterruptExecutionError()
+		}
+
 		if len(state.lockTaskID) != 0 && state.lockTaskID != taskID {
 			err = tx.Commit(ctx)
 			if err != nil {
@@ -1492,6 +1496,94 @@ func (s *storageYDB) listSnapshots(
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+func (s *storageYDB) holdSnapshotForBackup(
+	ctx context.Context,
+	session *persistence.Session,
+	snapshotID string,
+	taskID string,
+) error {
+
+	tx, err := session.BeginRWTransaction(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	res, err := tx.Execute(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $id as Utf8;
+
+		select * from snapshots where id = $id
+	`, s.tablesPath),
+		persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)),
+	)
+	if err != nil {
+		return err
+	}
+	defer res.Close()
+
+	states, err := scanSnapshotStates(ctx, res)
+	if err != nil {
+		return err
+	}
+	if err = res.Err(); err != nil {
+		return err
+	}
+
+	if len(states) == 0 || states[0].status != snapshotStatusReady {
+		return task_errors.NewSilentNonRetriableErrorf(
+			"snapshot %v is not ready for backup",
+			snapshotID,
+		)
+	}
+
+	owner := states[0].backupTaskID
+	if len(owner) != 0 && owner != taskID {
+		return task_errors.NewInterruptExecutionError()
+	}
+
+	_, err = tx.Execute(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $id as Utf8;
+		declare $task_id as Utf8;
+
+		update snapshots set backup_task_id = $task_id where id = $id
+	`, s.tablesPath),
+		persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)),
+		persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)),
+	)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (s *storageYDB) ReleaseSnapshotForBackup(
+	ctx context.Context,
+	snapshotID string,
+	taskID string,
+) (err error) {
+
+	defer s.metrics.StatOperation("ReleaseSnapshotForBackup")(&err)
+
+	_, err = s.db.ExecuteRW(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $id as Utf8;
+		declare $task_id as Utf8;
+
+		update snapshots set backup_task_id = ""
+		where id = $id and backup_task_id = $task_id
+	`, s.tablesPath),
+		persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)),
+		persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)),
+	)
+	return err
+}
 
 func (s *storageYDB) findBackupChunkIDsTx(
 	ctx context.Context,

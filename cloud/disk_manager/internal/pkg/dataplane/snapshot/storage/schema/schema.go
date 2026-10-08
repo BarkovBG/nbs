@@ -304,6 +304,10 @@ func snapshotStateTableDescription() persistence.CreateTableDescription {
 		persistence.WithColumn("storage_size", persistence.Optional(persistence.TypeUint64)),
 		persistence.WithColumn("chunk_count", persistence.Optional(persistence.TypeUint32)),
 		persistence.WithColumn("lock_task_id", persistence.Optional(persistence.TypeUTF8)),
+		persistence.WithColumn(
+			"backup_task_id",
+			persistence.Optional(persistence.TypeUTF8),
+		),
 		persistence.WithColumn("encryption_mode", persistence.Optional(persistence.TypeUint32)),
 		persistence.WithColumn("encryption_keyhash", persistence.Optional(persistence.TypeString)),
 		persistence.WithColumn("status", persistence.Optional(persistence.TypeInt64)),

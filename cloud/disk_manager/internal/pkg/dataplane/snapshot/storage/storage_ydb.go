@@ -7,6 +7,7 @@ import (
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/metrics"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/types"
 	tasks_common "github.com/ydb-platform/nbs/cloud/tasks/common"
+	task_errors "github.com/ydb-platform/nbs/cloud/tasks/errors"
 	"github.com/ydb-platform/nbs/cloud/tasks/persistence"
 )
 
@@ -274,6 +275,26 @@ func (s *storageYDB) ListSnapshots(
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+func (s *storageYDB) HoldSnapshotForBackup(
+	ctx context.Context,
+	snapshotID string,
+	taskID string,
+) (err error) {
+
+	defer s.metrics.StatOperation("HoldSnapshotForBackup")(&err)
+
+	if len(taskID) == 0 {
+		return task_errors.NewNonRetriableErrorf("empty backup task ID")
+	}
+
+	return s.db.Execute(
+		ctx,
+		func(ctx context.Context, session *persistence.Session) error {
+			return s.holdSnapshotForBackup(ctx, session, snapshotID, taskID)
+		},
+	)
+}
 
 func (s *storageYDB) EnqueueBackupChunks(
 	ctx context.Context,

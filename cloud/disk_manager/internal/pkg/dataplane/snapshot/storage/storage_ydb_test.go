@@ -685,6 +685,177 @@ func TestSnapshotsLocks(t *testing.T) {
 	}
 }
 
+func TestSnapshotBackupHold(t *testing.T) {
+	f := createFixture(t)
+	defer f.teardown()
+
+	_, err := f.storage.CreateSnapshot(f.ctx, SnapshotMeta{
+		ID:           "snapshot",
+		CreateTaskID: "create",
+	})
+	require.NoError(t, err)
+	err = f.storage.SnapshotCreated(f.ctx, "snapshot", 0, 0, 0, nil)
+	require.NoError(t, err)
+
+	locked, err := f.storage.LockSnapshot(f.ctx, "snapshot", "incremental")
+	require.NoError(t, err)
+	require.True(t, locked)
+
+	for i := 0; i != 2; i++ {
+		err = f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "backup")
+		require.NoError(t, err)
+	}
+
+	err = f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "another")
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+
+	err = f.storage.UnlockSnapshot(f.ctx, "snapshot", "incremental")
+	require.NoError(t, err)
+	locked, err = f.storage.LockSnapshot(f.ctx, "snapshot", "incremental2")
+	require.NoError(t, err)
+	require.True(t, locked)
+	err = f.storage.UnlockSnapshot(f.ctx, "snapshot", "incremental2")
+	require.NoError(t, err)
+
+	err = f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "another")
+	require.NoError(t, err)
+	for _, taskID := range []string{"delete", "backup"} {
+		_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", taskID)
+		require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	}
+
+	err = f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "backup")
+	require.NoError(t, err)
+	err = f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "next")
+	require.NoError(t, err)
+	err = f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "backup")
+	require.NoError(t, err)
+	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+
+	for i := 0; i != 2; i++ {
+		err = f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "next")
+		require.NoError(t, err)
+	}
+	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
+	require.NoError(t, err)
+}
+
+func TestSnapshotBackupHoldPreservesInheritedChunks(t *testing.T) {
+	for _, testCase := range testCases() {
+		t.Run(testCase.name, func(t *testing.T) {
+			f := createFixture(t)
+			defer f.teardown()
+
+			chunkID, err := f.storage.WriteChunk(
+				f.ctx, "", "source", makeChunk(0, "abc"), testCase.useS3,
+			)
+			require.NoError(t, err)
+			_, err = f.storage.CreateSnapshot(f.ctx, SnapshotMeta{
+				ID:           "copy",
+				CreateTaskID: "create",
+			})
+			require.NoError(t, err)
+			err = f.storage.ShallowCopySnapshot(f.ctx, "source", "copy", 0, nil)
+			require.NoError(t, err)
+			err = f.storage.SnapshotCreated(f.ctx, "copy", 3, 3, 1, nil)
+			require.NoError(t, err)
+			err = f.storage.HoldSnapshotForBackup(f.ctx, "copy", "backup")
+			require.NoError(t, err)
+
+			_, err = f.storage.DeletingSnapshot(f.ctx, "source", "delete")
+			require.NoError(t, err)
+			err = f.storage.DeleteSnapshotData(f.ctx, "source")
+			require.NoError(t, err)
+			_, err = f.storage.DeletingSnapshot(f.ctx, "copy", "delete")
+			require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+
+			blob, err := f.storage.ReadChunkBlob(f.ctx, chunkID, testCase.useS3)
+			require.NoError(t, err)
+			require.Equal(t, []byte("abc"), blob.Data)
+			err = f.storage.ReleaseSnapshotForBackup(f.ctx, "copy", "backup")
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestSnapshotBackupHoldRejectsUnavailableSnapshot(t *testing.T) {
+	f := createFixture(t)
+	defer f.teardown()
+
+	err := f.storage.HoldSnapshotForBackup(f.ctx, "missing", "backup")
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+
+	_, err = f.storage.CreateSnapshot(f.ctx, SnapshotMeta{
+		ID:           "snapshot",
+		CreateTaskID: "create",
+	})
+	require.NoError(t, err)
+	err = f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "backup")
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+
+	err = f.storage.SnapshotCreated(f.ctx, "snapshot", 0, 0, 0, nil)
+	require.NoError(t, err)
+	err = f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "")
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
+	require.NoError(t, err)
+	err = f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "backup")
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+}
+
+func TestSnapshotBackupHoldRacesWithDeletion(t *testing.T) {
+	f := createFixture(t)
+	defer f.teardown()
+
+	for i := 0; i != 10; i++ {
+		snapshotID := fmt.Sprintf("snapshot%v", i)
+		_, err := f.storage.CreateSnapshot(f.ctx, SnapshotMeta{
+			ID:           snapshotID,
+			CreateTaskID: "create",
+		})
+		require.NoError(t, err)
+		err = f.storage.SnapshotCreated(f.ctx, snapshotID, 0, 0, 0, nil)
+		require.NoError(t, err)
+
+		start := make(chan struct{})
+		held := make(chan error, 1)
+		deleted := make(chan error, 1)
+		go func() {
+			<-start
+			held <- f.storage.HoldSnapshotForBackup(f.ctx, snapshotID, "backup")
+		}()
+		go func() {
+			<-start
+			_, err := f.storage.DeletingSnapshot(f.ctx, snapshotID, "delete")
+			deleted <- err
+		}()
+		close(start)
+
+		holdErr, deleteErr := <-held, <-deleted
+		if holdErr == nil {
+			require.True(
+				t,
+				errors.Is(deleteErr, errors.NewInterruptExecutionError()),
+			)
+			err = f.storage.ReleaseSnapshotForBackup(
+				f.ctx,
+				snapshotID,
+				"backup",
+			)
+			require.NoError(t, err)
+			_, err = f.storage.DeletingSnapshot(f.ctx, snapshotID, "delete")
+			require.NoError(t, err)
+		} else {
+			require.NoError(t, deleteErr)
+			require.True(
+				t,
+				errors.Is(holdErr, errors.NewEmptyNonRetriableError()),
+			)
+		}
+	}
+}
+
 func TestDeletingSnapshot(t *testing.T) {
 	for _, testCase := range testCases() {
 		t.Run(testCase.name, func(t *testing.T) {
