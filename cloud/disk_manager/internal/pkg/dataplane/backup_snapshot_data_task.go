@@ -46,6 +46,17 @@ func (t *backupSnapshotDataTask) Run(
 
 	snapshotID := t.request.SnapshotId
 
+	// Persist completion before releasing the hold: a retry after release
+	// must not reacquire it or write objects after snapshot deletion started.
+	if t.state.Finished {
+		return t.finish(ctx, execCtx)
+	}
+
+	err := t.storage.HoldSnapshotForBackup(ctx, snapshotID, execCtx.GetTaskID())
+	if err != nil {
+		return err
+	}
+
 	meta, err := t.storage.CheckSnapshotReady(ctx, snapshotID)
 	if err != nil {
 		return err
@@ -63,18 +74,40 @@ func (t *backupSnapshotDataTask) Run(
 		return err
 	}
 
-	return t.clearCompletedBackupChunkQueueEntries(ctx, snapshotID)
+	if len(t.request.MetaKey) != 0 {
+		err = t.backupS3.PutObject(
+			ctx,
+			t.request.MetaKey,
+			persistence.S3Object{Data: t.request.Meta},
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	t.state.Finished = true
+	err = execCtx.SaveState(ctx)
+	if err != nil {
+		return err
+	}
+	return t.finish(ctx, execCtx)
 }
 
 func (t *backupSnapshotDataTask) Cancel(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
-) error {
+) (err error) {
 
-	// TODO(https://github.com/ydb-platform/nbs/issues/7237):
-	// lock the snapshot while its chunks are copied and remove them from
-	// backup_chunk_queue on cancellation.
-	return nil
+	// Cancellation must not be marked complete while cleanup has failed.
+	defer func() {
+		if err != nil && !errors.Is(err, errors.NewInterruptExecutionError()) {
+			err = errors.NewRetriableErrorf("failed to cancel snapshot backup: %v", err)
+		}
+	}()
+
+	// Run has stopped enqueueing. Drain also prevents workers with stale
+	// queue listings from starting new IO for this attempt.
+	return t.finish(ctx, execCtx)
 }
 
 func (t *backupSnapshotDataTask) GetMetadata(
@@ -89,6 +122,24 @@ func (t *backupSnapshotDataTask) GetResponse() proto.Message {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+func (t *backupSnapshotDataTask) finish(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
+
+	taskID := execCtx.GetTaskID()
+	err := t.storage.DrainSnapshotBackup(
+		ctx,
+		t.request.SnapshotId,
+		taskID,
+		t.batchSize,
+	)
+	if err != nil {
+		return err
+	}
+	return t.storage.ReleaseSnapshotForBackup(ctx, t.request.SnapshotId, taskID)
+}
 
 func validateChunkMapEntry(
 	entry storage.ChunkMapEntry,
@@ -213,29 +264,6 @@ func (t *backupSnapshotDataTask) waitForChunksBackupCompleted(
 	}
 
 	return nil
-}
-
-func (t *backupSnapshotDataTask) clearCompletedBackupChunkQueueEntries(
-	ctx context.Context,
-	snapshotID string,
-) error {
-
-	for {
-		cleared, err := t.storage.ClearCompletedBackupChunkQueueEntries(
-			ctx,
-			snapshotID,
-			t.batchSize,
-		)
-		if err != nil {
-			return err
-		}
-
-		// The storage clears fewer than batchSize entries only when no
-		// completed entries are left.
-		if cleared < t.batchSize {
-			return nil
-		}
-	}
 }
 
 func (t *backupSnapshotDataTask) backupChunkMap(

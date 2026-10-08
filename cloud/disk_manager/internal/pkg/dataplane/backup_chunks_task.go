@@ -46,6 +46,14 @@ func (t *backupChunksTask) Run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
+	// A restarted execution has no local IO from its previous batch. Clear
+	// claims left by an interrupted invocation before starting another batch.
+	taskID := execCtx.GetTaskID()
+	err := t.storage.ReleaseBackupChunkClaims(ctx, taskID)
+	if err != nil {
+		return err
+	}
+
 	for {
 		entries, err := t.storage.GetQueuedChunksToBackup(
 			ctx,
@@ -64,14 +72,30 @@ func (t *backupChunksTask) Run(
 		})
 		entries = entries[:min(len(entries), t.batchSize)]
 
-		copied, err := t.copyChunks(ctx, entries)
-		if len(copied) == 0 {
-			return err
-		}
-
-		err = t.storage.ChunksBackupCompleted(ctx, copied)
+		entries, err = t.storage.ClaimBackupChunks(ctx, taskID, entries)
 		if err != nil {
 			return err
+		}
+		if len(entries) == 0 {
+			continue
+		}
+
+		copied, copyErr := t.copyChunks(ctx, entries)
+		if len(copied) != 0 {
+			err = t.storage.ChunksBackupCompleted(ctx, copied)
+			if err != nil {
+				return err
+			}
+		}
+
+		// copyChunks joins every goroutine, including on errors. Retain the
+		// claims until both object writes and completion updates have stopped.
+		err = t.storage.ReleaseBackupChunkClaims(ctx, taskID)
+		if err != nil {
+			return err
+		}
+		if len(copied) == 0 {
+			return copyErr
 		}
 	}
 }
@@ -79,9 +103,16 @@ func (t *backupChunksTask) Run(
 func (t *backupChunksTask) Cancel(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
-) error {
+) (err error) {
 
-	return nil
+	// Cancellation must not be marked complete while cleanup has failed.
+	defer func() {
+		if err != nil && !errors.Is(err, errors.NewInterruptExecutionError()) {
+			err = errors.NewRetriableErrorf("failed to cancel backup worker: %v", err)
+		}
+	}()
+
+	return t.storage.ReleaseBackupChunkClaims(ctx, execCtx.GetTaskID())
 }
 
 func (t *backupChunksTask) GetMetadata(

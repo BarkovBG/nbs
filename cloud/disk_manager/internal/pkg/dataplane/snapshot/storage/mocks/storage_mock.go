@@ -359,3 +359,31 @@ func (s *StorageMock) FilterExistingChunkIDs(
 func assertStorageMockIsStorage(arg *StorageMock) storage.Storage {
 	return arg
 }
+
+func (s *StorageMock) ClaimBackupChunks(
+	ctx context.Context,
+	taskID string,
+	entries []storage.BackupChunkQueueEntry,
+) ([]storage.BackupChunkQueueEntry, error) {
+
+	args := s.Called(ctx, taskID, entries)
+	return args.Get(0).([]storage.BackupChunkQueueEntry), args.Error(1)
+}
+
+func (s *StorageMock) ReleaseBackupChunkClaims(
+	ctx context.Context,
+	taskID string,
+) error {
+
+	return s.Called(ctx, taskID).Error(0)
+}
+
+func (s *StorageMock) DrainSnapshotBackup(
+	ctx context.Context,
+	snapshotID string,
+	taskID string,
+	limit int,
+) error {
+
+	return s.Called(ctx, snapshotID, taskID, limit).Error(0)
+}

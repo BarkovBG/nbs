@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package snapshots;
 
+import "cloud/disk_manager/internal/pkg/dataplane/protos/backup_snapshot_data_task.proto";
+
 option go_package = "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/snapshots/protos";
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -13,4 +15,5 @@ message BackupSnapshotRequest {
 
 message BackupSnapshotTaskState {
     string DataplaneTaskID = 1;
+    dataplane.BackupSnapshotDataRequest DataplaneRequest = 2;
 }

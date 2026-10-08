@@ -1,6 +1,7 @@
 package snapshots
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -15,6 +16,8 @@ import (
 	resources_mocks "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources/mocks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/snapshots/protos"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/types"
+	"github.com/ydb-platform/nbs/cloud/tasks/errors"
+	"github.com/ydb-platform/nbs/cloud/tasks/headers"
 	tasks_mocks "github.com/ydb-platform/nbs/cloud/tasks/mocks"
 )
 
@@ -32,16 +35,6 @@ func TestBackupSnapshotTask(t *testing.T) {
 
 func testBackupSnapshotTask(t *testing.T, backupID string) {
 	ctx := test.NewContext()
-
-	s3, err := test.NewS3Client()
-	require.NoError(t, err)
-
-	exists, err := s3.BucketExists(ctx, backupTestBucket)
-	require.NoError(t, err)
-	if !exists {
-		err = s3.CreateBucket(ctx, backupTestBucket)
-		require.NoError(t, err)
-	}
 
 	creatingAt := time.Date(2026, 8, 31, 10, 0, 0, 0, time.UTC)
 	snapshot := &resources.SnapshotMeta{
@@ -87,12 +80,9 @@ func testBackupSnapshotTask(t *testing.T, backupID string) {
 		"dataplane1",
 	).Return(&empty.Empty{}, nil)
 
-	backupS3 := backup.NewS3(s3, backupTestBucket, t.Name())
-
 	task := &backupSnapshotTask{
 		scheduler: scheduler,
 		storage:   storage,
-		backupS3:  backupS3,
 		request: &protos.BackupSnapshotRequest{
 			SnapshotId: "snap1",
 			BackupId:   backupID,
@@ -100,20 +90,15 @@ func testBackupSnapshotTask(t *testing.T, backupID string) {
 		state: &protos.BackupSnapshotTaskState{},
 	}
 
-	err = task.Run(ctx, execCtx)
+	err := task.Run(ctx, execCtx)
 	require.NoError(t, err)
 	require.Equal(t, "dataplane1", task.state.DataplaneTaskID)
 	mock.AssertExpectationsForObjects(t, storage, scheduler, execCtx)
 
-	object, err := s3.GetObject(
-		ctx,
-		backupTestBucket,
-		backupS3.Key(backup.SnapshotMetaKey("disk1", "snap1")),
-	)
-	require.NoError(t, err)
+	require.Equal(t, backup.SnapshotMetaKey("disk1", "snap1"), task.state.DataplaneRequest.MetaKey)
 
 	var meta backup.SnapshotMeta
-	require.NoError(t, json.Unmarshal(object.Data, &meta))
+	require.NoError(t, json.Unmarshal(task.state.DataplaneRequest.Meta, &meta))
 	require.Equal(
 		t,
 		backup.SnapshotMeta{
@@ -143,6 +128,7 @@ func TestBackupSnapshotTaskCancellationUsesBackupID(t *testing.T) {
 
 	task := &backupSnapshotTask{
 		storage: storage,
+		state:   &protos.BackupSnapshotTaskState{},
 		request: &protos.BackupSnapshotRequest{
 			SnapshotId: "snap1",
 			BackupId:   "attempt",
@@ -166,6 +152,7 @@ func TestBackupSnapshotTaskDoesNotBackUpDeletingSnapshot(t *testing.T) {
 
 	task := &backupSnapshotTask{
 		storage: storage,
+		state:   &protos.BackupSnapshotTaskState{},
 		request: &protos.BackupSnapshotRequest{
 			SnapshotId: "snap1",
 			BackupId:   "attempt",
@@ -174,4 +161,63 @@ func TestBackupSnapshotTaskDoesNotBackUpDeletingSnapshot(t *testing.T) {
 	err := task.Run(ctx, tasks_mocks.NewExecutionContextMock())
 	require.NoError(t, err)
 	storage.AssertExpectations(t)
+}
+
+func TestBackupSnapshotTaskCancelRecoversChildAndWaitsForDrain(t *testing.T) {
+	ctx := test.NewContext()
+	storage := resources_mocks.NewStorageMock()
+	scheduler := tasks_mocks.NewSchedulerMock()
+	execCtx := tasks_mocks.NewExecutionContextMock()
+	execCtx.On("GetTaskID").Return("backup1")
+	execCtx.On("SaveState", mock.Anything).Return(nil)
+	request := &dataplane_protos.BackupSnapshotDataRequest{
+		SnapshotId: "snap1",
+		MetaKey:    "meta-key",
+		Meta:       []byte("metadata"),
+	}
+	// This is the persisted state if scheduling committed but saving its ID
+	// did not. Recovery must use exactly the original request and task key.
+	task := &backupSnapshotTask{
+		storage:   storage,
+		scheduler: scheduler,
+		request:   &protos.BackupSnapshotRequest{SnapshotId: "snap1", BackupId: "attempt"},
+		state:     &protos.BackupSnapshotTaskState{DataplaneRequest: request},
+	}
+	scheduler.On("ScheduleTask", mock.MatchedBy(func(ctx context.Context) bool {
+		return headers.GetIdempotencyKey(ctx) == "backup1_snap1_backup"
+	}), "dataplane.BackupSnapshotData", "", request).Return("child", nil).Once()
+	scheduler.On("CancelTask", mock.Anything, "child").Return(true, nil).Twice()
+	scheduler.On("WaitTaskEnded", mock.Anything, "child").Return(
+		errors.NewInterruptExecutionError(),
+	).Once()
+	err := task.Cancel(ctx, execCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	storage.AssertNotCalled(t, "SnapshotBackupCancelled", mock.Anything, "snap1", "attempt")
+
+	drained := false
+	scheduler.On("WaitTaskEnded", mock.Anything, "child").Run(func(mock.Arguments) {
+		drained = true
+	}).Return(nil).Once()
+	storage.On("SnapshotBackupCancelled", mock.Anything, "snap1", "attempt").Run(func(mock.Arguments) {
+		require.True(t, drained)
+	}).Return(nil).Once()
+	require.NoError(t, task.Cancel(ctx, execCtx))
+	mock.AssertExpectationsForObjects(t, storage, scheduler, execCtx)
+}
+
+func TestBackupSnapshotTaskResumesSavedChildWithoutRewritingMetadata(t *testing.T) {
+	ctx := test.NewContext()
+	storage := resources_mocks.NewStorageMock()
+	scheduler := tasks_mocks.NewSchedulerMock()
+	execCtx := tasks_mocks.NewExecutionContextMock()
+	scheduler.On("WaitTask", mock.Anything, execCtx, "child").Return(&empty.Empty{}, nil).Once()
+	storage.On("SnapshotBackupScheduled", mock.Anything, "snap1", "attempt").Return(nil).Once()
+	task := &backupSnapshotTask{
+		storage:   storage,
+		scheduler: scheduler,
+		request:   &protos.BackupSnapshotRequest{SnapshotId: "snap1", BackupId: "attempt"},
+		state:     &protos.BackupSnapshotTaskState{DataplaneTaskID: "child"},
+	}
+	require.NoError(t, task.Run(ctx, execCtx))
+	mock.AssertExpectationsForObjects(t, storage, scheduler, execCtx)
 }

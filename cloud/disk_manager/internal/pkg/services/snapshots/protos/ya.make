@@ -9,6 +9,7 @@ SRCS(
 )
 
 PEERDIR(
+    cloud/disk_manager/internal/pkg/dataplane/protos
     cloud/disk_manager/internal/pkg/types
 )
 

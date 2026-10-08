@@ -5,12 +5,14 @@ import (
 	"testing"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/backup"
 	dataplane_common "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/common"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/protos"
 	snapshot_storage "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/chunks"
+	storage_mocks "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/mocks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/test"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/types"
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
@@ -75,6 +77,7 @@ func newBackupExecutionContext(
 
 	execCtx := mocks.NewExecutionContextMock()
 	execCtx.On("SaveState", ctx).Return(nil)
+	execCtx.On("GetTaskID").Return("backup")
 	return execCtx
 }
 
@@ -197,8 +200,13 @@ func TestBackupSnapshotDataTask(t *testing.T) {
 
 	execCtx := newBackupExecutionContext(ctx)
 	task := newBackupSnapshotDataTask(storage, follower, "snap1")
+	task.request.MetaKey = backup.SnapshotMetaKey("disk1", "snap1")
+	task.request.Meta = []byte(`{"id":"snap1"}`)
 
 	err = task.Run(ctx, execCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+
+	_, err = storage.DeletingSnapshot(ctx, "snap1", "delete")
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 
 	_, err = follower.getObject(ctx, backup.ChunkMapKey("snap1"))
@@ -224,6 +232,10 @@ func TestBackupSnapshotDataTask(t *testing.T) {
 	err = task.Run(ctx, execCtx)
 	require.NoError(t, err)
 
+	object, err := follower.getObject(ctx, task.request.MetaKey)
+	require.NoError(t, err)
+	require.Equal(t, task.request.Meta, object.Data)
+
 	chunkMap := readBackupChunkMap(t, ctx, follower, "snap1")
 	require.Equal(t, []string{chunk0, ""}, chunkMap.ChunkIds)
 
@@ -231,7 +243,17 @@ func TestBackupSnapshotDataTask(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, cleared)
 
-	err = task.Run(ctx, execCtx)
+	state, err := task.Save()
+	require.NoError(t, err)
+	request, err := proto.Marshal(task.request)
+	require.NoError(t, err)
+	resumed := newBackupSnapshotDataTask(storage, follower, "snap1")
+	require.NoError(t, resumed.Load(request, state))
+
+	_, err = storage.DeletingSnapshot(ctx, "snap1", "delete")
+	require.NoError(t, err)
+
+	err = resumed.Run(ctx, execCtx)
 	require.NoError(t, err)
 }
 
@@ -416,6 +438,10 @@ func TestBackupSnapshotDataTaskEnqueuesInBatches(t *testing.T) {
 	resumed.state.MilestoneChunkIndex = 1
 	resumed.state.EnqueuedChunkCount = 1
 
+	for i := 0; i < 2; i++ {
+		err = resumed.Run(ctx, execCtx)
+		require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	}
 	err = resumed.Run(ctx, execCtx)
 	require.NoError(t, err)
 	require.EqualValues(t, 2, resumed.state.EnqueuedChunkCount)
@@ -479,7 +505,7 @@ func TestBackupSnapshotDataTaskBacksUpChunkStoredInYDB(t *testing.T) {
 	)
 
 	chunksTask := newBackupChunksTask(storage, follower)
-	err = chunksTask.Run(ctx, mocks.NewExecutionContextMock())
+	err = chunksTask.Run(ctx, newBackupExecutionContext(ctx))
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 
 	chunkBlob, err := storage.ReadChunkBlob(
@@ -548,6 +574,12 @@ func TestBackupSnapshotDataTaskFailsOnChunkIndexOutOfRange(t *testing.T) {
 
 	_, err = follower.getObject(ctx, backup.ChunkMapKey("snap1"))
 	require.Error(t, err)
+
+	_, err = storage.DeletingSnapshot(ctx, "snap1", "delete")
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	require.NoError(t, task.Cancel(ctx, execCtx))
+	_, err = storage.DeletingSnapshot(ctx, "snap1", "delete")
+	require.NoError(t, err)
 }
 
 func TestBackupSnapshotDataTaskEnqueuesNothingForShallowCopy(t *testing.T) {
@@ -623,4 +655,55 @@ func TestBackupSnapshotDataTaskFailsOnDeletedSnapshot(t *testing.T) {
 	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
 	require.NoError(t, err)
 	require.Empty(t, queue)
+}
+
+func TestBackupSnapshotDataTaskCancellationDrainsWorkers(t *testing.T) {
+	ctx := test.NewContext()
+	storage, closeFunc := newStorage(t, ctx)
+	defer closeFunc()
+	follower := newTestFollower(t, ctx)
+	createSnapshotWithChunk(t, ctx, storage, "snap1")
+	task := newBackupSnapshotDataTask(storage, follower, "snap1")
+	execCtx := newBackupExecutionContext(ctx)
+
+	err := task.Run(ctx, execCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
+	require.NoError(t, err)
+	claimed, err := storage.ClaimBackupChunks(ctx, "worker", queue)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+
+	err = task.Cancel(ctx, execCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	_, err = storage.DeletingSnapshot(ctx, "snap1", "delete")
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	queue, err = storage.GetQueuedChunksToBackup(ctx, 10)
+	require.NoError(t, err)
+	require.Empty(t, queue)
+
+	// A worker cancelled after a failed execution also releases its claims.
+	worker := newBackupChunksTask(storage, follower)
+	workerCtx := mocks.NewExecutionContextMock()
+	workerCtx.On("GetTaskID").Return("worker")
+	require.NoError(t, worker.Cancel(ctx, workerCtx))
+	require.NoError(t, task.Cancel(ctx, execCtx))
+	_, err = storage.DeletingSnapshot(ctx, "snap1", "delete")
+	require.NoError(t, err)
+	// Retrying cancellation after deletion is harmless.
+	require.NoError(t, task.Cancel(ctx, execCtx))
+}
+
+func TestBackupSnapshotDataTaskCancellationRetriesCleanupErrors(t *testing.T) {
+	ctx := test.NewContext()
+	storage := storage_mocks.NewStorageMock()
+	storage.On("DrainSnapshotBackup", mock.Anything, "snap1", "backup", 1000).Return(
+		errors.NewNonRetriableErrorf("storage failure"),
+	).Once()
+	task := newBackupSnapshotDataTask(storage, testFollower{}, "snap1")
+	err := task.Cancel(ctx, newBackupExecutionContext(ctx))
+	require.True(t, errors.Is(err, errors.NewEmptyRetriableError()))
+	require.False(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+	storage.AssertNotCalled(t, "ReleaseSnapshotForBackup", mock.Anything, "snap1", "backup")
+	storage.AssertExpectations(t)
 }

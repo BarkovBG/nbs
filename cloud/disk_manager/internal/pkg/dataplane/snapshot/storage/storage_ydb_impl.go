@@ -1937,3 +1937,163 @@ func (s *storageYDB) GetBackupChunkQueueLength(
 
 	return count, nil
 }
+
+////////////////////////////////////////////////////////////////////////////////
+
+func (s *storageYDB) ClaimBackupChunks(
+	ctx context.Context,
+	taskID string,
+	entries []BackupChunkQueueEntry,
+) (claimed []BackupChunkQueueEntry, err error) {
+
+	defer s.metrics.StatOperation("ClaimBackupChunks")(&err)
+
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	if len(taskID) == 0 {
+		return nil, task_errors.NewNonRetriableErrorf("empty backup worker task ID")
+	}
+
+	// Reading the queue and registering the worker must serialize with drain.
+	// In particular, a worker cannot start IO using an old queue listing.
+	res, err := s.db.ExecuteRW(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $task_id as Utf8;
+		declare $keys as List<%v>;
+
+		$entries = (
+			select q.snapshot_id as snapshot_id, q.chunk_id as chunk_id,
+				q.stored_in_s3 as stored_in_s3
+			from backup_chunk_queue as q
+			inner join AS_TABLE($keys) as k
+			on q.snapshot_id = k.snapshot_id and q.chunk_id = k.chunk_id
+		);
+
+		upsert into backup_chunk_inflight
+		select distinct snapshot_id, $task_id as task_id from $entries;
+
+		select * from $entries;
+	`, s.tablesPath, backupChunkKeyStructTypeString()),
+		persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)),
+		persistence.ValueParam("$keys", backupChunkKeyListValue(entries)),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Close()
+
+	for res.NextResultSet(ctx) {
+		for res.NextRow() {
+			var entry BackupChunkQueueEntry
+			err = res.ScanNamed(
+				persistence.OptionalWithDefault("snapshot_id", &entry.SnapshotID),
+				persistence.OptionalWithDefault("chunk_id", &entry.ChunkID),
+				persistence.OptionalWithDefault("stored_in_s3", &entry.StoredInS3),
+			)
+			if err != nil {
+				return nil, err
+			}
+			claimed = append(claimed, entry)
+		}
+	}
+	return claimed, res.Err()
+}
+
+func (s *storageYDB) ReleaseBackupChunkClaims(
+	ctx context.Context,
+	taskID string,
+) (err error) {
+
+	defer s.metrics.StatOperation("ReleaseBackupChunkClaims")(&err)
+
+	_, err = s.db.ExecuteRW(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $task_id as Utf8;
+
+		delete from backup_chunk_inflight where task_id = $task_id;
+	`, s.tablesPath),
+		persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)),
+	)
+	return err
+}
+
+func (s *storageYDB) DrainSnapshotBackup(
+	ctx context.Context,
+	snapshotID string,
+	taskID string,
+	limit int,
+) (err error) {
+
+	defer s.metrics.StatOperation("DrainSnapshotBackup")(&err)
+
+	if limit <= 0 {
+		return task_errors.NewNonRetriableErrorf("invalid backup drain limit %v", limit)
+	}
+
+	// An old task's cancellation must not remove a newer attempt's queue.
+	// Commit queue removal even when workers are still active, so no new
+	// worker can claim this snapshot while cancellation waits for them.
+	res, err := s.db.ExecuteRW(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $snapshot_id as Utf8;
+		declare $task_id as Utf8;
+		declare $limit as Uint64;
+
+		$owned = (
+			select id from snapshots
+			where id = $snapshot_id and backup_task_id = $task_id
+		);
+		$active = (
+			select snapshot_id from backup_chunk_inflight
+			where snapshot_id in $owned
+		);
+
+		$pending = (
+			select snapshot_id, chunk_id from backup_chunk_queue
+			where snapshot_id in $owned limit $limit
+		);
+		$chunks = (
+			select snapshot_id, chunk_id from backup_chunks
+			where snapshot_id in $owned and snapshot_id not in $active
+			limit $limit
+		);
+		delete from backup_chunk_queue on select * from $pending;
+		delete from backup_chunks on select * from $chunks;
+		select count(*) from $active;
+		select count(*) from $pending;
+		select count(*) from $chunks;
+	`, s.tablesPath),
+		persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)),
+		persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)),
+		persistence.ValueParam("$limit", persistence.Uint64Value(uint64(limit))),
+	)
+	if err != nil {
+		return err
+	}
+	defer res.Close()
+
+	var active, pending, cleared uint64
+	for _, count := range []*uint64{&active, &pending, &cleared} {
+		if !res.NextResultSet(ctx) || !res.NextRow() {
+			if res.Err() != nil {
+				return res.Err()
+			}
+			return task_errors.NewRetriableErrorf("missing backup drain result")
+		}
+		err = res.Scan(count)
+		if err != nil {
+			return err
+		}
+	}
+	if res.Err() != nil {
+		return res.Err()
+	}
+	if active != 0 || pending == uint64(limit) || cleared == uint64(limit) {
+		return task_errors.NewInterruptExecutionError()
+	}
+	return nil
+}

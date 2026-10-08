@@ -190,6 +190,22 @@ type Storage interface {
 		limit int,
 	) ([]BackupChunkQueueEntry, error)
 
+	// Claim only entries still in the queue and register their worker before IO.
+	ClaimBackupChunks(
+		ctx context.Context,
+		taskID string,
+		entries []BackupChunkQueueEntry,
+	) ([]BackupChunkQueueEntry, error)
+	ReleaseBackupChunkClaims(ctx context.Context, taskID string) error
+
+	// Remove pending work and wait for claimed workers before releasing the hold.
+	DrainSnapshotBackup(
+		ctx context.Context,
+		snapshotID string,
+		taskID string,
+		limit int,
+	) error
+
 	GetBackedUpChunkCount(
 		ctx context.Context,
 		snapshotID string,

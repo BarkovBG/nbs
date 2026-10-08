@@ -70,7 +70,6 @@ func RegisterForExecution(
 			return &backupSnapshotTask{
 				scheduler: taskScheduler,
 				storage:   storage,
-				backupS3:  backupS3,
 			}
 		})
 		if err != nil {

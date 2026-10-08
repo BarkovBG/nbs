@@ -14,7 +14,6 @@ import (
 	"github.com/ydb-platform/nbs/cloud/tasks"
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
 	"github.com/ydb-platform/nbs/cloud/tasks/headers"
-	"github.com/ydb-platform/nbs/cloud/tasks/persistence"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -22,7 +21,6 @@ import (
 type backupSnapshotTask struct {
 	scheduler tasks.Scheduler
 	storage   resources.Storage
-	backupS3  *backup.S3
 	request   *protos.BackupSnapshotRequest
 	state     *protos.BackupSnapshotTaskState
 }
@@ -47,80 +45,58 @@ func (t *backupSnapshotTask) Run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	snapshotID := t.request.SnapshotId
+	if len(t.state.DataplaneTaskID) == 0 {
+		if t.state.DataplaneRequest == nil {
+			meta, err := t.storage.GetSnapshotMeta(ctx, t.request.SnapshotId)
+			if err != nil {
+				return err
+			}
+			if meta == nil || !meta.Ready {
+				return t.storage.SnapshotBackupCancelled(
+					ctx,
+					t.request.SnapshotId,
+					t.request.BackupId,
+				)
+			}
+			if meta.Disk == nil {
+				return errors.NewNonRetriableErrorf(
+					"snapshot %v has no disk",
+					t.request.SnapshotId,
+				)
+			}
+			snapshotMeta, err := backup.NewSnapshotMeta(*meta)
+			if err != nil {
+				return err
+			}
+			data, err := json.Marshal(snapshotMeta)
+			if err != nil {
+				return errors.NewNonRetriableError(err)
+			}
+			t.state.DataplaneRequest = &dataplane_protos.BackupSnapshotDataRequest{
+				SnapshotId: t.request.SnapshotId,
+				MetaKey:    backup.SnapshotMetaKey(meta.Disk.DiskId, t.request.SnapshotId),
+				Meta:       data,
+			}
+			// Persist the exact request before scheduling. Cancel can then recover
+			// the child even if scheduling succeeds but saving its ID fails.
+			err = execCtx.SaveState(ctx)
+			if err != nil {
+				return err
+			}
+		}
+		err := t.scheduleDataplaneTask(ctx, execCtx)
+		if err != nil {
+			return err
+		}
+	}
 
-	meta, err := t.storage.GetSnapshotMeta(ctx, snapshotID)
+	_, err := t.scheduler.WaitTask(ctx, execCtx, t.state.DataplaneTaskID)
 	if err != nil {
 		return err
 	}
-
-	if meta == nil || !meta.Ready {
-		return t.storage.SnapshotBackupCancelled(
-			ctx,
-			snapshotID,
-			t.request.BackupId,
-		)
-	}
-
-	if meta.Disk == nil {
-		return errors.NewNonRetriableErrorf(
-			"snapshot %v has no disk",
-			snapshotID,
-		)
-	}
-
-	snapshotMeta, err := backup.NewSnapshotMeta(*meta)
-	if err != nil {
-		return err
-	}
-
-	data, err := json.Marshal(snapshotMeta)
-	if err != nil {
-		return errors.NewNonRetriableError(err)
-	}
-
-	err = t.backupS3.PutObject(
-		ctx,
-		backup.SnapshotMetaKey(meta.Disk.DiskId, snapshotID),
-		persistence.S3Object{Data: data},
-	)
-	if err != nil {
-		return err
-	}
-
-	idempotencyKey := fmt.Sprintf(
-		"%v_%v_backup",
-		execCtx.GetTaskID(),
-		snapshotID,
-	)
-
-	taskID, err := t.scheduler.ScheduleTask(
-		headers.SetIncomingIdempotencyKey(ctx, idempotencyKey),
-		"dataplane.BackupSnapshotData",
-		"",
-		&dataplane_protos.BackupSnapshotDataRequest{
-			SnapshotId: snapshotID,
-		},
-	)
-	if err != nil {
-		return err
-	}
-
-	t.state.DataplaneTaskID = taskID
-
-	err = execCtx.SaveState(ctx)
-	if err != nil {
-		return err
-	}
-
-	_, err = t.scheduler.WaitTask(ctx, execCtx, taskID)
-	if err != nil {
-		return err
-	}
-
 	return t.storage.SnapshotBackupScheduled(
 		ctx,
-		snapshotID,
+		t.request.SnapshotId,
 		t.request.BackupId,
 	)
 }
@@ -128,7 +104,31 @@ func (t *backupSnapshotTask) Run(
 func (t *backupSnapshotTask) Cancel(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
-) error {
+) (err error) {
+
+	// Cancellation must not be marked complete while cleanup has failed.
+	defer func() {
+		if err != nil && !errors.Is(err, errors.NewInterruptExecutionError()) {
+			err = errors.NewRetriableErrorf("failed to cancel snapshot backup: %v", err)
+		}
+	}()
+
+	if len(t.state.DataplaneTaskID) == 0 && t.state.DataplaneRequest != nil {
+		err := t.scheduleDataplaneTask(ctx, execCtx)
+		if err != nil {
+			return err
+		}
+	}
+	if len(t.state.DataplaneTaskID) != 0 {
+		_, err := t.scheduler.CancelTask(ctx, t.state.DataplaneTaskID)
+		if err != nil {
+			return err
+		}
+		err = t.scheduler.WaitTaskEnded(ctx, t.state.DataplaneTaskID)
+		if err != nil {
+			return err
+		}
+	}
 
 	// TODO(https://github.com/ydb-platform/nbs/issues/7237):
 	// roll back the objects already written to the follower bucket.
@@ -148,4 +148,25 @@ func (t *backupSnapshotTask) GetMetadata(
 
 func (t *backupSnapshotTask) GetResponse() proto.Message {
 	return &empty.Empty{}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+func (t *backupSnapshotTask) scheduleDataplaneTask(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
+
+	key := fmt.Sprintf("%v_%v_backup", execCtx.GetTaskID(), t.request.SnapshotId)
+	taskID, err := t.scheduler.ScheduleTask(
+		headers.SetIncomingIdempotencyKey(ctx, key),
+		"dataplane.BackupSnapshotData",
+		"",
+		t.state.DataplaneRequest,
+	)
+	if err != nil {
+		return err
+	}
+	t.state.DataplaneTaskID = taskID
+	return execCtx.SaveState(ctx)
 }
