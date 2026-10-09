@@ -10,9 +10,6 @@ import "cloud/disk_manager/internal/pkg/dataplane/protos/backup_snapshot_data_ta
 
 message BackupSnapshotRequest {
     string SnapshotId = 1;
-    string BackupId = 2;
-    bytes EncryptedDek = 3;
-    string CoordinatorId = 4;
 }
 
 message BackupSnapshotTaskState {

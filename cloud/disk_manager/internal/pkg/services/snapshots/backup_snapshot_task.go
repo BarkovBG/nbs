@@ -37,13 +37,6 @@ func (t *backupSnapshotTask) Load(request, state []byte) error {
 	return proto.Unmarshal(state, t.state)
 }
 
-func (t *backupSnapshotTask) ownerID(execCtx tasks.ExecutionContext) string {
-	if t.request.BackupId != "" {
-		return t.request.BackupId
-	}
-	return execCtx.GetTaskID()
-}
-
 func (t *backupSnapshotTask) scheduleDataplaneTask(ctx context.Context, execCtx tasks.ExecutionContext) error {
 	id, err := t.scheduler.ScheduleTask(
 		headers.SetIncomingIdempotencyKey(ctx, fmt.Sprintf("%v_%v_backup", execCtx.GetTaskID(), t.request.SnapshotId)),
@@ -58,32 +51,27 @@ func (t *backupSnapshotTask) scheduleDataplaneTask(ctx context.Context, execCtx 
 
 func (t *backupSnapshotTask) Run(ctx context.Context, execCtx tasks.ExecutionContext) (err error) {
 	defer func() { err = retrySnapshotBackupError(err) }()
-	owner := t.ownerID(execCtx)
+	owner := execCtx.GetTaskID()
 	if t.state.DataplaneTaskID != "" && t.state.DataplaneRequest == nil {
 		// Finish a child scheduled by the previous implementation. Its result
 		// predates full-map verification and must not set backup_completed.
 		if _, err := t.scheduler.WaitTask(ctx, execCtx, t.state.DataplaneTaskID); err != nil {
 			return err
 		}
-		return t.storage.SnapshotBackupCancelled(ctx, t.request.SnapshotId, t.request.BackupId)
+		return t.storage.SnapshotBackupCancelled(ctx, t.request.SnapshotId)
 	}
 	if t.state.Finished {
 		return t.storage.ReleaseSnapshotBackup(ctx, t.request.SnapshotId, owner, true)
 	}
 	if t.state.DataplaneRequest == nil {
-		// Old unscheduled tasks have no folder coordinator. Leave them for
-		// the new folder pass instead of accepting an unowned attempt.
-		if t.request.CoordinatorId == "" {
-			return t.storage.SnapshotBackupCancelled(ctx, t.request.SnapshotId, t.request.BackupId)
-		}
 		// The reservation is durable before scheduling any DP work. A retry of
 		// an accepted owner is allowed when Delete has since marked deleting.
-		meta, err := t.storage.ReserveSnapshotBackup(ctx, t.request.SnapshotId, owner, t.request.CoordinatorId)
+		meta, err := t.storage.ReserveSnapshotBackup(ctx, t.request.SnapshotId, owner)
 		if err != nil {
 			return err
 		}
 		if meta == nil {
-			return t.storage.SnapshotBackupCancelled(ctx, t.request.SnapshotId, t.request.BackupId)
+			return t.storage.SnapshotBackupCancelled(ctx, t.request.SnapshotId)
 		}
 		if meta.Disk == nil {
 			return errors.NewNonRetriableErrorf("snapshot %v has no disk", meta.ID)
@@ -95,9 +83,6 @@ func (t *backupSnapshotTask) Run(ctx context.Context, execCtx tasks.ExecutionCon
 		data, err := json.Marshal(snapshotMeta)
 		if err != nil {
 			return errors.NewNonRetriableError(err)
-		}
-		if len(t.state.EncryptedDek) == 0 {
-			t.state.EncryptedDek = t.request.EncryptedDek
 		}
 		t.state.EncryptedDek, err = t.backupS3.EnsureEncryptedDEK(t.state.EncryptedDek)
 		if err != nil {
@@ -149,8 +134,8 @@ func (t *backupSnapshotTask) Cancel(ctx context.Context, execCtx tasks.Execution
 	}
 	// Recover cleanup even if the DP child ID was lost after scheduling.
 	id, err := t.scheduler.ScheduleTask(
-		headers.SetIncomingIdempotencyKey(ctx, t.ownerID(execCtx)+"_release"),
-		"dataplane.ReleaseSnapshotBackup", "", &dataplane_protos.ReleaseSnapshotBackupRequest{SnapshotId: t.request.SnapshotId, OwnerId: t.ownerID(execCtx)},
+		headers.SetIncomingIdempotencyKey(ctx, execCtx.GetTaskID()+"_release"),
+		"dataplane.ReleaseSnapshotBackup", "", &dataplane_protos.ReleaseSnapshotBackupRequest{SnapshotId: t.request.SnapshotId, OwnerId: execCtx.GetTaskID()},
 	)
 	if err != nil {
 		return err
@@ -158,7 +143,7 @@ func (t *backupSnapshotTask) Cancel(ctx context.Context, execCtx tasks.Execution
 	if _, err := t.scheduler.WaitTask(ctx, execCtx, id); err != nil {
 		return err
 	}
-	return t.storage.ReleaseSnapshotBackup(ctx, t.request.SnapshotId, t.ownerID(execCtx), t.state.Finished)
+	return t.storage.ReleaseSnapshotBackup(ctx, t.request.SnapshotId, execCtx.GetTaskID(), t.state.Finished)
 }
 
 func (t *backupSnapshotTask) GetMetadata(ctx context.Context) (proto.Message, error) {

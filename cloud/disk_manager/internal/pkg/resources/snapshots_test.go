@@ -439,7 +439,6 @@ func TestSnapshotsBackup(t *testing.T) {
 	defer db.Close(ctx)
 
 	storage := newStorage(t, ctx, db)
-	require.NoError(t, storage.SetSnapshotBackupFolder(ctx, "folder", "generation", true))
 
 	snapshot := SnapshotMeta{
 		ID:       "snapshot",
@@ -468,14 +467,9 @@ func TestSnapshotsBackup(t *testing.T) {
 
 	ids, err = storage.ListSnapshotsToBackup(ctx, 10)
 	require.NoError(t, err)
-	require.Equal(t, []SnapshotBackupRequest{{SnapshotID: snapshot.ID}}, ids)
-	err = storage.EnqueueSnapshotBackup(ctx, snapshot.ID, "manual")
-	require.NoError(t, err)
-	ids, err = storage.ListSnapshotsToBackup(ctx, 10)
-	require.NoError(t, err)
-	require.Equal(t, []SnapshotBackupRequest{{SnapshotID: snapshot.ID}}, ids)
+	require.Equal(t, []string{snapshot.ID}, ids)
 
-	err = storage.SnapshotBackupScheduled(ctx, snapshot.ID, "")
+	err = storage.SnapshotBackupScheduled(ctx, snapshot.ID)
 	require.NoError(t, err)
 
 	ids, err = storage.ListSnapshotsToBackup(ctx, 10)
@@ -483,232 +477,11 @@ func TestSnapshotsBackup(t *testing.T) {
 	require.Empty(t, ids)
 
 	// Check idempotency.
-	err = storage.SnapshotBackupScheduled(ctx, snapshot.ID, "")
+	err = storage.SnapshotBackupScheduled(ctx, snapshot.ID)
 	require.NoError(t, err)
 
-	err = storage.SnapshotBackupCancelled(ctx, snapshot.ID, "")
+	err = storage.SnapshotBackupCancelled(ctx, snapshot.ID)
 	require.NoError(t, err)
-	err = storage.EnqueueSnapshotBackup(ctx, snapshot.ID, "manual")
-	require.NoError(t, err)
-	ids, err = storage.ListSnapshotsToBackup(ctx, 10)
-	require.NoError(t, err)
-	require.Empty(t, ids)
-}
-
-func newSnapshotBackupTestStorage(t *testing.T) (context.Context, *storageYDB) {
-	t.Helper()
-	ctx, cancel := context.WithCancel(newContext())
-	t.Cleanup(cancel)
-	db, err := newYDB(ctx)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close(ctx)) })
-
-	storage := newStorage(t, ctx, db).(*storageYDB)
-	storage.backupEnabled = false
-	_, err = storage.CreateSnapshot(ctx, SnapshotMeta{
-		ID:            "snapshot",
-		Disk:          &types.Disk{ZoneId: "zone", DiskId: "disk"},
-		CreateRequest: &wrappers.UInt64Value{Value: 1},
-		CreateTaskID:  "create",
-		CreatingAt:    time.Now(),
-	})
-	require.NoError(t, err)
-	err = storage.SnapshotCreated(ctx, "snapshot", "cp", time.Now(), 0, 0)
-	require.NoError(t, err)
-	storage.backupEnabled = true
-	return ctx, storage
-}
-
-func TestEnqueueSnapshotBackupIsIdempotent(t *testing.T) {
-	ctx, storage := newSnapshotBackupTestStorage(t)
-
-	meta, err := storage.GetSnapshotMeta(ctx, "snapshot")
-	require.NoError(t, err)
-	require.False(t, meta.BackupCompleted)
-
-	queue, err := storage.ListSnapshotsToBackup(ctx, 10)
-	require.NoError(t, err)
-	require.Empty(t, queue)
-
-	for _, backupID := range []string{"first", "second"} {
-		err = storage.EnqueueSnapshotBackup(ctx, "snapshot", backupID)
-		require.NoError(t, err)
-	}
-	queue, err = storage.ListSnapshotsToBackup(ctx, 10)
-	require.NoError(t, err)
-	require.Equal(t, []SnapshotBackupRequest{{
-		SnapshotID: "snapshot", BackupID: "first",
-	}}, queue)
-
-	meta, err = storage.GetSnapshotMeta(ctx, "snapshot")
-	require.NoError(t, err)
-	require.False(t, meta.BackupCompleted)
-
-	err = storage.SnapshotBackupScheduled(ctx, "snapshot", "first")
-	require.NoError(t, err)
-	meta, err = storage.GetSnapshotMeta(ctx, "snapshot")
-	require.NoError(t, err)
-	require.True(t, meta.BackupCompleted)
-
-	err = storage.SnapshotBackupCancelled(ctx, "snapshot", "first")
-	require.NoError(t, err)
-	err = storage.EnqueueSnapshotBackup(ctx, "snapshot", "third")
-	require.NoError(t, err)
-	queue, err = storage.ListSnapshotsToBackup(ctx, 10)
-	require.NoError(t, err)
-	require.Empty(t, queue)
-	meta, err = storage.GetSnapshotMeta(ctx, "snapshot")
-	require.NoError(t, err)
-	require.True(t, meta.BackupCompleted)
-}
-
-func TestEnqueueSnapshotBackupAfterCancellation(t *testing.T) {
-	ctx, storage := newSnapshotBackupTestStorage(t)
-
-	err := storage.EnqueueSnapshotBackup(ctx, "snapshot", "first")
-	require.NoError(t, err)
-	err = storage.SnapshotBackupCancelled(ctx, "snapshot", "first")
-	require.NoError(t, err)
-	meta, err := storage.GetSnapshotMeta(ctx, "snapshot")
-	require.NoError(t, err)
-	require.False(t, meta.BackupCompleted)
-
-	err = storage.EnqueueSnapshotBackup(ctx, "snapshot", "second")
-	require.NoError(t, err)
-
-	for _, backupID := range []string{"", "first"} {
-		err = storage.SnapshotBackupScheduled(ctx, "snapshot", backupID)
-		require.NoError(t, err)
-		err = storage.SnapshotBackupCancelled(ctx, "snapshot", backupID)
-		require.NoError(t, err)
-	}
-	queue, err := storage.ListSnapshotsToBackup(ctx, 10)
-	require.NoError(t, err)
-	require.Equal(t, []SnapshotBackupRequest{{
-		SnapshotID: "snapshot", BackupID: "second",
-	}}, queue)
-	meta, err = storage.GetSnapshotMeta(ctx, "snapshot")
-	require.NoError(t, err)
-	require.False(t, meta.BackupCompleted)
-
-	err = storage.SnapshotBackupCancelled(ctx, "snapshot", "second")
-	require.NoError(t, err)
-	err = storage.EnqueueSnapshotBackup(ctx, "snapshot", "third")
-	require.NoError(t, err)
-	queue, err = storage.ListSnapshotsToBackup(ctx, 10)
-	require.NoError(t, err)
-	require.Equal(t, []SnapshotBackupRequest{{
-		SnapshotID: "snapshot", BackupID: "third",
-	}}, queue)
-}
-
-func TestEnqueueSnapshotBackupRejectsUnavailableSnapshot(t *testing.T) {
-	ctx, storage := newSnapshotBackupTestStorage(t)
-
-	_, err := storage.CreateSnapshot(ctx, SnapshotMeta{
-		ID:            "creating",
-		Disk:          &types.Disk{ZoneId: "zone", DiskId: "disk"},
-		CreateRequest: &wrappers.UInt64Value{Value: 1},
-		CreateTaskID:  "create2",
-		CreatingAt:    time.Now(),
-	})
-	require.NoError(t, err)
-	for _, id := range []string{"", "missing", "creating"} {
-		err = storage.EnqueueSnapshotBackup(ctx, id, "backup")
-		require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
-	}
-	err = storage.EnqueueSnapshotBackup(ctx, "snapshot", "")
-	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
-
-	_, err = storage.DeleteSnapshot(ctx, "snapshot", "delete", time.Now())
-	require.NoError(t, err)
-	err = storage.EnqueueSnapshotBackup(ctx, "snapshot", "backup")
-	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
-	err = storage.SnapshotDeleted(ctx, "snapshot", time.Now())
-	require.NoError(t, err)
-	err = storage.EnqueueSnapshotBackup(ctx, "snapshot", "backup")
-	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
-
-	queue, err := storage.ListSnapshotsToBackup(ctx, 10)
-	require.NoError(t, err)
-	require.Empty(t, queue)
-}
-
-func TestEnqueueSnapshotBackupConcurrentRequests(t *testing.T) {
-	ctx, storage := newSnapshotBackupTestStorage(t)
-	start := make(chan struct{})
-	results := make(chan error, 2)
-	for _, id := range []string{"first", "second"} {
-		backupID := id
-		go func() {
-			<-start
-			results <- storage.EnqueueSnapshotBackup(ctx, "snapshot", backupID)
-		}()
-	}
-	close(start)
-	first, second := <-results, <-results
-	require.NoError(t, first)
-	require.NoError(t, second)
-
-	queue, err := storage.ListSnapshotsToBackup(ctx, 10)
-	require.NoError(t, err)
-	require.Len(t, queue, 1)
-	require.Equal(t, "snapshot", queue[0].SnapshotID)
-	require.Contains(t, []string{"first", "second"}, queue[0].BackupID)
-}
-
-func TestEnqueueSnapshotBackupRacesWithCompletion(t *testing.T) {
-	ctx, storage := newSnapshotBackupTestStorage(t)
-	err := storage.EnqueueSnapshotBackup(ctx, "snapshot", "first")
-	require.NoError(t, err)
-
-	start := make(chan struct{})
-	results := make(chan error, 2)
-	go func() {
-		<-start
-		results <- storage.EnqueueSnapshotBackup(ctx, "snapshot", "second")
-	}()
-	go func() {
-		<-start
-		results <- storage.SnapshotBackupScheduled(ctx, "snapshot", "first")
-	}()
-	close(start)
-	first, second := <-results, <-results
-	require.NoError(t, first)
-	require.NoError(t, second)
-
-	queue, err := storage.ListSnapshotsToBackup(ctx, 10)
-	require.NoError(t, err)
-	require.Empty(t, queue)
-}
-
-func TestEnqueueSnapshotBackupRacesWithDeletion(t *testing.T) {
-	ctx, storage := newSnapshotBackupTestStorage(t)
-	start := make(chan struct{})
-	enqueued := make(chan error, 1)
-	deleted := make(chan error, 1)
-	go func() {
-		<-start
-		enqueued <- storage.EnqueueSnapshotBackup(ctx, "snapshot", "backup")
-	}()
-	go func() {
-		<-start
-		_, err := storage.DeleteSnapshot(ctx, "snapshot", "delete", time.Now())
-		deleted <- err
-	}()
-	close(start)
-	enqueueErr, deleteErr := <-enqueued, <-deleted
-	require.NoError(t, deleteErr)
-	if enqueueErr != nil {
-		require.True(
-			t,
-			errors.Is(enqueueErr, errors.NewEmptyNonRetriableError()),
-		)
-	}
-
-	queue, err := storage.ListSnapshotsToBackup(ctx, 10)
-	require.NoError(t, err)
-	require.Empty(t, queue)
 }
 
 func TestSnapshotsDeletionStopsBackup(t *testing.T) {
@@ -720,7 +493,6 @@ func TestSnapshotsDeletionStopsBackup(t *testing.T) {
 	defer db.Close(ctx)
 
 	storage := newStorage(t, ctx, db)
-	require.NoError(t, storage.SetSnapshotBackupFolder(ctx, "folder", "generation", true))
 
 	snapshot := SnapshotMeta{
 		ID:       "snapshot",
@@ -749,4 +521,28 @@ func TestSnapshotsDeletionStopsBackup(t *testing.T) {
 	ids, err := storage.ListSnapshotsToBackup(ctx, 10)
 	require.NoError(t, err)
 	require.Empty(t, ids)
+}
+
+func newSnapshotBackupTestStorage(t *testing.T) (context.Context, *storageYDB) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(newContext())
+	t.Cleanup(cancel)
+	db, err := newYDB(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close(ctx)) })
+
+	storage := newStorage(t, ctx, db).(*storageYDB)
+	storage.backupEnabled = false
+	_, err = storage.CreateSnapshot(ctx, SnapshotMeta{
+		ID:            "snapshot",
+		Disk:          &types.Disk{ZoneId: "zone", DiskId: "disk"},
+		CreateRequest: &wrappers.UInt64Value{Value: 1},
+		CreateTaskID:  "create",
+		CreatingAt:    time.Now(),
+	})
+	require.NoError(t, err)
+	err = storage.SnapshotCreated(ctx, "snapshot", "cp", time.Now(), 0, 0)
+	require.NoError(t, err)
+	storage.backupEnabled = true
+	return ctx, storage
 }
