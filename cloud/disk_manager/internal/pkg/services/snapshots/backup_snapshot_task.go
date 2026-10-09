@@ -78,7 +78,7 @@ func (t *backupSnapshotTask) run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	if t.state.DataplaneRequest == nil {
+	if len(t.state.Meta) == 0 {
 		meta, err := t.storage.GetSnapshotMeta(ctx, t.request.SnapshotId)
 		if err != nil {
 			return err
@@ -125,7 +125,7 @@ func (t *backupSnapshotTask) cancel(
 	// The copy clears its chunks and releases the snapshot in its own Cancel.
 	// A next attempt cannot hold the snapshot before that, so there is no
 	// need to wait here.
-	if t.state.DataplaneRequest != nil {
+	if len(t.state.Meta) != 0 {
 		taskID, err := t.scheduleCopy(ctx, execCtx)
 		if err != nil {
 			return err
@@ -168,17 +168,16 @@ func (t *backupSnapshotTask) prepareCopy(
 		return errors.NewNonRetriableError(err)
 	}
 
-	encryptedDEK, err := t.backupS3.EnsureEncryptedDEK(nil)
+	// Reuses the DEK saved by a task started before metadata was saved.
+	t.state.EncryptedDek, err = t.backupS3.EnsureEncryptedDEK(
+		t.state.EncryptedDek,
+	)
 	if err != nil {
 		return err
 	}
 
-	t.state.DataplaneRequest = &dataplane_protos.BackupSnapshotDataRequest{
-		SnapshotId:   meta.ID,
-		EncryptedDek: encryptedDEK,
-		MetaKey:      backup.SnapshotMetaKey(meta.Disk.DiskId, meta.ID),
-		Meta:         data,
-	}
+	t.state.MetaKey = backup.SnapshotMetaKey(meta.Disk.DiskId, meta.ID)
+	t.state.Meta = data
 	return execCtx.SaveState(ctx)
 }
 
@@ -198,7 +197,12 @@ func (t *backupSnapshotTask) scheduleCopy(
 		),
 		"dataplane.BackupSnapshotData",
 		"",
-		t.state.DataplaneRequest,
+		&dataplane_protos.BackupSnapshotDataRequest{
+			SnapshotId:   t.request.SnapshotId,
+			EncryptedDek: t.state.EncryptedDek,
+			MetaKey:      t.state.MetaKey,
+			Meta:         t.state.Meta,
+		},
 	)
 	if err != nil {
 		return "", err
