@@ -11,15 +11,12 @@ message BackupSnapshotDataRequest {
     bytes EncryptedDek = 2;
     string MetaKey = 3;
     bytes Meta = 4;
-    reserved 5; // Former shared owner; the copy uses its own task ID.
-    repeated string CompletedSnapshotIds = 6;
+    repeated string CompletedSnapshotIds = 5;
 }
 
 message BackupSnapshotDataTaskState {
     uint32 MilestoneChunkIndex = 1;
     uint32 ChunkCount = 2;
-    reserved 3; // Former EnqueuedChunkCount counted duplicate chunk IDs.
+    bool Finished = 3;
     bool ChunkMapBackedUp = 4;
-    bool Finished = 5;
-    reserved 6; // Temporary map storage is no longer needed.
 }
