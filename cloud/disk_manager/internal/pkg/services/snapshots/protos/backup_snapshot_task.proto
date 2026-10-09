@@ -14,23 +14,13 @@ message BackupSnapshotRequest {
 }
 
 message BackupSnapshotTaskState {
-    // The copy in progress: the saved request accepts it, the child ID
-    // survives an interrupted ScheduleTask.
+    // The saved request accepts the copy; the child ID survives an
+    // interrupted ScheduleTask.
     string DataplaneTaskID = 1;
     dataplane.BackupSnapshotDataRequest DataplaneRequest = 2;
-
-    // Copy order: creators of chunks first, the requested snapshot last.
-    repeated SnapshotBackupNode Nodes = 3;
+    bool Completed = 3;
 }
 
 message BackupSnapshotResponse {
     bool Completed = 1;
-    repeated string CompletedSnapshotIds = 2;
-}
-
-message SnapshotBackupNode {
-    string SnapshotId = 1;
-    bool Completed = 2;
-    // Missing or deleted before its copy was accepted.
-    bool Skipped = 3;
 }

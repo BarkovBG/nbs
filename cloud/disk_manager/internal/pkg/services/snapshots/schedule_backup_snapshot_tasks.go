@@ -28,9 +28,6 @@ func (t *scheduleBackupSnapshotTasks) Load(_, _ []byte) error {
 	return nil
 }
 
-// Graphs run one at a time: the queue row of a finished backup is removed by
-// its task, so each run resumes with the next request. Intersecting graphs
-// of concurrent tasks would otherwise copy the same sources twice.
 func (t *scheduleBackupSnapshotTasks) Run(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
@@ -48,7 +45,7 @@ func (t *scheduleBackupSnapshotTasks) Run(
 			item.BackupID,
 		)
 
-		taskID, err := t.scheduler.ScheduleTask(
+		_, err := t.scheduler.ScheduleTask(
 			headers.SetIncomingIdempotencyKey(ctx, idempotencyKey),
 			"snapshots.BackupSnapshot",
 			"",
@@ -57,11 +54,6 @@ func (t *scheduleBackupSnapshotTasks) Run(
 				BackupId:   item.BackupID,
 			},
 		)
-		if err != nil {
-			return err
-		}
-
-		_, err = t.scheduler.WaitTask(ctx, execCtx, taskID)
 		if err != nil {
 			return err
 		}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes/empty"
@@ -19,11 +18,9 @@ import (
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// Backs up a snapshot together with the snapshots that created its chunks,
-// creators first, so that their chunks are copied once. Each copy holds only
-// its own snapshot: the chunks a snapshot uses stay while it exists, so a
-// creator deleted before its turn is skipped and its chunks are copied with
-// the snapshots that use them.
+// Backs up one snapshot. dataplane.BackupSnapshotData holds the snapshot for
+// the whole copy and copies every chunk of its map that is not in the follower
+// yet, so chunks shared with other snapshots are copied once.
 type backupSnapshotTask struct {
 	scheduler tasks.Scheduler
 	storage   resources.Storage
@@ -71,15 +68,7 @@ func (t *backupSnapshotTask) GetMetadata(
 }
 
 func (t *backupSnapshotTask) GetResponse() proto.Message {
-	var completed bool
-	if len(t.state.Nodes) != 0 {
-		completed = t.state.Nodes[len(t.state.Nodes)-1].Completed
-	}
-
-	return &protos.BackupSnapshotResponse{
-		Completed:            completed,
-		CompletedSnapshotIds: t.completedSnapshotIDs(),
-	}
+	return &protos.BackupSnapshotResponse{Completed: t.state.Completed}
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -89,22 +78,15 @@ func (t *backupSnapshotTask) run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	if len(t.state.Nodes) == 0 {
-		err := t.prepareNodes(ctx, execCtx)
-		if err != nil {
-			return err
-		}
+	completed, err := t.backup(ctx, execCtx)
+	if err != nil {
+		return err
 	}
 
-	for _, node := range t.state.Nodes {
-		if node.Completed || node.Skipped {
-			continue
-		}
-
-		err := t.copyNode(ctx, execCtx, node)
-		if err != nil {
-			return err
-		}
+	t.state.Completed = completed
+	err = execCtx.SaveState(ctx)
+	if err != nil {
+		return err
 	}
 
 	return t.storage.RemoveSnapshotFromBackupQueue(
@@ -143,152 +125,58 @@ func (t *backupSnapshotTask) cancel(
 	)
 }
 
-// Orders the snapshots by creation time: a chunk is created before the
-// snapshots that reference it, so creators come before their users.
-func (t *backupSnapshotTask) prepareNodes(
+// Returns whether the snapshot has a complete copy in the follower. Saving the
+// request accepts the copy: from then on it finishes even if the snapshot is
+// being deleted, unless deletion won before the copy took its hold.
+func (t *backupSnapshotTask) backup(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
-) error {
-
-	root, err := t.storage.GetSnapshotMeta(ctx, t.request.SnapshotId)
-	if err != nil {
-		return err
-	}
-
-	metas := make([]*resources.SnapshotMeta, 0)
-	if root != nil && root.Ready && !root.BackupCompleted {
-		creators, err := t.listChunkCreators(ctx, execCtx)
-		if err != nil {
-			return err
-		}
-
-		for _, id := range creators {
-			meta, err := t.storage.GetSnapshotMeta(ctx, id)
-			if err != nil {
-				return err
-			}
-
-			// A deleted creator is not copied; the chunks of it that are
-			// still used are copied with the snapshots that use them.
-			if meta != nil {
-				metas = append(metas, meta)
-			}
-		}
-
-		sort.Slice(metas, func(i, j int) bool {
-			return metas[i].CreatingAt.Before(metas[j].CreatingAt)
-		})
-	}
-
-	for _, meta := range metas {
-		t.state.Nodes = append(t.state.Nodes, &protos.SnapshotBackupNode{
-			SnapshotId: meta.ID,
-			Completed:  meta.BackupCompleted,
-		})
-	}
-
-	t.state.Nodes = append(t.state.Nodes, &protos.SnapshotBackupNode{
-		SnapshotId: t.request.SnapshotId,
-		Completed:  root != nil && root.BackupCompleted,
-		Skipped:    root == nil || !root.Ready && !root.BackupCompleted,
-	})
-	return execCtx.SaveState(ctx)
-}
-
-func (t *backupSnapshotTask) listChunkCreators(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-) ([]string, error) {
-
-	taskID, err := t.scheduler.ScheduleTask(
-		headers.SetIncomingIdempotencyKey(
-			ctx,
-			execCtx.GetTaskID()+"_chunk_creators",
-		),
-		"dataplane.ListSnapshotChunkCreators",
-		"",
-		&dataplane_protos.ListSnapshotChunkCreatorsRequest{
-			SnapshotId: t.request.SnapshotId,
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	response, err := t.scheduler.WaitTask(ctx, execCtx, taskID)
-	if err != nil {
-		return nil, err
-	}
-
-	typedResponse, ok := response.(*dataplane_protos.ListSnapshotChunkCreatorsResponse)
-	if !ok {
-		return nil, errors.NewNonRetriableErrorf(
-			"invalid list snapshot chunk creators response type %T",
-			response,
-		)
-	}
-
-	return typedResponse.SnapshotIds, nil
-}
-
-// Saving the request accepts the copy. The copy then holds the snapshot, so
-// it finishes even if the snapshot is being deleted, unless deletion won
-// before the hold.
-func (t *backupSnapshotTask) copyNode(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-	node *protos.SnapshotBackupNode,
-) error {
+) (bool, error) {
 
 	if t.state.DataplaneRequest == nil {
-		meta, err := t.storage.GetSnapshotMeta(ctx, node.SnapshotId)
+		meta, err := t.storage.GetSnapshotMeta(ctx, t.request.SnapshotId)
 		if err != nil {
-			return err
+			return false, err
 		}
 
-		if meta == nil || !meta.Ready {
-			node.Skipped = true
-			return execCtx.SaveState(ctx)
+		if meta == nil || !meta.Ready || meta.BackupCompleted {
+			return meta != nil && meta.BackupCompleted, nil
 		}
 
 		err = t.prepareCopy(ctx, execCtx, meta)
 		if err != nil {
-			return err
+			return false, err
 		}
 	}
 
 	taskID, err := t.scheduleCopy(ctx, execCtx)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	response, err := t.scheduler.WaitTask(ctx, execCtx, taskID)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	typedResponse, ok := response.(*dataplane_protos.BackupSnapshotDataResponse)
 	if !ok {
-		return errors.NewNonRetriableErrorf(
+		return false, errors.NewNonRetriableErrorf(
 			"invalid backup snapshot data response type %T",
 			response,
 		)
 	}
 
 	if typedResponse.Skipped {
-		node.Skipped = true
-	} else {
-		err = t.storage.SnapshotBackupCompleted(ctx, node.SnapshotId)
-		if err != nil {
-			return err
-		}
-
-		node.Completed = true
+		return false, nil
 	}
 
-	t.state.DataplaneRequest = nil
-	t.state.DataplaneTaskID = ""
-	return execCtx.SaveState(ctx)
+	err = t.storage.SnapshotBackupCompleted(ctx, t.request.SnapshotId)
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 func (t *backupSnapshotTask) prepareCopy(
@@ -317,11 +205,10 @@ func (t *backupSnapshotTask) prepareCopy(
 	}
 
 	t.state.DataplaneRequest = &dataplane_protos.BackupSnapshotDataRequest{
-		SnapshotId:           meta.ID,
-		EncryptedDek:         encryptedDEK,
-		MetaKey:              backup.SnapshotMetaKey(meta.Disk.DiskId, meta.ID),
-		Meta:                 data,
-		CompletedSnapshotIds: t.completedSnapshotIDs(),
+		SnapshotId:   meta.ID,
+		EncryptedDek: encryptedDEK,
+		MetaKey:      backup.SnapshotMetaKey(meta.Disk.DiskId, meta.ID),
+		Meta:         data,
 	}
 	return execCtx.SaveState(ctx)
 }
@@ -338,11 +225,7 @@ func (t *backupSnapshotTask) scheduleCopy(
 	taskID, err := t.scheduler.ScheduleTask(
 		headers.SetIncomingIdempotencyKey(
 			ctx,
-			fmt.Sprintf(
-				"%v_%v_backup",
-				execCtx.GetTaskID(),
-				t.state.DataplaneRequest.SnapshotId,
-			),
+			fmt.Sprintf("%v_backup", execCtx.GetTaskID()),
 		),
 		"dataplane.BackupSnapshotData",
 		"",
@@ -354,18 +237,6 @@ func (t *backupSnapshotTask) scheduleCopy(
 
 	t.state.DataplaneTaskID = taskID
 	return taskID, execCtx.SaveState(ctx)
-}
-
-func (t *backupSnapshotTask) completedSnapshotIDs() []string {
-	var ids []string
-	for _, node := range t.state.Nodes {
-		if node.Completed {
-			ids = append(ids, node.SnapshotId)
-		}
-	}
-
-	sort.Strings(ids)
-	return ids
 }
 
 func retrySnapshotBackupError(err error) error {
