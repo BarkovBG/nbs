@@ -610,12 +610,6 @@ func (s *storageYDB) deleteSnapshotData(
 	snapshotID string,
 ) error {
 
-	// Serialize even direct cleanup callers with backup holds before reading
-	// the map. Once deleting is recorded no new backup can acquire a hold.
-	if _, err := s.deletingSnapshot(ctx, session, snapshotID, ""); err != nil {
-		return err
-	}
-
 	entries, errors := s.readChunkMap(ctx, session, snapshotID, 0, nil)
 
 	err := s.processChunkMapEntries(
