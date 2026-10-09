@@ -303,12 +303,12 @@ func TestBackupSnapshotTaskCancellationRecoversHoldAfterFailedStateSave(t *testi
 	f.execCtx.ExpectedCalls = nil
 	f.execCtx.On("GetTaskID").Return("task")
 	var durableState []byte
-	// Initial node intent and the state immediately before acquisition succeed.
+	// The node intent is durable before acquisition.
 	f.execCtx.On("SaveState", mock.Anything).Run(func(mock.Arguments) {
 		var err error
 		durableState, err = f.task.Save()
 		require.NoError(t, err)
-	}).Return(nil).Twice()
+	}).Return(nil).Once()
 	// CP holding succeeded, but the DP lock intent has not reached storage.
 	f.execCtx.On("SaveState", mock.Anything).Return(errors.NewRetriableErrorf("save failed")).Once()
 	require.Error(t, f.task.Run(f.ctx, f.execCtx))

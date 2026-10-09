@@ -58,9 +58,6 @@ func (t *backupSnapshotTask) Run(ctx context.Context, execCtx tasks.ExecutionCon
 
 func (t *backupSnapshotTask) run(ctx context.Context, execCtx tasks.ExecutionContext) error {
 	if t.state.Finished {
-		if err := execCtx.SaveState(ctx); err != nil {
-			return err
-		}
 		return t.releasePlan(ctx, execCtx)
 	}
 	if err := t.storage.ClaimSnapshotBackupPlan(ctx, execCtx.GetTaskID()); err != nil {
@@ -82,52 +79,11 @@ func (t *backupSnapshotTask) run(ctx context.Context, execCtx tasks.ExecutionCon
 			return err
 		}
 		if !node.Completed && !node.Excluded {
-			// An exact saved request identifies an already accepted copy.
-			// Deletion never prunes that copy, including after a restart.
-			if t.state.DataplaneRequest == nil {
-				meta, err := t.storage.ReserveSnapshotBackup(ctx, node.SnapshotId,
-					execCtx.GetTaskID(), t.hasDependent(node.SnapshotId, needed))
-				if err != nil {
-					return err
-				}
-				if meta == nil {
-					node.Excluded = true
-					if err := execCtx.SaveState(ctx); err != nil {
-						return err
-					}
-				} else if err := t.prepareCopy(ctx, execCtx, meta); err != nil {
-					return err
-				}
-			}
-			if t.state.DataplaneRequest != nil {
-				if t.state.DataplaneTaskID == "" {
-					if err := t.scheduleDataplaneTask(ctx, execCtx); err != nil {
-						return err
-					}
-				}
-				if _, err := t.scheduler.WaitTask(ctx, execCtx, t.state.DataplaneTaskID); err != nil {
-					return err
-				}
-				t.markCompleted(node)
-				// Persist completion before releasing any source reference.
-				if err := execCtx.SaveState(ctx); err != nil {
-					return err
-				}
+			if err := t.copyNode(ctx, execCtx, node, t.hasDependent(node.SnapshotId, needed)); err != nil {
+				return err
 			}
 		}
-		if err := execCtx.SaveState(ctx); err != nil {
-			return err
-		}
-		if err := t.releaseSnapshotLock(ctx, execCtx, node); err != nil {
-			return err
-		}
-		if err := t.storage.ReleaseSnapshotBackup(ctx, node.SnapshotId, execCtx.GetTaskID(), node.Completed); err != nil {
-			return err
-		}
-		t.state.DataplaneRequest = nil
-		t.state.DataplaneTaskID = ""
-		t.state.CopyIndex++
-		if err := execCtx.SaveState(ctx); err != nil {
+		if err := t.releaseNode(ctx, execCtx, node); err != nil {
 			return err
 		}
 	}
@@ -136,6 +92,49 @@ func (t *backupSnapshotTask) run(ctx context.Context, execCtx tasks.ExecutionCon
 		return err
 	}
 	return t.releasePlan(ctx, execCtx)
+}
+
+// An exact saved request identifies an already accepted copy. Deletion never
+// prunes that copy, including after a restart.
+func (t *backupSnapshotTask) copyNode(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode, neededByDependents bool) error {
+	if t.state.DataplaneRequest == nil {
+		meta, err := t.storage.ReserveSnapshotBackup(ctx, node.SnapshotId, execCtx.GetTaskID(), neededByDependents)
+		if err != nil {
+			return err
+		}
+		if meta == nil {
+			node.Excluded = true
+			return execCtx.SaveState(ctx)
+		}
+		if err := t.prepareCopy(ctx, execCtx, meta); err != nil {
+			return err
+		}
+	}
+	if t.state.DataplaneTaskID == "" {
+		if err := t.scheduleDataplaneTask(ctx, execCtx); err != nil {
+			return err
+		}
+	}
+	if _, err := t.scheduler.WaitTask(ctx, execCtx, t.state.DataplaneTaskID); err != nil {
+		return err
+	}
+	node.Completed = true
+	// Persist completion before releasing any source reference.
+	return execCtx.SaveState(ctx)
+}
+
+// Release the node's DP lock and CP holds, then move the cursor past it.
+func (t *backupSnapshotTask) releaseNode(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode) error {
+	if err := t.releaseSnapshotLock(ctx, execCtx, node); err != nil {
+		return err
+	}
+	if err := t.storage.ReleaseSnapshotBackup(ctx, node.SnapshotId, execCtx.GetTaskID(), node.Completed); err != nil {
+		return err
+	}
+	t.state.DataplaneRequest = nil
+	t.state.DataplaneTaskID = ""
+	t.state.CopyIndex++
+	return execCtx.SaveState(ctx)
 }
 
 func (t *backupSnapshotTask) prepareCopy(ctx context.Context, execCtx tasks.ExecutionContext, meta *resources.SnapshotMeta) error {
@@ -167,6 +166,8 @@ func (t *backupSnapshotTask) Cancel(ctx context.Context, execCtx tasks.Execution
 	return retrySnapshotBackupError(t.cancel(ctx, execCtx))
 }
 
+// Stop the copy and wait for its queue and workers before the lock tasks and
+// CP holds are dropped.
 func (t *backupSnapshotTask) cancel(ctx context.Context, execCtx tasks.ExecutionContext) error {
 	if t.state.DataplaneTaskID == "" && t.state.DataplaneRequest != nil {
 		if err := t.scheduleDataplaneTask(ctx, execCtx); err != nil {
@@ -182,24 +183,7 @@ func (t *backupSnapshotTask) cancel(ctx context.Context, execCtx tasks.Execution
 		}
 	}
 	for _, node := range t.state.Nodes {
-		if !node.LockRequested {
-			continue
-		}
-		// Recover a child whose ScheduleTask succeeded before saving its ID.
-		if node.LockTaskId == "" {
-			if err := t.scheduleSnapshotLock(ctx, execCtx, node); err != nil {
-				return err
-			}
-		}
-		if _, err := t.scheduler.CancelTask(ctx, node.LockTaskId); err != nil {
-			return err
-		}
-		if err := t.scheduler.WaitTaskEnded(ctx, node.LockTaskId); err != nil {
-			return err
-		}
-		node.LockRequested = false
-		node.LockTaskId = ""
-		if err := execCtx.SaveState(ctx); err != nil {
+		if err := t.cancelSnapshotLock(ctx, execCtx, node); err != nil {
 			return err
 		}
 	}
