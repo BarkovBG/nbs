@@ -78,37 +78,42 @@ func (t *backupSnapshotTask) prepareGraph(ctx context.Context, execCtx tasks.Exe
 					node.Excluded = true
 					node.Discovered = true
 				} else {
-					if t.state.ReaderSnapshotId == "" {
-						t.state.ReaderSnapshotId = node.SnapshotId
+					if !node.LockRequested {
+						node.LockRequested = true
 						if err := execCtx.SaveState(ctx); err != nil {
 							return err
 						}
 					}
-					if t.state.ReaderTaskId == "" {
-						if err := t.scheduleDependencyReader(ctx, execCtx); err != nil {
+					if node.LockTaskId == "" {
+						if err := t.scheduleSnapshotLock(ctx, execCtx, node); err != nil {
 							return err
 						}
 					}
-					response, err := t.scheduler.WaitTask(ctx, execCtx, t.state.ReaderTaskId)
+					message, err := t.scheduler.GetTaskMetadata(ctx, node.LockTaskId)
 					if err != nil {
 						return err
 					}
-					deps, ok := response.(*dataplane_protos.GetSnapshotBackupDependenciesResponse)
+					lock, ok := message.(*dataplane_protos.LockSnapshotForBackupState)
 					if !ok {
-						return errors.NewNonRetriableErrorf("unexpected backup dependencies response")
+						return errors.NewNonRetriableErrorf("unexpected snapshot backup lock metadata %T", message)
 					}
-					node.Dependencies = append([]string(nil), deps.SnapshotIds...)
-					for _, id := range node.Dependencies {
-						if t.node(id) == nil {
-							t.state.Nodes = append(t.state.Nodes, &protos.SnapshotBackupNode{SnapshotId: id})
+					if !lock.Ready {
+						return errors.NewInterruptExecutionError()
+					}
+					if !lock.Locked {
+						node.Excluded = true
+					} else {
+						node.Dependencies = append([]string(nil), lock.SnapshotIds...)
+						for _, id := range node.Dependencies {
+							if t.node(id) == nil {
+								t.state.Nodes = append(t.state.Nodes, &protos.SnapshotBackupNode{SnapshotId: id})
+							}
 						}
 					}
 					node.Discovered = true
 				}
 			}
 		}
-		t.state.ReaderSnapshotId = ""
-		t.state.ReaderTaskId = ""
 		if err := execCtx.SaveState(ctx); err != nil {
 			return err
 		}
@@ -121,19 +126,39 @@ func (t *backupSnapshotTask) prepareGraph(ctx context.Context, execCtx tasks.Exe
 	return execCtx.SaveState(ctx)
 }
 
-func (t *backupSnapshotTask) scheduleDependencyReader(ctx context.Context, execCtx tasks.ExecutionContext) error {
+func (t *backupSnapshotTask) scheduleSnapshotLock(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode) error {
 	if err := execCtx.SaveState(ctx); err != nil {
 		return err
 	}
 	id, err := t.scheduler.ScheduleTask(
-		headers.SetIncomingIdempotencyKey(ctx, execCtx.GetTaskID()+"_dependencies_"+t.state.ReaderSnapshotId),
-		"dataplane.GetSnapshotBackupDependencies", "",
-		&dataplane_protos.GetSnapshotBackupDependenciesRequest{SnapshotId: t.state.ReaderSnapshotId},
+		headers.SetIncomingIdempotencyKey(ctx, execCtx.GetTaskID()+"_lock_"+node.SnapshotId),
+		"dataplane.LockSnapshotForBackup", "",
+		&dataplane_protos.LockSnapshotForBackupRequest{SnapshotId: node.SnapshotId, OwnerId: t.ownerID(execCtx)},
 	)
 	if err != nil {
 		return err
 	}
-	t.state.ReaderTaskId = id
+	node.LockTaskId = id
+	return execCtx.SaveState(ctx)
+}
+
+func (t *backupSnapshotTask) releaseSnapshotLock(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode) error {
+	if !node.LockRequested {
+		return nil
+	}
+	if node.LockTaskId == "" {
+		if err := t.scheduleSnapshotLock(ctx, execCtx, node); err != nil {
+			return err
+		}
+	}
+	if err := t.scheduler.SendEvent(ctx, node.LockTaskId, int64(dataplane_protos.SnapshotBackupLockEvent_RELEASE)); err != nil {
+		return err
+	}
+	if err := t.scheduler.WaitTaskEnded(ctx, node.LockTaskId); err != nil {
+		return err
+	}
+	node.LockRequested = false
+	node.LockTaskId = ""
 	return execCtx.SaveState(ctx)
 }
 
@@ -186,6 +211,9 @@ func (t *backupSnapshotTask) pruneGraph(ctx context.Context, execCtx tasks.Execu
 	// snapshot's own chunk references, leaving references of other sources.
 	for _, node := range t.state.Nodes {
 		if node.Excluded {
+			if err := t.releaseSnapshotLock(ctx, execCtx, node); err != nil {
+				return nil, err
+			}
 			if err := t.storage.ReleaseSnapshotBackup(ctx, node.SnapshotId, t.ownerID(execCtx), false); err != nil {
 				return nil, err
 			}

@@ -281,8 +281,8 @@ func RegisterForExecution(
 	}
 
 	if backupS3 != nil {
-		err = taskRegistry.RegisterForExecution("dataplane.GetSnapshotBackupDependencies", func() tasks.Task {
-			return &getSnapshotBackupDependenciesTask{storage: storage}
+		err = taskRegistry.RegisterForExecution("dataplane.LockSnapshotForBackup", func() tasks.Task {
+			return &lockSnapshotForBackupTask{storage: storage}
 		})
 		if err != nil {
 			return err
@@ -354,20 +354,20 @@ func Register(ctx context.Context, taskRegistry *tasks.Registry) error {
 ////////////////////////////////////////////////////////////////////////////////
 
 var newTaskByTaskType = map[string]func() tasks.Task{
-	"dataplane.CreateSnapshotFromDisk":        func() tasks.Task { return &createSnapshotFromDiskTask{} },
-	"dataplane.CreateSnapshotFromSnapshot":    func() tasks.Task { return &createSnapshotFromSnapshotTask{} },
-	"dataplane.CreateSnapshotFromURL":         func() tasks.Task { return &createSnapshotFromURLTask{} },
-	"dataplane.MigrateSnapshotTask":           func() tasks.Task { return &migrateSnapshotTask{} },
-	"dataplane.MigrateSnapshotDatabaseTask":   func() tasks.Task { return &migrateSnapshotDatabaseTask{} },
-	"dataplane.TransferFromSnapshotToDisk":    func() tasks.Task { return &transferFromSnapshotToDiskTask{} },
-	"dataplane.TransferFromDiskToDisk":        func() tasks.Task { return &transferFromDiskToDiskTask{} },
-	"dataplane.ReplicateDisk":                 func() tasks.Task { return &replicateDiskTask{} },
-	"dataplane.DeleteSnapshot":                func() tasks.Task { return &deleteSnapshotTask{} },
-	"dataplane.DeleteSnapshotData":            func() tasks.Task { return &deleteSnapshotDataTask{} },
-	"dataplane.DeleteDiskFromIncremental":     func() tasks.Task { return &deleteDiskFromIncrementalTask{} },
-	"dataplane.CreateDRBasedDiskCheckpoint":   func() tasks.Task { return &createDRBasedDiskCheckpointTask{} },
-	"dataplane.GetSnapshotBackupDependencies": func() tasks.Task { return &getSnapshotBackupDependenciesTask{} },
-	"dataplane.ReleaseSnapshotBackup":         func() tasks.Task { return &releaseSnapshotBackupTask{} },
-	"dataplane.BackupSnapshotData":            func() tasks.Task { return &backupSnapshotDataTask{} },
-	"dataplane.BackupChunks":                  func() tasks.Task { return &backupChunksTask{} },
+	"dataplane.CreateSnapshotFromDisk":      func() tasks.Task { return &createSnapshotFromDiskTask{} },
+	"dataplane.CreateSnapshotFromSnapshot":  func() tasks.Task { return &createSnapshotFromSnapshotTask{} },
+	"dataplane.CreateSnapshotFromURL":       func() tasks.Task { return &createSnapshotFromURLTask{} },
+	"dataplane.MigrateSnapshotTask":         func() tasks.Task { return &migrateSnapshotTask{} },
+	"dataplane.MigrateSnapshotDatabaseTask": func() tasks.Task { return &migrateSnapshotDatabaseTask{} },
+	"dataplane.TransferFromSnapshotToDisk":  func() tasks.Task { return &transferFromSnapshotToDiskTask{} },
+	"dataplane.TransferFromDiskToDisk":      func() tasks.Task { return &transferFromDiskToDiskTask{} },
+	"dataplane.ReplicateDisk":               func() tasks.Task { return &replicateDiskTask{} },
+	"dataplane.DeleteSnapshot":              func() tasks.Task { return &deleteSnapshotTask{} },
+	"dataplane.DeleteSnapshotData":          func() tasks.Task { return &deleteSnapshotDataTask{} },
+	"dataplane.DeleteDiskFromIncremental":   func() tasks.Task { return &deleteDiskFromIncrementalTask{} },
+	"dataplane.CreateDRBasedDiskCheckpoint": func() tasks.Task { return &createDRBasedDiskCheckpointTask{} },
+	"dataplane.LockSnapshotForBackup":       func() tasks.Task { return &lockSnapshotForBackupTask{} },
+	"dataplane.ReleaseSnapshotBackup":       func() tasks.Task { return &releaseSnapshotBackupTask{} },
+	"dataplane.BackupSnapshotData":          func() tasks.Task { return &backupSnapshotDataTask{} },
+	"dataplane.BackupChunks":                func() tasks.Task { return &backupChunksTask{} },
 }
