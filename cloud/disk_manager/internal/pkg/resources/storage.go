@@ -71,8 +71,6 @@ type SnapshotMeta struct {
 	StorageSize       uint64                `json:"storage_size"`
 	Encryption        *types.EncryptionDesc `json:"encryption"`
 	Ready             bool                  `json:"ready"`
-	BackupTaskID      string                `json:"backup_task_id"`
-	BackupPlanID      string                `json:"backup_plan_id"`
 	BackupCompleted   bool                  `json:"backup_completed"`
 }
 
@@ -239,12 +237,6 @@ type Storage interface {
 	ListSnapshotBackupCandidates(ctx context.Context, folderID, afterID string, limit int) ([]string, error)
 	EnqueueSnapshotBackupForFolder(ctx context.Context, snapshotID, backupID, folderID, generation string) (bool, error)
 
-	ClaimSnapshotBackupPlan(ctx context.Context, backupTaskID string) error
-	ReserveSnapshotBackup(ctx context.Context, snapshotID, backupTaskID string, neededByDependents bool) (*SnapshotMeta, error)
-	HoldSnapshotBackupPlan(ctx context.Context, snapshotID, backupTaskID string) (*SnapshotMeta, error)
-	FinishSnapshotBackupPlan(ctx context.Context, backupTaskID string) error
-	ReleaseSnapshotBackup(ctx context.Context, snapshotID, ownerID string, completed bool) error
-
 	EnqueueSnapshotBackup(
 		ctx context.Context,
 		snapshotID string,
@@ -256,14 +248,15 @@ type Storage interface {
 		limit int,
 	) ([]SnapshotBackupRequest, error)
 
-	// Queue cleanup is not proof of a completed copy. ReleaseSnapshotBackup
-	// records success only for the task that owns the source hold.
-
+	// Queue cleanup is not proof of a completed copy; SnapshotBackupCompleted
+	// records success.
 	RemoveSnapshotFromBackupQueue(
 		ctx context.Context,
 		snapshotID string,
 		backupID string,
 	) error
+
+	SnapshotBackupCompleted(ctx context.Context, snapshotID string) error
 
 	// Returns filesystem if action has been accepted by storage and nil otherwise.
 	CreateFilesystem(ctx context.Context, filesystem FilesystemMeta) (*FilesystemMeta, error)

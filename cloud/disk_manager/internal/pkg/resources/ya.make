@@ -8,7 +8,6 @@ SRCS(
     filesystem_snapshots.go
     images.go
     placement_groups.go
-    snapshot_backups.go
     snapshots.go
     storage.go
 )
@@ -21,7 +20,6 @@ GO_TEST_SRCS(
     filesystem_snapshots_test.go
     images_test.go
     placement_groups_test.go
-    snapshot_backups_test.go
     snapshots_test.go
 )
 

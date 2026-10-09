@@ -328,13 +328,3 @@ func (s *storageYDB) GetQueuedChunksToBackup(
 	)
 	return entries, err
 }
-
-func (s *storageYDB) EnqueueBackupChunksForTask(ctx context.Context, snapshotID, taskID string, entries []BackupChunkQueueEntry) (err error) {
-	defer s.metrics.StatOperation("EnqueueBackupChunksForTask")(&err)
-	if taskID == "" {
-		return task_errors.NewNonRetriableErrorf("empty snapshot backup task ID")
-	}
-	return s.db.Execute(ctx, func(ctx context.Context, session *persistence.Session) error {
-		return s.enqueueBackupChunksForTask(ctx, session, snapshotID, taskID, entries)
-	})
-}

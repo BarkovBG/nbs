@@ -88,24 +88,6 @@ func TestSnapshotBackupLockRetriesFailedReleaseAndCancellation(t *testing.T) {
 	s.AssertNotCalled(t, "HoldSnapshotForBackup", mock.Anything, mock.Anything, mock.Anything)
 	s.AssertExpectations(t)
 }
-
-func TestSnapshotBackupCopyDrainsAndReleasesOnlyItsOwnReference(t *testing.T) {
-	ctx := test.NewContext()
-	s := storage_mocks.NewStorageMock()
-	execCtx := mocks.NewExecutionContextMock()
-	execCtx.On("GetTaskID").Return("copy-task")
-	s.On("DrainSnapshotBackup", ctx, "C", "copy-task", 1000).Return(errors.NewInterruptExecutionError()).Once()
-	s.On("DrainSnapshotBackup", ctx, "C", "copy-task", 1000).Return(nil)
-	s.On("ReleaseSnapshotForBackup", ctx, "C", "copy-task").Return(nil)
-	task := &backupSnapshotDataTask{storage: s, batchSize: 1000, request: &protos.BackupSnapshotDataRequest{SnapshotId: "C"}, state: &protos.BackupSnapshotDataTaskState{Finished: true}}
-	require.True(t, errors.Is(task.Run(ctx, execCtx), errors.NewInterruptExecutionError()))
-	s.AssertNotCalled(t, "ReleaseSnapshotForBackup", mock.Anything, mock.Anything, mock.Anything)
-	require.NoError(t, task.Run(ctx, execCtx))
-	require.NoError(t, task.Cancel(ctx, execCtx))
-	s.AssertNotCalled(t, "ReleaseSnapshotForBackup", ctx, "C", "lock-task")
-	s.AssertExpectations(t)
-}
-
 func TestSnapshotBackupLockDoesNotExposeDependenciesBeforeSuccessfulStateSave(t *testing.T) {
 	ctx := test.NewContext()
 	s := storage_mocks.NewStorageMock()

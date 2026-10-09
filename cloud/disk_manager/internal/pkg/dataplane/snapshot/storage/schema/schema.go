@@ -180,22 +180,6 @@ func Create(
 	err = db.CreateOrAlterTable(
 		ctx,
 		config.GetStorageFolder(),
-		"backup_chunk_inflight",
-		persistence.NewCreateTableDescription(
-			persistence.WithColumn("snapshot_id", persistence.Optional(persistence.TypeUTF8)),
-			persistence.WithColumn("task_id", persistence.Optional(persistence.TypeUTF8)),
-			persistence.WithPrimaryKeyColumn("snapshot_id", "task_id"),
-		),
-		dropUnusedColumns,
-	)
-	if err != nil {
-		return err
-	}
-	logging.Info(ctx, "Created backup_chunk_inflight table")
-
-	err = db.CreateOrAlterTable(
-		ctx,
-		config.GetStorageFolder(),
 		"backup_snapshot_refs",
 		persistence.NewCreateTableDescription(
 			persistence.WithColumn("snapshot_id", persistence.Optional(persistence.TypeUTF8)),
@@ -292,12 +276,6 @@ func Drop(
 		return err
 	}
 	logging.Info(ctx, "Dropped backup_chunk_queue table")
-
-	err = db.DropTable(ctx, config.GetStorageFolder(), "backup_chunk_inflight")
-	if err != nil {
-		return err
-	}
-	logging.Info(ctx, "Dropped backup_chunk_inflight table")
 
 	err = db.DropTable(ctx, config.GetStorageFolder(), "backup_snapshot_refs")
 	if err != nil {

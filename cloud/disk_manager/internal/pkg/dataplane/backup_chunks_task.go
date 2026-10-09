@@ -46,16 +46,6 @@ func (t *backupChunksTask) Run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	// Claims describe a worker batch, not a snapshot hold. Recover rows left
-	// by the previous invocation; otherwise drain would wait for it forever.
-	// This assumes the previous invocation has stopped: a logical task ID
-	// alone does not fence a stale execution on another host.
-	taskID := execCtx.GetTaskID()
-	err := t.storage.ReleaseBackupChunkClaims(ctx, taskID)
-	if err != nil {
-		return err
-	}
-
 	for {
 		entries, err := t.storage.GetQueuedChunksToBackup(
 			ctx,
@@ -74,30 +64,14 @@ func (t *backupChunksTask) Run(
 		})
 		entries = entries[:min(len(entries), t.batchSize)]
 
-		entries, err = t.storage.ClaimBackupChunks(ctx, taskID, entries)
-		if err != nil {
-			return err
-		}
-		if len(entries) == 0 {
-			continue
-		}
-
-		copied, copyErr := t.copyChunks(ctx, entries)
-		if len(copied) != 0 {
-			err = t.storage.ChunksBackupCompleted(ctx, copied)
-			if err != nil {
-				return err
-			}
-		}
-
-		// copyChunks joins every goroutine, including on errors. Retain the
-		// claims until both object writes and completion updates have stopped.
-		err = t.storage.ReleaseBackupChunkClaims(ctx, taskID)
-		if err != nil {
-			return err
-		}
+		copied, err := t.copyChunks(ctx, entries)
 		if len(copied) == 0 {
-			return copyErr
+			return err
+		}
+
+		err = t.storage.ChunksBackupCompleted(ctx, copied)
+		if err != nil {
+			return err
 		}
 	}
 }
@@ -107,11 +81,7 @@ func (t *backupChunksTask) Cancel(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	// runnerForCancel treats non-retriable errors as completed cancellation.
-	// Keep retrying cleanup until this worker's claims have been released.
-	return retrySnapshotBackupError(
-		t.storage.ReleaseBackupChunkClaims(ctx, execCtx.GetTaskID()),
-	)
+	return nil
 }
 
 func (t *backupChunksTask) GetMetadata(
@@ -192,17 +162,11 @@ func (t *backupChunksTask) copyChunks(
 				if err != nil {
 					logging.Warn(
 						groupCtx,
-						"Failed to copy chunk %v of snapshot %v: %v",
+						"Failed to copy chunk %v of snapshot %v, will retry: %v",
 						entry.ChunkID,
 						entry.SnapshotID,
 						err,
 					)
-					if errors.Is(err, errors.NewEmptyNonRetriableError()) {
-						markErr := t.storage.ChunkBackupFailed(groupCtx, entry)
-						if markErr != nil {
-							err = markErr
-						}
-					}
 					copyErrors <- err
 					continue
 				}

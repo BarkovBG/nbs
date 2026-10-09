@@ -700,8 +700,6 @@ func TestSnapshotBackupReferencesAreIndependentAndIdempotent(t *testing.T) {
 		require.NoError(t, f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "copy"))
 	}
 	require.NoError(t, f.storage.UnlockSnapshot(f.ctx, "snapshot", "incremental"))
-	require.NoError(t, f.storage.CheckSnapshotHeldForBackup(f.ctx, "snapshot", "graph-lock"))
-	require.NoError(t, f.storage.CheckSnapshotHeldForBackup(f.ctx, "snapshot", "copy"))
 	require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "unknown"))
 	for _, taskID := range []string{"delete", "graph-lock", "copy"} {
 		_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", taskID)
@@ -712,7 +710,6 @@ func TestSnapshotBackupReferencesAreIndependentAndIdempotent(t *testing.T) {
 	for i := 0; i != 2; i++ {
 		require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "graph-lock"))
 	}
-	require.NoError(t, f.storage.CheckSnapshotHeldForBackup(f.ctx, "snapshot", "copy"))
 	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 
@@ -720,7 +717,6 @@ func TestSnapshotBackupReferencesAreIndependentAndIdempotent(t *testing.T) {
 	require.NoError(t, f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "next-lock"))
 	require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "copy"))
 	require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "graph-lock"))
-	require.NoError(t, f.storage.CheckSnapshotHeldForBackup(f.ctx, "snapshot", "next-lock"))
 	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 
@@ -1929,16 +1925,15 @@ func TestBackupChunkQueue(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 
-	completed, err := f.storage.GetBackedUpChunkCount(f.ctx, "snap1")
-	require.NoError(t, err)
-	require.Zero(t, completed)
+	err = f.storage.CheckBackupChunksCompleted(f.ctx, "snap1")
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 
 	err = f.storage.ChunksBackupCompleted(f.ctx, entries[:2])
 	require.NoError(t, err)
 
-	completed, err = f.storage.GetBackedUpChunkCount(f.ctx, "snap1")
-	require.NoError(t, err)
-	require.EqualValues(t, 2, completed)
+	require.NoError(t, f.storage.CheckBackupChunksCompleted(f.ctx, "snap1"))
+	err = f.storage.CheckBackupChunksCompleted(f.ctx, "snap2")
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 
 	err = f.storage.EnqueueBackupChunks(f.ctx, "snap1", entries[:2])
 	require.NoError(t, err)
@@ -1959,7 +1954,7 @@ func TestBackupChunkQueue(t *testing.T) {
 	require.EqualValues(t, 0, length)
 }
 
-func TestClearCompletedBackupChunks(t *testing.T) {
+func TestClearBackupChunks(t *testing.T) {
 	f := createFixture(t)
 	defer f.teardown()
 
@@ -2005,12 +2000,9 @@ func TestClearCompletedBackupChunks(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 1, length)
 
-	completed, err := f.storage.GetBackedUpChunkCount(f.ctx, "snap1")
-	require.NoError(t, err)
-	require.EqualValues(t, 2, completed)
-
-	for _, expected := range []int{1, 1, 0} {
-		cleared, err := f.storage.ClearCompletedBackupChunks(
+	// Queued and completed entries of the snapshot are cleared together.
+	for _, expected := range []int{1, 1, 1, 0} {
+		cleared, err := f.storage.ClearBackupChunks(
 			f.ctx,
 			"snap1",
 			1, // limit
@@ -2019,14 +2011,19 @@ func TestClearCompletedBackupChunks(t *testing.T) {
 		require.Equal(t, expected, cleared)
 	}
 
-	err = f.storage.ChunksBackupCompleted(f.ctx, entries[:2])
+	got, err = f.storage.GetQueuedChunksToBackup(f.ctx, 10)
 	require.NoError(t, err)
+	require.Empty(t, got)
+	require.NoError(t, f.storage.CheckBackupChunksCompleted(f.ctx, "snap1"))
 
-	completed, err = f.storage.GetBackedUpChunkCount(f.ctx, "snap1")
+	// Cleared chunks are enqueued again by the next attempt.
+	err = f.storage.EnqueueBackupChunks(f.ctx, "snap1", entries[:1])
 	require.NoError(t, err)
-	require.Zero(t, completed)
+	got, err = f.storage.GetQueuedChunksToBackup(f.ctx, 10)
+	require.NoError(t, err)
+	require.Equal(t, entries[:1], got)
 
-	cleared, err := f.storage.ClearCompletedBackupChunks(
+	cleared, err := f.storage.ClearBackupChunks(
 		f.ctx,
 		"snap2",
 		10, // limit
@@ -2114,160 +2111,16 @@ func TestGetSnapshotIDFromChunkID(t *testing.T) {
 	require.False(t, IsChunkCreatedBySnapshot("task1.snap1.7", "snap2"))
 	require.False(t, IsChunkCreatedBySnapshot("", ""))
 }
-
-func TestDrainSnapshotBackupWaitsForAllWorkers(t *testing.T) {
-	f := createFixture(t)
-	defer f.teardown()
-
-	_, err := f.storage.CreateSnapshot(f.ctx, SnapshotMeta{ID: "snapshot"})
-	require.NoError(t, err)
-	require.NoError(t, f.storage.SnapshotCreated(f.ctx, "snapshot", 0, 0, 0, nil))
-	require.NoError(t, f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "backup"))
-	entries := []BackupChunkQueueEntry{{SnapshotID: "snapshot", ChunkID: "chunk"}}
-	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snapshot", entries))
-
-	for _, worker := range []string{"worker1", "worker2"} {
-		claimed, err := f.storage.ClaimBackupChunks(f.ctx, worker, entries)
-		require.NoError(t, err)
-		require.Equal(t, entries, claimed)
-	}
-	// One worker can remove the queue row while another is still writing.
-	require.NoError(t, f.storage.ChunksBackupCompleted(f.ctx, entries))
-	require.NoError(t, f.storage.ReleaseBackupChunkClaims(f.ctx, "worker1"))
-	err = f.storage.DrainSnapshotBackup(f.ctx, "snapshot", "backup", 10)
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
-	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
-
-	claimed, err := f.storage.ClaimBackupChunks(f.ctx, "late", entries)
-	require.NoError(t, err)
-	require.Empty(t, claimed)
-	require.NoError(t, f.storage.ReleaseBackupChunkClaims(f.ctx, "worker2"))
-	require.NoError(t, f.storage.DrainSnapshotBackup(f.ctx, "snapshot", "backup", 10))
-	require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "backup"))
-	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
-	require.NoError(t, err)
-}
-
-func TestDrainSnapshotBackupRejectsStaleWorkersAndTasks(t *testing.T) {
-	f := createFixture(t)
-	defer f.teardown()
-
-	_, err := f.storage.CreateSnapshot(f.ctx, SnapshotMeta{ID: "snapshot"})
-	require.NoError(t, err)
-	require.NoError(t, f.storage.SnapshotCreated(f.ctx, "snapshot", 0, 0, 0, nil))
-	require.NoError(t, f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "backup"))
-	entries := []BackupChunkQueueEntry{
-		{SnapshotID: "snapshot", ChunkID: "first"},
-		{SnapshotID: "snapshot", ChunkID: "second"},
-	}
-	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snapshot", entries))
-	for i := 0; i < 2; i++ {
-		err = f.storage.DrainSnapshotBackup(f.ctx, "snapshot", "backup", 1)
-		require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
-	}
-	require.NoError(t, f.storage.DrainSnapshotBackup(f.ctx, "snapshot", "backup", 1))
-	claimed, err := f.storage.ClaimBackupChunks(f.ctx, "late", entries)
-	require.NoError(t, err)
-	require.Empty(t, claimed)
-	require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "backup"))
-
-	require.NoError(t, f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "next"))
-	err = f.storage.EnqueueBackupChunksForTask(f.ctx, "snapshot", "backup", entries)
-	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
-	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snapshot", entries))
-	require.NoError(t, f.storage.DrainSnapshotBackup(f.ctx, "snapshot", "backup", 10))
-	require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "backup"))
-	queue, err := f.storage.GetQueuedChunksToBackup(f.ctx, 10)
-	require.NoError(t, err)
-	require.ElementsMatch(t, entries, queue)
-	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
-}
-
-func TestClaimBackupChunksRacesWithDrain(t *testing.T) {
-	f := createFixture(t)
-	defer f.teardown()
-
-	for i := 0; i < 20; i++ {
-		id := fmt.Sprintf("snapshot%v", i)
-		_, err := f.storage.CreateSnapshot(f.ctx, SnapshotMeta{ID: id})
-		require.NoError(t, err)
-		require.NoError(t, f.storage.SnapshotCreated(f.ctx, id, 0, 0, 0, nil))
-		require.NoError(t, f.storage.HoldSnapshotForBackup(f.ctx, id, "backup"))
-		entries := []BackupChunkQueueEntry{{SnapshotID: id, ChunkID: "chunk"}}
-		require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, id, entries))
-
-		start := make(chan struct{})
-		drainResult := make(chan error, 1)
-		type claimResult struct {
-			entries []BackupChunkQueueEntry
-			err     error
-		}
-		claim := make(chan claimResult, 1)
-		go func() {
-			<-start
-			entries, err := f.storage.ClaimBackupChunks(f.ctx, "worker", entries)
-			claim <- claimResult{entries, err}
-		}()
-		go func() {
-			<-start
-			drainResult <- f.storage.DrainSnapshotBackup(f.ctx, id, "backup", 10)
-		}()
-		close(start)
-		result := <-claim
-		require.NoError(t, result.err)
-		err = <-drainResult
-		if len(result.entries) != 0 {
-			require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
-		} else {
-			require.NoError(t, err)
-		}
-		require.NoError(t, f.storage.ReleaseBackupChunkClaims(f.ctx, "worker"))
-		require.NoError(t, f.storage.DrainSnapshotBackup(f.ctx, id, "backup", 10))
-		require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, id, "backup"))
-	}
-}
-
-func TestBackupChunkFailureDoesNotOverwriteSuccess(t *testing.T) {
-	f := createFixture(t)
-	defer f.teardown()
-	entry := BackupChunkQueueEntry{SnapshotID: "snapshot", ChunkID: "chunk"}
-	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snapshot", []BackupChunkQueueEntry{entry}))
-	require.NoError(t, f.storage.ChunksBackupCompleted(f.ctx, []BackupChunkQueueEntry{entry}))
-	// A duplicate worker's late failure must preserve recorded success.
-	require.NoError(t, f.storage.ChunkBackupFailed(f.ctx, entry))
-	require.NoError(t, f.storage.CheckBackupChunksCompleted(f.ctx, "snapshot"))
-	failed := BackupChunkQueueEntry{SnapshotID: "snapshot", ChunkID: "failed"}
-	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snapshot", []BackupChunkQueueEntry{failed}))
-	require.NoError(t, f.storage.ChunkBackupFailed(f.ctx, failed))
-	err := f.storage.CheckBackupChunksCompleted(f.ctx, "snapshot")
-	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
-	queue, err := f.storage.GetQueuedChunksToBackup(f.ctx, 10)
-	require.NoError(t, err)
-	require.Empty(t, queue)
-	// Conversely, a completed duplicate write is sufficient to recover a
-	// failure, as long as the snapshot task has not cancelled the attempt.
-	require.NoError(t, f.storage.ChunksBackupCompleted(f.ctx, []BackupChunkQueueEntry{failed}))
-	require.NoError(t, f.storage.CheckBackupChunksCompleted(f.ctx, "snapshot"))
-}
-
-func TestBackupHoldRejectsDirectCleanupAndLateEnqueue(t *testing.T) {
+func TestBackupHoldRejectsDirectCleanup(t *testing.T) {
 	f := createFixture(t)
 	defer f.teardown()
 	_, err := f.storage.CreateSnapshot(f.ctx, SnapshotMeta{ID: "snapshot"})
 	require.NoError(t, err)
 	require.NoError(t, f.storage.SnapshotCreated(f.ctx, "snapshot", 0, 0, 0, nil))
 	require.NoError(t, f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "owner"))
-	require.NoError(t, f.storage.CheckSnapshotHeldForBackup(f.ctx, "snapshot", "owner"))
 	err = f.storage.DeleteSnapshotData(f.ctx, "snapshot")
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 	require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "owner"))
-	err = f.storage.EnqueueBackupChunksForTask(f.ctx, "snapshot", "owner", []BackupChunkQueueEntry{{SnapshotID: "snapshot", ChunkID: "late"}})
-	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
-	queue, err := f.storage.GetQueuedChunksToBackup(f.ctx, 10)
-	require.NoError(t, err)
-	require.Empty(t, queue)
 	require.NoError(t, f.storage.DeleteSnapshotData(f.ctx, "snapshot"))
 	err = f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "next")
 	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))

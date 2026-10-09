@@ -60,9 +60,6 @@ func (t *backupSnapshotTask) run(ctx context.Context, execCtx tasks.ExecutionCon
 	if t.state.Finished {
 		return t.releasePlan(ctx, execCtx)
 	}
-	if err := t.storage.ClaimSnapshotBackupPlan(ctx, execCtx.GetTaskID()); err != nil {
-		return err
-	}
 	if !t.state.GraphPrepared {
 		if err := t.prepareGraph(ctx, execCtx); err != nil {
 			return err
@@ -74,12 +71,12 @@ func (t *backupSnapshotTask) run(ctx context.Context, execCtx tasks.ExecutionCon
 	}
 	for t.state.CopyIndex < uint32(len(order)) {
 		node := t.node(order[t.state.CopyIndex])
-		needed, err := t.pruneGraph(ctx, execCtx)
+		metas, err := t.pruneGraph(ctx, execCtx)
 		if err != nil {
 			return err
 		}
-		if !node.Completed && !node.Excluded {
-			if err := t.copyNode(ctx, execCtx, node, t.hasDependent(node.SnapshotId, needed)); err != nil {
+		if meta := metas[node.SnapshotId]; meta != nil {
+			if err := t.copyNode(ctx, execCtx, node, meta); err != nil {
 				return err
 			}
 		}
@@ -94,18 +91,10 @@ func (t *backupSnapshotTask) run(ctx context.Context, execCtx tasks.ExecutionCon
 	return t.releasePlan(ctx, execCtx)
 }
 
-// An exact saved request identifies an already accepted copy. Deletion never
-// prunes that copy, including after a restart.
-func (t *backupSnapshotTask) copyNode(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode, neededByDependents bool) error {
-	if t.state.DataplaneRequest == nil {
-		meta, err := t.storage.ReserveSnapshotBackup(ctx, node.SnapshotId, execCtx.GetTaskID(), neededByDependents)
-		if err != nil {
-			return err
-		}
-		if meta == nil {
-			node.Excluded = true
-			return execCtx.SaveState(ctx)
-		}
+// Saving the exact request accepts the copy: from then on it is finished
+// even if the source gets deleted meanwhile.
+func (t *backupSnapshotTask) copyNode(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode, meta *resources.SnapshotMeta) error {
+	if !t.copyAccepted(node) {
 		if err := t.prepareCopy(ctx, execCtx, meta); err != nil {
 			return err
 		}
@@ -119,16 +108,18 @@ func (t *backupSnapshotTask) copyNode(ctx context.Context, execCtx tasks.Executi
 		return err
 	}
 	node.Completed = true
-	// Persist completion before releasing any source reference.
+	// Persist completion before releasing the source lock.
 	return execCtx.SaveState(ctx)
 }
 
-// Release the node's DP lock and CP holds, then move the cursor past it.
+// Record completion, unlock the node and move the cursor past it.
 func (t *backupSnapshotTask) releaseNode(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode) error {
-	if err := t.releaseSnapshotLock(ctx, execCtx, node); err != nil {
-		return err
+	if node.Completed {
+		if err := t.storage.SnapshotBackupCompleted(ctx, node.SnapshotId); err != nil {
+			return err
+		}
 	}
-	if err := t.storage.ReleaseSnapshotBackup(ctx, node.SnapshotId, execCtx.GetTaskID(), node.Completed); err != nil {
+	if err := t.releaseSnapshotLock(ctx, execCtx, node); err != nil {
 		return err
 	}
 	t.state.DataplaneRequest = nil
@@ -166,8 +157,8 @@ func (t *backupSnapshotTask) Cancel(ctx context.Context, execCtx tasks.Execution
 	return retrySnapshotBackupError(t.cancel(ctx, execCtx))
 }
 
-// Stop the copy and wait for its queue and workers before the lock tasks and
-// CP holds are dropped.
+// Stop the copy and wait for its queue cleanup before the lock tasks are
+// cancelled.
 func (t *backupSnapshotTask) cancel(ctx context.Context, execCtx tasks.ExecutionContext) error {
 	if t.state.DataplaneTaskID == "" && t.state.DataplaneRequest != nil {
 		if err := t.scheduleDataplaneTask(ctx, execCtx); err != nil {
@@ -190,21 +181,15 @@ func (t *backupSnapshotTask) cancel(ctx context.Context, execCtx tasks.Execution
 	return t.releasePlan(ctx, execCtx)
 }
 
+// Includes locks requested immediately before a failed SaveState: every
+// node's intent was durable before its lock task was scheduled.
 func (t *backupSnapshotTask) releasePlan(ctx context.Context, execCtx tasks.ExecutionContext) error {
-	// Includes nodes whose Hold succeeded immediately before a failed SaveState:
-	// every node's intent was durable before acquisition, even if not discovered.
 	for _, node := range t.state.Nodes {
 		if err := t.releaseSnapshotLock(ctx, execCtx, node); err != nil {
 			return err
 		}
-		if err := t.storage.ReleaseSnapshotBackup(ctx, node.SnapshotId, execCtx.GetTaskID(), node.Completed); err != nil {
-			return err
-		}
 	}
-	if err := t.storage.RemoveSnapshotFromBackupQueue(ctx, t.request.SnapshotId, t.request.BackupId); err != nil {
-		return err
-	}
-	return t.storage.FinishSnapshotBackupPlan(ctx, execCtx.GetTaskID())
+	return t.storage.RemoveSnapshotFromBackupQueue(ctx, t.request.SnapshotId, t.request.BackupId)
 }
 
 func (t *backupSnapshotTask) GetMetadata(ctx context.Context) (proto.Message, error) {

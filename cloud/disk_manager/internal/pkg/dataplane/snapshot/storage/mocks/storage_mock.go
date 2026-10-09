@@ -307,16 +307,6 @@ func (s *StorageMock) GetQueuedChunksToBackup(
 	args := s.Called(ctx, limit)
 	return args.Get(0).([]storage.BackupChunkQueueEntry), args.Error(1)
 }
-
-func (s *StorageMock) GetBackedUpChunkCount(
-	ctx context.Context,
-	snapshotID string,
-) (uint64, error) {
-
-	args := s.Called(ctx, snapshotID)
-	return args.Get(0).(uint64), args.Error(1)
-}
-
 func (s *StorageMock) ChunksBackupCompleted(
 	ctx context.Context,
 	entries []storage.BackupChunkQueueEntry,
@@ -326,7 +316,16 @@ func (s *StorageMock) ChunksBackupCompleted(
 	return args.Error(0)
 }
 
-func (s *StorageMock) ClearCompletedBackupChunks(
+func (s *StorageMock) CheckBackupChunksCompleted(
+	ctx context.Context,
+	snapshotID string,
+) error {
+
+	args := s.Called(ctx, snapshotID)
+	return args.Error(0)
+}
+
+func (s *StorageMock) ClearBackupChunks(
 	ctx context.Context,
 	snapshotID string,
 	limit int,
@@ -349,48 +348,4 @@ func (s *StorageMock) GetBackupChunkQueueLength(
 // Ensure that StorageMock implements storage.Storage.
 func assertStorageMockIsStorage(arg *StorageMock) storage.Storage {
 	return arg
-}
-
-func (s *StorageMock) ClaimBackupChunks(
-	ctx context.Context,
-	taskID string,
-	entries []storage.BackupChunkQueueEntry,
-) ([]storage.BackupChunkQueueEntry, error) {
-
-	args := s.Called(ctx, taskID, entries)
-	return args.Get(0).([]storage.BackupChunkQueueEntry), args.Error(1)
-}
-
-func (s *StorageMock) ReleaseBackupChunkClaims(
-	ctx context.Context,
-	taskID string,
-) error {
-
-	return s.Called(ctx, taskID).Error(0)
-}
-
-func (s *StorageMock) DrainSnapshotBackup(
-	ctx context.Context,
-	snapshotID string,
-	taskID string,
-	limit int,
-) error {
-
-	return s.Called(ctx, snapshotID, taskID, limit).Error(0)
-}
-
-func (s *StorageMock) CheckBackupChunksCompleted(ctx context.Context, snapshotID string) error {
-	return s.Called(ctx, snapshotID).Error(0)
-}
-
-func (s *StorageMock) ChunkBackupFailed(ctx context.Context, entry storage.BackupChunkQueueEntry) error {
-	return s.Called(ctx, entry).Error(0)
-}
-
-func (s *StorageMock) EnqueueBackupChunksForTask(ctx context.Context, snapshotID, taskID string, entries []storage.BackupChunkQueueEntry) error {
-	return s.Called(ctx, snapshotID, taskID, entries).Error(0)
-}
-
-func (s *StorageMock) CheckSnapshotHeldForBackup(ctx context.Context, snapshotID, taskID string) error {
-	return s.Called(ctx, snapshotID, taskID).Error(0)
 }

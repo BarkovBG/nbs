@@ -189,7 +189,6 @@ type backupChunkStatus int64
 const (
 	backupChunkStatusQueued    backupChunkStatus = iota
 	backupChunkStatusCompleted backupChunkStatus = iota
-	backupChunkStatusFailed    backupChunkStatus = iota
 )
 
 func backupChunkStructTypeString() string {
