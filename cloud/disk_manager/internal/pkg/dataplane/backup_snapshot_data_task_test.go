@@ -755,6 +755,20 @@ func TestBackupSnapshotDataTaskRejectsBadDEK(t *testing.T) {
 	require.Empty(t, queue)
 }
 
+func TestBackupSnapshotDataTaskRetriesBadDEKForAcceptedCPOwner(t *testing.T) {
+	ctx := test.NewContext()
+	storage := storage_mocks.NewStorageMock()
+	task := newBackupSnapshotDataTask(storage, newTestFollower(t, ctx), "snapshot")
+	task.request.OwnerId = "accepted"
+	task.request.EncryptedDek = []byte("bad")
+	err := task.Run(ctx, newBackupExecutionContext(ctx))
+	retriable := errors.NewEmptyRetriableError()
+	require.True(t, errors.As(err, &retriable))
+	require.True(t, retriable.IgnoreRetryLimit)
+	require.False(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+	storage.AssertNotCalled(t, "HoldSnapshotForBackup", mock.Anything, mock.Anything, mock.Anything)
+}
+
 func TestBackupSnapshotDataTaskCancellationDrainsWorkers(t *testing.T) {
 	ctx := test.NewContext()
 	storage, closeFunc := newStorage(t, ctx)
@@ -927,25 +941,38 @@ func TestBackupSnapshotDataTaskDoesNotTrustEmptyChunkStatusTable(t *testing.T) {
 	require.NoError(t, task.Cancel(ctx, execCtx))
 }
 
-func TestBackupSnapshotDataTaskRestartsLegacyMapProgressUnderHold(t *testing.T) {
-	ctx := test.NewContext()
-	storage, closeFunc := newStorage(t, ctx)
-	defer closeFunc()
-	follower := newTestFollower(t, ctx)
-	chunkID := createSnapshotWithChunk(t, ctx, storage, "snapshot")
-	task := newBackupSnapshotDataTask(storage, follower, "snapshot")
-	task.state.MilestoneChunkIndex = 1
-	task.state.ChunkCount = 1
-	task.state.ChunkMapBackedUp = true
-	execCtx := newBackupExecutionContext(ctx)
-	err := task.Run(ctx, execCtx)
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
-	require.True(t, task.state.ChunkMapPrepared)
-	require.False(t, task.state.ChunkMapBackedUp)
-	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
-	require.NoError(t, err)
-	require.Len(t, queue, 1)
-	require.Equal(t, chunkID, queue[0].ChunkID)
-	require.Equal(t, follower.encryptedDEK, queue[0].EncryptedDEK)
-	require.NoError(t, task.Cancel(ctx, execCtx))
+func TestBackupSnapshotDataTaskRepairsFollowerChunkBeforePublishingMap(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("missing=%v", missing), func(t *testing.T) {
+			ctx := test.NewContext()
+			storage, closeFunc := newStorage(t, ctx)
+			defer closeFunc()
+			follower := newTestFollower(t, ctx)
+			chunkID := createSnapshotWithChunk(t, ctx, storage, "snapshot")
+			task := newBackupSnapshotDataTask(storage, follower, "snapshot")
+			execCtx := newBackupExecutionContext(ctx)
+			require.True(t, errors.Is(task.Run(ctx, execCtx), errors.NewInterruptExecutionError()))
+			worker := newBackupChunksTask(storage, follower)
+			workerCtx := mocks.NewExecutionContextMock()
+			workerCtx.On("GetTaskID").Return("worker")
+			require.True(t, errors.Is(worker.Run(ctx, workerCtx), errors.NewInterruptExecutionError()))
+			require.NoError(t, storage.CheckBackupChunksCompleted(ctx, "snapshot"))
+
+			if missing {
+				require.NoError(t, follower.backupS3.DeleteObject(ctx, backup.ChunkKey(chunkID)))
+			} else {
+				require.NoError(t, follower.backupS3.PutObject(ctx, backup.ChunkKey(chunkID), follower.encryptedDEK,
+					chunks.NewS3Object(chunks.ChunkBlob{Data: []byte("wrong"), Checksum: 1})))
+			}
+			require.True(t, errors.Is(task.Run(ctx, execCtx), errors.NewInterruptExecutionError()))
+			_, err := follower.getObject(ctx, backup.ChunkMapKey("snapshot"))
+			require.Error(t, err)
+			_, err = storage.DeletingSnapshot(ctx, "snapshot", "delete")
+			require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+
+			require.True(t, errors.Is(worker.Run(ctx, workerCtx), errors.NewInterruptExecutionError()))
+			require.NoError(t, task.Run(ctx, execCtx))
+			require.Equal(t, []string{chunkID}, readBackupChunkMap(t, ctx, follower, "snapshot").ChunkIds)
+		})
+	}
 }

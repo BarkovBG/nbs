@@ -8,6 +8,7 @@ import (
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/protos"
 	snapshot_storage "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/chunks"
+	storage_mocks "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/mocks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/test"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/monitoring/metrics"
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
@@ -206,6 +207,20 @@ func TestBackupChunksTaskRecoversClaimsAfterRestart(t *testing.T) {
 	require.NoError(t, storage.DrainSnapshotBackup(ctx, "snap1", "backup", 10))
 	_, err = follower.getObject(ctx, backup.ChunkKey(chunkID))
 	require.Error(t, err)
+}
+
+func TestBackupChunksTaskCancellationRetriesClaimCleanupFailure(t *testing.T) {
+	ctx := test.NewContext()
+	storage := storage_mocks.NewStorageMock()
+	storage.On("ReleaseBackupChunkClaims", ctx, "worker").Return(
+		errors.NewNonRetriableErrorf("storage failure"),
+	).Once()
+	execCtx := mocks.NewExecutionContextMock()
+	execCtx.On("GetTaskID").Return("worker")
+	err := newBackupChunksTask(storage, testFollower{}).Cancel(ctx, execCtx)
+	require.True(t, errors.Is(err, errors.NewEmptyRetriableError()))
+	require.False(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+	storage.AssertExpectations(t)
 }
 
 func TestBackupChunksTaskVerifiesExistingFollowerContent(t *testing.T) {
