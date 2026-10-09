@@ -29,27 +29,20 @@ func TestScheduleBackupSnapshotTasks(t *testing.T) {
 	execCtx := tasks_mocks.NewExecutionContextMock()
 
 	storage.On("ListSnapshotsToBackup", mock.Anything, 2).Return(
-		[]resources.SnapshotBackupRequest{{SnapshotID: "snap1"}, {SnapshotID: "snap2", BackupID: "attempt"}},
+		[]resources.SnapshotBackupRequest{{SnapshotID: "snap1", BackupID: "attempt1"}, {SnapshotID: "snap2", BackupID: "attempt2"}},
 		nil,
 	)
 
-	expectScheduled := func(id string) {
+	expectScheduled := func(id, attempt string) {
 		scheduler.On(
 			"ScheduleTask",
 			mock.MatchedBy(func(ctx context.Context) bool {
-				key := "backup_snapshot_" + id
-				if id == "snap2" {
-					key += "_attempt"
-				}
-				return headers.GetIdempotencyKey(ctx) == key
+				return headers.GetIdempotencyKey(ctx) ==
+					"backup_snapshot_"+id+"_"+attempt
 			}),
 			"snapshots.BackupSnapshot",
 			"",
 			mock.MatchedBy(func(request *protos.BackupSnapshotRequest) bool {
-				attempt := ""
-				if id == "snap2" {
-					attempt = "attempt"
-				}
 				return request.SnapshotId == id && request.BackupId == attempt
 			}),
 		).Return(id+"_task", nil)
@@ -62,7 +55,7 @@ func TestScheduleBackupSnapshotTasks(t *testing.T) {
 	}
 
 	// Graphs run one at a time: the second request waits for the first.
-	expectScheduled("snap1")
+	expectScheduled("snap1", "attempt1")
 	scheduler.On("WaitTask", mock.Anything, execCtx, "snap1_task").Return(
 		nil,
 		errors.NewInterruptExecutionError(),
@@ -71,7 +64,7 @@ func TestScheduleBackupSnapshotTasks(t *testing.T) {
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 	mock.AssertExpectationsForObjects(t, storage, scheduler)
 
-	expectScheduled("snap2")
+	expectScheduled("snap2", "attempt2")
 	scheduler.On("WaitTask", mock.Anything, execCtx, "snap1_task").Return(&empty.Empty{}, nil).Once()
 	scheduler.On("WaitTask", mock.Anything, execCtx, "snap2_task").Return(&empty.Empty{}, nil).Once()
 	err = task.Run(ctx, execCtx)
