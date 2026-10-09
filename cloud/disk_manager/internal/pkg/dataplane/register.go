@@ -281,9 +281,12 @@ func RegisterForExecution(
 	}
 
 	if backupS3 != nil {
-		err = taskRegistry.RegisterForExecution("dataplane.LockSnapshotForBackup", func() tasks.Task {
-			return &lockSnapshotForBackupTask{storage: storage}
-		})
+		err = taskRegistry.RegisterForExecution(
+			"dataplane.ListSnapshotChunkCreators",
+			func() tasks.Task {
+				return &listSnapshotChunkCreatorsTask{storage: storage}
+			},
+		)
 		if err != nil {
 			return err
 		}
@@ -359,7 +362,7 @@ var newTaskByTaskType = map[string]func() tasks.Task{
 	"dataplane.DeleteSnapshotData":          func() tasks.Task { return &deleteSnapshotDataTask{} },
 	"dataplane.DeleteDiskFromIncremental":   func() tasks.Task { return &deleteDiskFromIncrementalTask{} },
 	"dataplane.CreateDRBasedDiskCheckpoint": func() tasks.Task { return &createDRBasedDiskCheckpointTask{} },
-	"dataplane.LockSnapshotForBackup":       func() tasks.Task { return &lockSnapshotForBackupTask{} },
+	"dataplane.ListSnapshotChunkCreators":   func() tasks.Task { return &listSnapshotChunkCreatorsTask{} },
 	"dataplane.BackupSnapshotData":          func() tasks.Task { return &backupSnapshotDataTask{} },
 	"dataplane.BackupChunks":                func() tasks.Task { return &backupChunksTask{} },
 }

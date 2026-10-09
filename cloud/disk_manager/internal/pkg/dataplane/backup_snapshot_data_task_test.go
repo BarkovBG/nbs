@@ -160,6 +160,22 @@ func createSnapshotWithChunk(
 	return chunkID
 }
 
+// Deletes the snapshot the way dataplane.DeleteSnapshot does: its own chunk
+// references go away, chunks referenced by other snapshots stay.
+func finishSnapshotDeletion(
+	t *testing.T,
+	ctx context.Context,
+	storage snapshot_storage.Storage,
+	snapshotID string,
+) {
+
+	_, err := storage.DeletingSnapshot(ctx, snapshotID, "delete")
+	require.NoError(t, err)
+
+	err = storage.DeleteSnapshotData(ctx, snapshotID)
+	require.NoError(t, err)
+}
+
 func readBackupChunkMap(
 	t *testing.T,
 	ctx context.Context,
@@ -235,6 +251,10 @@ func TestBackupSnapshotDataTask(t *testing.T) {
 	err = task.Run(ctx, execCtx)
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 
+	// The copy holds the snapshot.
+	_, err = storage.DeletingSnapshot(ctx, "snap1", "delete")
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+
 	_, err = follower.getObject(ctx, backup.ChunkMapKey("snap1"))
 	require.Error(t, err)
 
@@ -282,6 +302,9 @@ func TestBackupSnapshotDataTask(t *testing.T) {
 	require.NoError(t, resumed.Load(request, state))
 
 	err = resumed.Run(ctx, execCtx)
+	require.NoError(t, err)
+
+	_, err = storage.DeletingSnapshot(ctx, "snap1", "delete")
 	require.NoError(t, err)
 }
 
@@ -639,7 +662,12 @@ func TestBackupSnapshotDataTaskFailsOnChunkIndexOutOfRange(t *testing.T) {
 
 	_, err = follower.getObject(ctx, backup.ChunkMapKey("snap1"))
 	require.Error(t, err)
+
+	_, err = storage.DeletingSnapshot(ctx, "snap1", "delete")
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 	require.NoError(t, task.Cancel(ctx, execCtx))
+	_, err = storage.DeletingSnapshot(ctx, "snap1", "delete")
+	require.NoError(t, err)
 }
 
 func TestBackupSnapshotDataTaskBacksUpShallowCopyWithoutCreatorBackup(t *testing.T) {
@@ -700,7 +728,7 @@ func TestBackupSnapshotDataTaskBacksUpShallowCopyWithoutCreatorBackup(t *testing
 	require.Equal(t, []string{chunk0}, chunkMap.ChunkIds)
 }
 
-func TestBackupSnapshotDataTaskFailsOnDeletedSnapshot(t *testing.T) {
+func TestBackupSnapshotDataTaskSkipsDeletedSnapshot(t *testing.T) {
 	ctx := test.NewContext()
 
 	storage, closeFunc := newStorage(t, ctx)
@@ -716,7 +744,8 @@ func TestBackupSnapshotDataTaskFailsOnDeletedSnapshot(t *testing.T) {
 	task := newBackupSnapshotDataTask(storage, follower, "snap1")
 
 	err = task.Run(ctx, execCtx)
-	require.True(t, errors.Is(err, errors.NewEmptyRetriableError()))
+	require.NoError(t, err)
+	require.True(t, task.GetResponse().(*protos.BackupSnapshotDataResponse).Skipped)
 
 	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
 	require.NoError(t, err)
@@ -743,13 +772,20 @@ func TestBackupSnapshotDataTaskEnqueuesNothingOnBadDEK(t *testing.T) {
 	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
 	require.NoError(t, err)
 	require.Empty(t, queue)
+
+	// The copy keeps its reference until it is cancelled.
+	_, err = storage.DeletingSnapshot(ctx, "snap1", "delete")
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 	require.NoError(t, task.Cancel(ctx, execCtx))
+	_, err = storage.DeletingSnapshot(ctx, "snap1", "delete")
+	require.NoError(t, err)
 }
 
 func TestBackupSnapshotDataTaskRetriesBadDEKWithoutRetryLimit(t *testing.T) {
 	ctx := test.NewContext()
 	storage := storage_mocks.NewStorageMock()
 	task := newBackupSnapshotDataTask(storage, newTestFollower(t, ctx), "snapshot")
+	storage.On("HoldSnapshotForBackup", ctx, "snapshot", "backup").Return(true, nil).Once()
 	task.request.EncryptedDek = []byte("bad")
 	err := task.Run(ctx, newBackupExecutionContext(ctx))
 	retriable := errors.NewEmptyRetriableError()
@@ -781,8 +817,6 @@ func TestBackupSnapshotDataTaskCancellationClearsQueue(t *testing.T) {
 	cleared, err := storage.ClearBackupChunks(ctx, "snap1", 10)
 	require.NoError(t, err)
 	require.Zero(t, cleared)
-	// Retrying cancellation is harmless.
-	require.NoError(t, task.Cancel(ctx, execCtx))
 
 	// The next attempt enqueues the chunk again.
 	next := newBackupSnapshotDataTask(storage, follower, "snap1")

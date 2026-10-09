@@ -153,11 +153,12 @@ type Storage interface {
 
 	// HoldSnapshotForBackup adds an idempotent (snapshotID, taskID) reference.
 	// Deletion waits for all references; they do not expire automatically.
+	// Returns false if the snapshot is missing or not ready.
 	HoldSnapshotForBackup(
 		ctx context.Context,
 		snapshotID string,
 		taskID string,
-	) error
+	) (bool, error)
 
 	// ReleaseSnapshotForBackup removes only this task's reference.
 	ReleaseSnapshotForBackup(

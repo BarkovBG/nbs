@@ -19,7 +19,7 @@ message BackupSnapshotTaskState {
     string DataplaneTaskID = 1;
     dataplane.BackupSnapshotDataRequest DataplaneRequest = 2;
 
-    // Discovery, copy progress and completion are derived from the nodes.
+    // Copy order: creators of chunks first, the requested snapshot last.
     repeated SnapshotBackupNode Nodes = 3;
 }
 
@@ -30,11 +30,7 @@ message BackupSnapshotResponse {
 
 message SnapshotBackupNode {
     string SnapshotId = 1;
-    // Snapshots that created chunks of this one.
-    repeated string Dependencies = 2;
-    bool Discovered = 3;
-    bool Excluded = 4;
-    bool Completed = 5;
-    // The lock task may exist and has to be cancelled.
-    bool Locked = 6;
+    bool Completed = 2;
+    // Missing or deleted before its copy was accepted.
+    bool Skipped = 3;
 }

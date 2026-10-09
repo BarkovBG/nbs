@@ -19,9 +19,11 @@ import (
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// Backs up a snapshot together with the snapshots whose chunks it uses.
-// First every snapshot of the graph is locked by dataplane.LockSnapshotForBackup,
-// then dataplane.BackupSnapshotData copies them, creators of chunks first.
+// Backs up a snapshot together with the snapshots that created its chunks,
+// creators first, so that their chunks are copied once. Each copy holds only
+// its own snapshot: the chunks a snapshot uses stay while it exists, so a
+// creator deleted before its turn is skipped and its chunks are copied with
+// the snapshots that use them.
 type backupSnapshotTask struct {
 	scheduler tasks.Scheduler
 	storage   resources.Storage
@@ -69,9 +71,13 @@ func (t *backupSnapshotTask) GetMetadata(
 }
 
 func (t *backupSnapshotTask) GetResponse() proto.Message {
-	root := t.node(t.request.SnapshotId)
+	var completed bool
+	if len(t.state.Nodes) != 0 {
+		completed = t.state.Nodes[len(t.state.Nodes)-1].Completed
+	}
+
 	return &protos.BackupSnapshotResponse{
-		Completed:            root != nil && root.Completed,
+		Completed:            completed,
 		CompletedSnapshotIds: t.completedSnapshotIDs(),
 	}
 }
@@ -83,29 +89,19 @@ func (t *backupSnapshotTask) run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	err := t.prepareGraph(ctx, execCtx)
-	if err != nil {
-		return err
+	if len(t.state.Nodes) == 0 {
+		err := t.prepareNodes(ctx, execCtx)
+		if err != nil {
+			return err
+		}
 	}
 
-	for _, node := range snapshotBackupOrder(t.state.Nodes) {
-		if !node.Completed && !node.Excluded {
-			err = t.copyNode(ctx, execCtx, node)
-			if err != nil {
-				return err
-			}
+	for _, node := range t.state.Nodes {
+		if node.Completed || node.Skipped {
+			continue
 		}
 
-		// Completion is saved before the unlock, so a restart repeats only
-		// the record and the unlock.
-		if node.Completed && node.Locked {
-			err = t.storage.SnapshotBackupCompleted(ctx, node.SnapshotId)
-			if err != nil {
-				return err
-			}
-		}
-
-		err = t.unlockSnapshot(ctx, execCtx, node)
+		err := t.copyNode(ctx, execCtx, node)
 		if err != nil {
 			return err
 		}
@@ -118,8 +114,6 @@ func (t *backupSnapshotTask) run(
 	)
 }
 
-// Stops the copy before the locks are cancelled: the copy reads the snapshot
-// that the lock keeps.
 func (t *backupSnapshotTask) cancel(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
@@ -142,13 +136,6 @@ func (t *backupSnapshotTask) cancel(
 		}
 	}
 
-	for _, node := range t.state.Nodes {
-		err := t.unlockSnapshot(ctx, execCtx, node)
-		if err != nil {
-			return err
-		}
-	}
-
 	return t.storage.RemoveSnapshotFromBackupQueue(
 		ctx,
 		t.request.SnapshotId,
@@ -156,91 +143,97 @@ func (t *backupSnapshotTask) cancel(
 	)
 }
 
-// Starts from the requested snapshot and adds the creators of its chunks
-// until the whole graph is locked. No copy starts before that.
-func (t *backupSnapshotTask) prepareGraph(
+// Orders the snapshots by creation time: a chunk is created before the
+// snapshots that reference it, so creators come before their users.
+func (t *backupSnapshotTask) prepareNodes(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	if len(t.state.Nodes) == 0 {
-		t.state.Nodes = []*protos.SnapshotBackupNode{
-			{SnapshotId: t.request.SnapshotId},
-		}
-	}
-
-	// Discovery appends new nodes to the slice.
-	for i := 0; i < len(t.state.Nodes); i++ {
-		node := t.state.Nodes[i]
-		if node.Discovered {
-			continue
-		}
-
-		err := t.discoverNode(ctx, execCtx, node)
-		if err != nil {
-			return err
-		}
-
-		err = execCtx.SaveState(ctx)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (t *backupSnapshotTask) discoverNode(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-	node *protos.SnapshotBackupNode,
-) error {
-
-	meta, err := t.storage.GetSnapshotMeta(ctx, node.SnapshotId)
+	root, err := t.storage.GetSnapshotMeta(ctx, t.request.SnapshotId)
 	if err != nil {
 		return err
 	}
 
-	switch {
-	case meta != nil && meta.BackupCompleted:
-		node.Completed = true
-	case meta == nil || !meta.Ready:
-		// Missing or deleting creators are not copied. Descendants keep
-		// references to the chunks they use and copy those chunks themselves.
-		node.Excluded = true
-	default:
-		lock, err := t.lockSnapshot(ctx, execCtx, node)
+	metas := make([]*resources.SnapshotMeta, 0)
+	if root != nil && root.Ready && !root.BackupCompleted {
+		creators, err := t.listChunkCreators(ctx, execCtx)
 		if err != nil {
 			return err
 		}
 
-		if !lock.Ready {
-			return errors.NewInterruptExecutionError()
-		}
+		for _, id := range creators {
+			meta, err := t.storage.GetSnapshotMeta(ctx, id)
+			if err != nil {
+				return err
+			}
 
-		if !lock.Locked {
-			// Deletion won the lock.
-			node.Excluded = true
-		}
-
-		node.Dependencies = lock.SnapshotIds
-		for _, id := range node.Dependencies {
-			if t.node(id) == nil {
-				t.state.Nodes = append(
-					t.state.Nodes,
-					&protos.SnapshotBackupNode{SnapshotId: id},
-				)
+			// A deleted creator is not copied; the chunks of it that are
+			// still used are copied with the snapshots that use them.
+			if meta != nil {
+				metas = append(metas, meta)
 			}
 		}
+
+		sort.Slice(metas, func(i, j int) bool {
+			return metas[i].CreatingAt.Before(metas[j].CreatingAt)
+		})
 	}
 
-	node.Discovered = true
-	return nil
+	for _, meta := range metas {
+		t.state.Nodes = append(t.state.Nodes, &protos.SnapshotBackupNode{
+			SnapshotId: meta.ID,
+			Completed:  meta.BackupCompleted,
+		})
+	}
+
+	t.state.Nodes = append(t.state.Nodes, &protos.SnapshotBackupNode{
+		SnapshotId: t.request.SnapshotId,
+		Completed:  root != nil && root.BackupCompleted,
+		Skipped:    root == nil || !root.Ready && !root.BackupCompleted,
+	})
+	return execCtx.SaveState(ctx)
 }
 
-// Saving the request accepts the copy: from then on it is finished even if
-// the snapshot is being deleted. Before that a deleting snapshot is skipped;
-// the chunks of it that descendants use are copied with the descendants.
+func (t *backupSnapshotTask) listChunkCreators(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) ([]string, error) {
+
+	taskID, err := t.scheduler.ScheduleTask(
+		headers.SetIncomingIdempotencyKey(
+			ctx,
+			execCtx.GetTaskID()+"_chunk_creators",
+		),
+		"dataplane.ListSnapshotChunkCreators",
+		"",
+		&dataplane_protos.ListSnapshotChunkCreatorsRequest{
+			SnapshotId: t.request.SnapshotId,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	response, err := t.scheduler.WaitTask(ctx, execCtx, taskID)
+	if err != nil {
+		return nil, err
+	}
+
+	typedResponse, ok := response.(*dataplane_protos.ListSnapshotChunkCreatorsResponse)
+	if !ok {
+		return nil, errors.NewNonRetriableErrorf(
+			"invalid list snapshot chunk creators response type %T",
+			response,
+		)
+	}
+
+	return typedResponse.SnapshotIds, nil
+}
+
+// Saving the request accepts the copy. The copy then holds the snapshot, so
+// it finishes even if the snapshot is being deleted, unless deletion won
+// before the hold.
 func (t *backupSnapshotTask) copyNode(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
@@ -254,7 +247,7 @@ func (t *backupSnapshotTask) copyNode(
 		}
 
 		if meta == nil || !meta.Ready {
-			node.Excluded = true
+			node.Skipped = true
 			return execCtx.SaveState(ctx)
 		}
 
@@ -269,12 +262,30 @@ func (t *backupSnapshotTask) copyNode(
 		return err
 	}
 
-	_, err = t.scheduler.WaitTask(ctx, execCtx, taskID)
+	response, err := t.scheduler.WaitTask(ctx, execCtx, taskID)
 	if err != nil {
 		return err
 	}
 
-	node.Completed = true
+	typedResponse, ok := response.(*dataplane_protos.BackupSnapshotDataResponse)
+	if !ok {
+		return errors.NewNonRetriableErrorf(
+			"invalid backup snapshot data response type %T",
+			response,
+		)
+	}
+
+	if typedResponse.Skipped {
+		node.Skipped = true
+	} else {
+		err = t.storage.SnapshotBackupCompleted(ctx, node.SnapshotId)
+		if err != nil {
+			return err
+		}
+
+		node.Completed = true
+	}
+
 	t.state.DataplaneRequest = nil
 	t.state.DataplaneTaskID = ""
 	return execCtx.SaveState(ctx)
@@ -345,104 +356,6 @@ func (t *backupSnapshotTask) scheduleCopy(
 	return taskID, execCtx.SaveState(ctx)
 }
 
-// Returns the state of the task that locks the snapshot of the node.
-func (t *backupSnapshotTask) lockSnapshot(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-	node *protos.SnapshotBackupNode,
-) (*dataplane_protos.LockSnapshotForBackupState, error) {
-
-	taskID, err := t.scheduleLock(ctx, execCtx, node)
-	if err != nil {
-		return nil, err
-	}
-
-	metadata, err := t.scheduler.GetTaskMetadata(ctx, taskID)
-	if err != nil {
-		return nil, err
-	}
-
-	lock, ok := metadata.(*dataplane_protos.LockSnapshotForBackupState)
-	if !ok {
-		return nil, errors.NewNonRetriableErrorf(
-			"unexpected snapshot backup lock metadata %T",
-			metadata,
-		)
-	}
-
-	return lock, nil
-}
-
-// Cancelling the lock task drops its dataplane reference to the snapshot.
-func (t *backupSnapshotTask) unlockSnapshot(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-	node *protos.SnapshotBackupNode,
-) error {
-
-	if !node.Locked {
-		return nil
-	}
-
-	taskID, err := t.scheduleLock(ctx, execCtx, node)
-	if err != nil {
-		return err
-	}
-
-	_, err = t.scheduler.CancelTask(ctx, taskID)
-	if err != nil {
-		return err
-	}
-
-	err = t.scheduler.WaitTaskEnded(ctx, taskID)
-	if err != nil {
-		return err
-	}
-
-	node.Locked = false
-	return execCtx.SaveState(ctx)
-}
-
-// Locked is saved before scheduling, so cancellation finds every lock task.
-// Scheduling with the same idempotency key returns the same task, so its ID
-// is not saved.
-func (t *backupSnapshotTask) scheduleLock(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-	node *protos.SnapshotBackupNode,
-) (string, error) {
-
-	if !node.Locked {
-		node.Locked = true
-		err := execCtx.SaveState(ctx)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	return t.scheduler.ScheduleTask(
-		headers.SetIncomingIdempotencyKey(
-			ctx,
-			execCtx.GetTaskID()+"_lock_"+node.SnapshotId,
-		),
-		"dataplane.LockSnapshotForBackup",
-		"",
-		&dataplane_protos.LockSnapshotForBackupRequest{
-			SnapshotId: node.SnapshotId,
-		},
-	)
-}
-
-func (t *backupSnapshotTask) node(id string) *protos.SnapshotBackupNode {
-	for _, node := range t.state.Nodes {
-		if node.SnapshotId == id {
-			return node
-		}
-	}
-
-	return nil
-}
-
 func (t *backupSnapshotTask) completedSnapshotIDs() []string {
 	var ids []string
 	for _, node := range t.state.Nodes {
@@ -453,40 +366,6 @@ func (t *backupSnapshotTask) completedSnapshotIDs() []string {
 
 	sort.Strings(ids)
 	return ids
-}
-
-// Puts the creators of chunks before the snapshots that use them. A creator
-// existed before the snapshot that references its chunks, so there are no
-// cycles.
-func snapshotBackupOrder(
-	nodes []*protos.SnapshotBackupNode,
-) []*protos.SnapshotBackupNode {
-
-	byID := make(map[string]*protos.SnapshotBackupNode)
-	for _, node := range nodes {
-		byID[node.SnapshotId] = node
-	}
-
-	visited := make(map[string]bool)
-	order := make([]*protos.SnapshotBackupNode, 0, len(nodes))
-
-	var visit func(node *protos.SnapshotBackupNode)
-	visit = func(node *protos.SnapshotBackupNode) {
-		if visited[node.SnapshotId] {
-			return
-		}
-		visited[node.SnapshotId] = true
-
-		for _, id := range node.Dependencies {
-			visit(byID[id])
-		}
-		order = append(order, node)
-	}
-
-	for _, node := range nodes {
-		visit(node)
-	}
-	return order
 }
 
 func retrySnapshotBackupError(err error) error {
