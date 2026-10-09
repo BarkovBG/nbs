@@ -630,8 +630,8 @@ func (s *StorageMock) ListSnapshotBackupCandidates(ctx context.Context, folderID
 	return a.Get(0).([]string), a.Error(1)
 }
 
-func (s *StorageMock) ReserveSnapshotBackup(ctx context.Context, snapshotID, ownerID, coordinatorID string) (*resources.SnapshotMeta, error) {
-	a := s.Called(ctx, snapshotID, ownerID, coordinatorID)
+func (s *StorageMock) ReserveSnapshotBackup(ctx context.Context, snapshotID, ownerID, coordinatorID string, neededByDependents bool) (*resources.SnapshotMeta, error) {
+	a := s.Called(ctx, snapshotID, ownerID, coordinatorID, neededByDependents)
 	if a.Get(0) == nil {
 		return nil, a.Error(1)
 	}
@@ -654,4 +654,15 @@ func (s *StorageMock) ReleaseSnapshotBackupFolder(ctx context.Context, folderID,
 
 func (s *StorageMock) SetSnapshotBackupFolder(ctx context.Context, folderID, generation string, enabled bool) error {
 	return s.Called(ctx, folderID, generation, enabled).Error(0)
+}
+
+func (s *StorageMock) HoldSnapshotBackupPlan(ctx context.Context, snapshotID, ownerID, coordinatorID string) (*resources.SnapshotMeta, error) {
+	a := s.Called(ctx, snapshotID, ownerID, coordinatorID)
+	if a.Get(0) == nil {
+		return nil, a.Error(1)
+	}
+	return a.Get(0).(*resources.SnapshotMeta), a.Error(1)
+}
+func (s *StorageMock) FinishSnapshotBackupPlan(ctx context.Context, folderID, ownerID string) error {
+	return s.Called(ctx, folderID, ownerID).Error(0)
 }

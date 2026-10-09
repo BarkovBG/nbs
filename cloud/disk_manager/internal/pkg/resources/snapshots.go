@@ -68,6 +68,7 @@ type snapshotState struct {
 	storageSize       uint64
 	backupCompleted   bool
 	backupTaskID      string
+	backupPlanID      string
 	encryptionMode    uint32
 	encryptionKeyHash []byte
 
@@ -102,6 +103,7 @@ func (s *snapshotState) toSnapshotMeta() *SnapshotMeta {
 		Ready:           s.status == snapshotStatusReady,
 		BackupCompleted: s.backupCompleted,
 		BackupTaskID:    s.backupTaskID,
+		BackupPlanID:    s.backupPlanID,
 	}
 }
 
@@ -131,6 +133,7 @@ func (s *snapshotState) structValue() persistence.Value {
 			persistence.BoolValue(s.backupCompleted),
 		),
 		persistence.StructFieldValue("backup_task_id", persistence.UTF8Value(s.backupTaskID)),
+		persistence.StructFieldValue("backup_plan_id", persistence.UTF8Value(s.backupPlanID)),
 		persistence.StructFieldValue("status", persistence.Int64Value(int64(s.status))),
 	)
 }
@@ -160,6 +163,7 @@ func scanSnapshotState(res persistence.Result) (state snapshotState, err error) 
 			&state.backupCompleted,
 		),
 		persistence.OptionalWithDefault("backup_task_id", &state.backupTaskID),
+		persistence.OptionalWithDefault("backup_plan_id", &state.backupPlanID),
 		persistence.OptionalWithDefault("status", &state.status),
 	)
 	return
@@ -208,6 +212,7 @@ func snapshotStateStructTypeString() string {
 		encryption_keyhash: String,
 		backup_completed: Bool,
         backup_task_id: Utf8,
+        backup_plan_id: Utf8,
 		status: Int64>`
 }
 
@@ -237,6 +242,7 @@ func snapshotStateTableDescription() persistence.CreateTableDescription {
 			persistence.Optional(persistence.TypeBool),
 		),
 		persistence.WithColumn("backup_task_id", persistence.Optional(persistence.TypeUTF8)),
+		persistence.WithColumn("backup_plan_id", persistence.Optional(persistence.TypeUTF8)),
 		persistence.WithColumn("status", persistence.Optional(persistence.TypeInt64)),
 		persistence.WithPrimaryKeyColumn("id"),
 		persistence.WithSecondaryKeyColumn("folder_id"),
@@ -663,7 +669,7 @@ func (s *storageYDB) deleteSnapshot(
 		return nil, err
 	}
 
-	if s.backupEnabled && state.backupTaskID == "" {
+	if s.backupEnabled && state.backupTaskID == "" && state.backupPlanID == "" {
 		_, err = tx.Execute(ctx, fmt.Sprintf(`
 			--!syntax_v1
 			pragma TablePathPrefix = "%v";
@@ -727,7 +733,7 @@ func (s *storageYDB) snapshotDeleted(
 	}
 
 	state := states[0]
-	if state.backupTaskID != "" {
+	if state.backupTaskID != "" || state.backupPlanID != "" {
 		return errors.NewInterruptExecutionError()
 	}
 
@@ -1042,7 +1048,7 @@ func (s *storageYDB) finishSnapshotBackup(
 		$ids = (
 			select snapshot_id as id from backup_queue
             where snapshot_id = $snapshot_id
-                and snapshot_id in (select id from snapshots where COALESCE(backup_task_id, "") = "")
+                and snapshot_id in (select id from snapshots where COALESCE(backup_task_id, "") = "" and COALESCE(backup_plan_id, "") = "")
 				and COALESCE(backup_id, "") = $backup_id
 		);
 

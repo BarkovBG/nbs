@@ -131,8 +131,8 @@ func (t *backupFolderTask) Run(ctx context.Context, execCtx tasks.ExecutionConte
 		t.state.Round++
 		t.state.SnapshotId = ids[0]
 		t.state.OwnerId = fmt.Sprintf("%v_%v_%v", execCtx.GetTaskID(), t.state.Round, ids[0])
-		// Persist the exact child key before sending it. No other snapshot is
-		// held or scheduled while this one is in progress.
+		// Persist the exact child key before sending it. The child prepares and holds
+		// this root's complete graph before copying any of its nodes.
 		if err := execCtx.SaveState(ctx); err != nil {
 			return err
 		}

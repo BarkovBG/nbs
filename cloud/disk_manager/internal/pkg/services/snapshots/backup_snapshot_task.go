@@ -45,8 +45,11 @@ func (t *backupSnapshotTask) ownerID(execCtx tasks.ExecutionContext) string {
 }
 
 func (t *backupSnapshotTask) scheduleDataplaneTask(ctx context.Context, execCtx tasks.ExecutionContext) error {
+	if err := execCtx.SaveState(ctx); err != nil {
+		return err
+	}
 	id, err := t.scheduler.ScheduleTask(
-		headers.SetIncomingIdempotencyKey(ctx, fmt.Sprintf("%v_%v_backup", execCtx.GetTaskID(), t.request.SnapshotId)),
+		headers.SetIncomingIdempotencyKey(ctx, fmt.Sprintf("%v_%v_backup", execCtx.GetTaskID(), t.state.DataplaneRequest.SnapshotId)),
 		"dataplane.BackupSnapshotData", "", t.state.DataplaneRequest,
 	)
 	if err != nil {
@@ -61,82 +64,104 @@ func (t *backupSnapshotTask) Run(ctx context.Context, execCtx tasks.ExecutionCon
 }
 
 func (t *backupSnapshotTask) run(ctx context.Context, execCtx tasks.ExecutionContext) error {
-	owner := t.ownerID(execCtx)
-	if t.state.DataplaneTaskID != "" && t.state.DataplaneRequest == nil {
-		// Finish a child scheduled by the previous implementation. Its result
-		// predates full-map verification and must not set backup_completed.
-		if _, err := t.scheduler.WaitTask(ctx, execCtx, t.state.DataplaneTaskID); err != nil {
-			return err
-		}
-		return t.storage.SnapshotBackupCancelled(ctx, t.request.SnapshotId, t.request.BackupId)
-	}
 	if t.state.Finished {
-		return t.storage.ReleaseSnapshotBackup(ctx, t.request.SnapshotId, owner, true)
-	}
-	if t.state.DataplaneRequest == nil {
-		// Old unscheduled tasks have no folder coordinator. Leave them for
-		// the new folder pass instead of accepting an unowned attempt.
-		if t.request.CoordinatorId == "" {
-			return t.storage.SnapshotBackupCancelled(ctx, t.request.SnapshotId, t.request.BackupId)
-		}
-		if err := t.backupDependencies(ctx, execCtx); err != nil {
-			return err
-		}
-		if t.state.AlreadyBackedUp {
-			return nil
-		}
-
-		// The reservation is durable before scheduling any DP work. A retry of
-		// an accepted owner is allowed when Delete has since marked deleting.
-		meta, err := t.storage.ReserveSnapshotBackup(ctx, t.request.SnapshotId, owner, t.request.CoordinatorId)
-		if err != nil {
-			return err
-		}
-		if meta == nil {
-			return t.storage.SnapshotBackupCancelled(ctx, t.request.SnapshotId, t.request.BackupId)
-		}
-		if meta.Disk == nil {
-			return errors.NewNonRetriableErrorf("snapshot %v has no disk", meta.ID)
-		}
-		snapshotMeta, err := backup.NewSnapshotMeta(*meta)
-		if err != nil {
-			return err
-		}
-		data, err := json.Marshal(snapshotMeta)
-		if err != nil {
-			return errors.NewNonRetriableError(err)
-		}
-		if len(t.state.EncryptedDek) == 0 {
-			t.state.EncryptedDek = t.request.EncryptedDek
-		}
-		t.state.EncryptedDek, err = t.backupS3.EnsureEncryptedDEK(t.state.EncryptedDek)
-		if err != nil {
-			return err
-		}
-		t.state.DataplaneRequest = &dataplane_protos.BackupSnapshotDataRequest{
-			SnapshotId: meta.ID, OwnerId: owner, EncryptedDek: t.state.EncryptedDek,
-			CompletedSnapshotIds: append([]string(nil), t.state.CompletedSnapshotIds...),
-			MetaKey:              backup.SnapshotMetaKey(meta.Disk.DiskId, meta.ID), Meta: data,
-		}
-		// Exact metadata and DEK survive a crash after scheduling but before
-		// saving the child ID. Cancellation recovers that same child.
 		if err := execCtx.SaveState(ctx); err != nil {
 			return err
 		}
+		return t.releasePlan(ctx, execCtx)
 	}
-	if t.state.DataplaneTaskID == "" {
-		if err := t.scheduleDataplaneTask(ctx, execCtx); err != nil {
+	if t.request.CoordinatorId == "" {
+		return t.storage.SnapshotBackupCancelled(ctx, t.request.SnapshotId, t.request.BackupId)
+	}
+	if !t.state.GraphPrepared {
+		if err := t.prepareGraph(ctx, execCtx); err != nil {
 			return err
 		}
 	}
-	if _, err := t.scheduler.WaitTask(ctx, execCtx, t.state.DataplaneTaskID); err != nil {
-		return err
+	for t.state.CopyIndex < uint32(len(t.state.CopyOrder)) {
+		node := t.node(t.state.CopyOrder[t.state.CopyIndex])
+		needed, err := t.pruneGraph(ctx, execCtx)
+		if err != nil {
+			return err
+		}
+		if !node.Completed && !node.Excluded {
+			// An exact saved request identifies an already accepted copy.
+			// Deletion never prunes that copy, including after a restart.
+			if t.state.DataplaneRequest == nil {
+				meta, err := t.storage.ReserveSnapshotBackup(ctx, node.SnapshotId,
+					t.ownerID(execCtx), t.request.CoordinatorId, t.hasDependent(node.SnapshotId, needed))
+				if err != nil {
+					return err
+				}
+				if meta == nil {
+					node.Excluded = true
+					if err := execCtx.SaveState(ctx); err != nil {
+						return err
+					}
+				} else if err := t.prepareCopy(ctx, execCtx, meta); err != nil {
+					return err
+				}
+			}
+			if t.state.DataplaneRequest != nil {
+				if t.state.DataplaneTaskID == "" {
+					if err := t.scheduleDataplaneTask(ctx, execCtx); err != nil {
+						return err
+					}
+				}
+				if _, err := t.scheduler.WaitTask(ctx, execCtx, t.state.DataplaneTaskID); err != nil {
+					return err
+				}
+				t.markCompleted(node)
+				// Persist completion before releasing any source reference.
+				if err := execCtx.SaveState(ctx); err != nil {
+					return err
+				}
+			}
+		}
+		if err := execCtx.SaveState(ctx); err != nil {
+			return err
+		}
+		if err := t.storage.ReleaseSnapshotBackup(ctx, node.SnapshotId, t.ownerID(execCtx), node.Completed); err != nil {
+			return err
+		}
+		t.state.DataplaneRequest = nil
+		t.state.DataplaneTaskID = ""
+		t.state.EncryptedDek = nil
+		t.state.CopyIndex++
+		if err := execCtx.SaveState(ctx); err != nil {
+			return err
+		}
 	}
 	t.state.Finished = true
 	if err := execCtx.SaveState(ctx); err != nil {
 		return err
 	}
-	return t.storage.ReleaseSnapshotBackup(ctx, t.request.SnapshotId, owner, true)
+	return t.releasePlan(ctx, execCtx)
+}
+
+func (t *backupSnapshotTask) prepareCopy(ctx context.Context, execCtx tasks.ExecutionContext, meta *resources.SnapshotMeta) error {
+	if meta.Disk == nil {
+		return errors.NewNonRetriableErrorf("snapshot %v has no disk", meta.ID)
+	}
+	snapshotMeta, err := backup.NewSnapshotMeta(*meta)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(snapshotMeta)
+	if err != nil {
+		return errors.NewNonRetriableError(err)
+	}
+	t.state.EncryptedDek, err = t.backupS3.EnsureEncryptedDEK(t.request.EncryptedDek)
+	if err != nil {
+		return err
+	}
+	t.state.DataplaneRequest = &dataplane_protos.BackupSnapshotDataRequest{
+		SnapshotId: meta.ID, OwnerId: t.ownerID(execCtx), EncryptedDek: t.state.EncryptedDek,
+		CompletedSnapshotIds: append([]string(nil), t.state.CompletedSnapshotIds...),
+		MetaKey:              backup.SnapshotMetaKey(meta.Disk.DiskId, meta.ID), Meta: data,
+	}
+	// Cancellation recovers this exact request if the child ID was not saved.
+	return execCtx.SaveState(ctx)
 }
 
 func (t *backupSnapshotTask) Cancel(ctx context.Context, execCtx tasks.ExecutionContext) error {
@@ -144,27 +169,17 @@ func (t *backupSnapshotTask) Cancel(ctx context.Context, execCtx tasks.Execution
 }
 
 func (t *backupSnapshotTask) cancel(ctx context.Context, execCtx tasks.ExecutionContext) error {
-	// Recover a child whose scheduling succeeded before its ID was saved.
-	if t.state.DataplaneRequest == nil && t.state.DataplaneTaskID == "" {
-		if !t.state.DependenciesRead && t.state.DependencyReaderTaskId == "" {
-			if err := t.scheduleDependencyReader(ctx, execCtx); err != nil {
-				return err
-			}
-		}
-		if t.state.DependencyIndex < uint32(len(t.state.DependencyIds)) && t.state.DependencyTaskId == "" {
-			if err := t.scheduleDependency(ctx, execCtx); err != nil {
-				return err
-			}
-		}
-	}
-	for _, id := range []string{t.state.DependencyTaskId, t.state.DependencyReaderTaskId} {
-		if id == "" {
-			continue
-		}
-		if _, err := t.scheduler.CancelTask(ctx, id); err != nil {
+	// Reader intent is saved before scheduling, just like the exact copy request.
+	if t.state.ReaderSnapshotId != "" && t.state.ReaderTaskId == "" {
+		if err := t.scheduleDependencyReader(ctx, execCtx); err != nil {
 			return err
 		}
-		if err := t.scheduler.WaitTaskEnded(ctx, id); err != nil {
+	}
+	if t.state.ReaderTaskId != "" {
+		if _, err := t.scheduler.CancelTask(ctx, t.state.ReaderTaskId); err != nil {
+			return err
+		}
+		if err := t.scheduler.WaitTaskEnded(ctx, t.state.ReaderTaskId); err != nil {
 			return err
 		}
 	}
@@ -181,18 +196,36 @@ func (t *backupSnapshotTask) cancel(ctx context.Context, execCtx tasks.Execution
 			return err
 		}
 	}
-	// Recover cleanup even if the DP child ID was lost after scheduling.
-	id, err := t.scheduler.ScheduleTask(
-		headers.SetIncomingIdempotencyKey(ctx, t.ownerID(execCtx)+"_release"),
-		"dataplane.ReleaseSnapshotBackup", "", &dataplane_protos.ReleaseSnapshotBackupRequest{SnapshotId: t.request.SnapshotId, OwnerId: t.ownerID(execCtx)},
-	)
-	if err != nil {
-		return err
+	if t.state.DataplaneRequest != nil {
+		snapshotID := t.state.DataplaneRequest.SnapshotId
+		// Recover a DP hold acquired before saving the child ID. Cleanup drains
+		// chunk workers before any CP graph hold is released.
+		id, err := t.scheduler.ScheduleTask(
+			headers.SetIncomingIdempotencyKey(ctx, t.ownerID(execCtx)+"_release_"+snapshotID),
+			"dataplane.ReleaseSnapshotBackup", "", &dataplane_protos.ReleaseSnapshotBackupRequest{SnapshotId: snapshotID, OwnerId: t.ownerID(execCtx)},
+		)
+		if err != nil {
+			return err
+		}
+		if _, err := t.scheduler.WaitTask(ctx, execCtx, id); err != nil {
+			return err
+		}
 	}
-	if _, err := t.scheduler.WaitTask(ctx, execCtx, id); err != nil {
-		return err
+	return t.releasePlan(ctx, execCtx)
+}
+
+func (t *backupSnapshotTask) releasePlan(ctx context.Context, execCtx tasks.ExecutionContext) error {
+	// Includes nodes whose Hold succeeded immediately before a failed SaveState:
+	// every node's intent was durable before acquisition, even if not discovered.
+	for _, node := range t.state.Nodes {
+		if err := t.storage.ReleaseSnapshotBackup(ctx, node.SnapshotId, t.ownerID(execCtx), node.Completed); err != nil {
+			return err
+		}
 	}
-	return t.storage.ReleaseSnapshotBackup(ctx, t.request.SnapshotId, t.ownerID(execCtx), t.state.Finished)
+	if t.state.FolderId == "" {
+		return nil
+	}
+	return t.storage.FinishSnapshotBackupPlan(ctx, t.state.FolderId, t.ownerID(execCtx))
 }
 
 func (t *backupSnapshotTask) GetMetadata(ctx context.Context) (proto.Message, error) {
@@ -200,12 +233,11 @@ func (t *backupSnapshotTask) GetMetadata(ctx context.Context) (proto.Message, er
 }
 
 func (t *backupSnapshotTask) GetResponse() proto.Message {
-	ids := append([]string(nil), t.state.CompletedSnapshotIds...)
-	completed := t.state.Finished || t.state.AlreadyBackedUp
-	if completed {
-		ids = append(ids, t.request.SnapshotId)
+	root := t.node(t.request.SnapshotId)
+	return &protos.BackupSnapshotResponse{
+		Completed:            root != nil && root.Completed,
+		CompletedSnapshotIds: append([]string(nil), t.state.CompletedSnapshotIds...),
 	}
-	return &protos.BackupSnapshotResponse{Completed: completed, CompletedSnapshotIds: ids}
 }
 
 func retrySnapshotBackupError(err error) error {
@@ -213,124 +245,4 @@ func retrySnapshotBackupError(err error) error {
 		return err
 	}
 	return errors.NewRetriableErrorWithIgnoreRetryLimitf("snapshot backup waits for recovery: %v", err)
-}
-
-// Recursing through task dependencies gives a topological execution order:
-// all available creators finish before the current snapshot is admitted.
-func (t *backupSnapshotTask) backupDependencies(ctx context.Context, execCtx tasks.ExecutionContext) error {
-	if !t.state.DependenciesRead {
-		meta, err := t.storage.GetSnapshotMeta(ctx, t.request.SnapshotId)
-		if err != nil {
-			return err
-		}
-		if meta == nil || (!meta.Ready && !meta.BackupCompleted) {
-			t.state.DependenciesRead = true
-			return execCtx.SaveState(ctx)
-		}
-		if meta.BackupCompleted {
-			t.state.AlreadyBackedUp = true
-			t.state.DependenciesRead = true
-			return execCtx.SaveState(ctx)
-		}
-		for _, id := range t.request.AncestorIds {
-			if id == t.request.SnapshotId {
-				return errors.NewNonRetriableErrorf("snapshot backup dependency cycle at %v", id)
-			}
-		}
-		if t.state.DependencyReaderTaskId == "" {
-			if err := t.scheduleDependencyReader(ctx, execCtx); err != nil {
-				return err
-			}
-		}
-		response, err := t.scheduler.WaitTask(ctx, execCtx, t.state.DependencyReaderTaskId)
-		if err != nil {
-			return err
-		}
-		deps, ok := response.(*dataplane_protos.GetSnapshotBackupDependenciesResponse)
-		if !ok {
-			return errors.NewNonRetriableErrorf("unexpected backup dependencies response")
-		}
-		t.state.DependencyIds = deps.SnapshotIds
-		t.state.DependenciesRead = true
-		if err := execCtx.SaveState(ctx); err != nil {
-			return err
-		}
-	}
-	for t.state.DependencyIndex < uint32(len(t.state.DependencyIds)) {
-		dependency := t.state.DependencyIds[t.state.DependencyIndex]
-		if t.state.DependencyTaskId == "" {
-			// Do not enroll other folders or images implicitly. A missing,
-			// deleting or unselected creator is copied from this source.
-			current, err := t.storage.GetSnapshotMeta(ctx, t.request.SnapshotId)
-			if err != nil {
-				return err
-			}
-			meta, err := t.storage.GetSnapshotMeta(ctx, dependency)
-			if err != nil {
-				return err
-			}
-			if current == nil || meta == nil || meta.FolderID != current.FolderID || (!meta.Ready && !meta.BackupCompleted) {
-				t.state.DependencyIndex++
-				if err := execCtx.SaveState(ctx); err != nil {
-					return err
-				}
-				continue
-			}
-			if err := t.scheduleDependency(ctx, execCtx); err != nil {
-				return err
-			}
-		}
-		response, err := t.scheduler.WaitTask(ctx, execCtx, t.state.DependencyTaskId)
-		if err != nil {
-			return err
-		}
-		completed, ok := response.(*protos.BackupSnapshotResponse)
-		if !ok {
-			return errors.NewNonRetriableErrorf("unexpected dependency backup response")
-		}
-		known := make(map[string]struct{})
-		for _, id := range t.state.CompletedSnapshotIds {
-			known[id] = struct{}{}
-		}
-		for _, id := range completed.CompletedSnapshotIds {
-			if _, ok := known[id]; !ok {
-				t.state.CompletedSnapshotIds = append(t.state.CompletedSnapshotIds, id)
-				known[id] = struct{}{}
-			}
-		}
-		t.state.DependencyIndex++
-		t.state.DependencyTaskId = ""
-		if err := execCtx.SaveState(ctx); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (t *backupSnapshotTask) scheduleDependencyReader(ctx context.Context, execCtx tasks.ExecutionContext) error {
-	id, err := t.scheduler.ScheduleTask(
-		headers.SetIncomingIdempotencyKey(ctx, execCtx.GetTaskID()+"_dependencies"),
-		"dataplane.GetSnapshotBackupDependencies", "",
-		&dataplane_protos.GetSnapshotBackupDependenciesRequest{SnapshotId: t.request.SnapshotId},
-	)
-	if err != nil {
-		return err
-	}
-	t.state.DependencyReaderTaskId = id
-	return execCtx.SaveState(ctx)
-}
-
-func (t *backupSnapshotTask) scheduleDependency(ctx context.Context, execCtx tasks.ExecutionContext) error {
-	dependency := t.state.DependencyIds[t.state.DependencyIndex]
-	path := append(append([]string(nil), t.request.AncestorIds...), t.request.SnapshotId)
-	id, err := t.scheduler.ScheduleTask(
-		headers.SetIncomingIdempotencyKey(ctx, execCtx.GetTaskID()+"_dependency_"+dependency),
-		"snapshots.BackupSnapshot", "",
-		&protos.BackupSnapshotRequest{SnapshotId: dependency, CoordinatorId: t.request.CoordinatorId, AncestorIds: path},
-	)
-	if err != nil {
-		return err
-	}
-	t.state.DependencyTaskId = id
-	return execCtx.SaveState(ctx)
 }

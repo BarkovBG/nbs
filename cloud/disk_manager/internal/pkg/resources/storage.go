@@ -72,6 +72,7 @@ type SnapshotMeta struct {
 	Encryption        *types.EncryptionDesc `json:"encryption"`
 	Ready             bool                  `json:"ready"`
 	BackupTaskID      string                `json:"backup_task_id"`
+	BackupPlanID      string                `json:"backup_plan_id"`
 	BackupCompleted   bool                  `json:"backup_completed"`
 }
 
@@ -233,7 +234,9 @@ type Storage interface {
 	SetSnapshotBackupFolder(ctx context.Context, folderID, generation string, enabled bool) error
 	ListSnapshotBackupFolders(ctx context.Context) ([]SnapshotBackupFolder, error)
 	ListSnapshotBackupCandidates(ctx context.Context, folderID, afterID string, limit int) ([]string, error)
-	ReserveSnapshotBackup(ctx context.Context, snapshotID, ownerID, coordinatorID string) (*SnapshotMeta, error)
+	ReserveSnapshotBackup(ctx context.Context, snapshotID, ownerID, coordinatorID string, neededByDependents bool) (*SnapshotMeta, error)
+	HoldSnapshotBackupPlan(ctx context.Context, snapshotID, ownerID, coordinatorID string) (*SnapshotMeta, error)
+	FinishSnapshotBackupPlan(ctx context.Context, folderID, ownerID string) error
 	ReleaseSnapshotBackup(ctx context.Context, snapshotID, ownerID string, completed bool) error
 
 	EnqueueSnapshotBackup(
