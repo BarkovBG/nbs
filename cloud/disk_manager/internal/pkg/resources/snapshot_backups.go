@@ -15,12 +15,15 @@ type SnapshotBackupFolder struct {
 	Generation string
 }
 
+// snapshotBackupFolderState maps one backup_folders row. Transactions use it
+// to serialize folder ownership, graph preparation and copy admission across
+// coordinator retries and service restarts.
 type snapshotBackupFolderState struct {
-	generation  string
-	enabled     bool
-	coordinator string
-	activeOwner string
-	activePlan  string
+	generation  string // Enable cycle; fences requests from earlier coordinators.
+	enabled     bool   // Allows new graph holds and copy admissions.
+	coordinator string // BackupFolder task ID owning this folder.
+	activeOwner string // Accepted copy owner, retained through DP cleanup.
+	activePlan  string // Graph owner, retained until all source holds are released.
 }
 
 func (s *storageYDB) getSnapshotBackupFolderTx(
