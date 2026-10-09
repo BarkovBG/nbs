@@ -153,7 +153,7 @@ func preparedBackupGraph(f *backupGraphFixture, nodes ...*protos.SnapshotBackupN
 		f.metas[node.SnapshotId].BackupPlanID = "task"
 	}
 	var err error
-	f.task.state.CopyOrder, err = snapshotBackupOrder(nodes)
+	_, err = snapshotBackupOrder(nodes)
 	if err != nil {
 		panic(err)
 	}
@@ -366,4 +366,45 @@ func TestBackupSnapshotTaskWaitsForQueueSlotBeforeTakingSourceHolds(t *testing.T
 	require.True(t, errors.Is(task.Run(ctx, execCtx), errors.NewInterruptExecutionError()))
 	require.Empty(t, task.state.Nodes)
 	storage.AssertExpectations(t)
+}
+
+func TestSnapshotBackupDerivedOrderDoesNotMoveCursorAfterCompletionOrPruning(t *testing.T) {
+	nodes := []*protos.SnapshotBackupNode{
+		{SnapshotId: "C", Dependencies: []string{"B"}},
+		{SnapshotId: "B", Dependencies: []string{"A"}},
+		{SnapshotId: "A"},
+	}
+	order, err := snapshotBackupOrder(nodes)
+	require.NoError(t, err)
+	require.Equal(t, []string{"A", "B", "C"}, order)
+	nodes[2].Completed = true
+	nodes[1].Excluded = true
+	resumed, err := snapshotBackupOrder(nodes)
+	require.NoError(t, err)
+	require.Equal(t, order, resumed)
+}
+
+func TestBackupSnapshotTaskResumesCopyCursorFromSavedGraph(t *testing.T) {
+	f := newBackupGraphFixture(t, "C", "A", "B", "C")
+	preparedBackupGraph(f,
+		&protos.SnapshotBackupNode{SnapshotId: "C", Dependencies: []string{"B"}},
+		&protos.SnapshotBackupNode{SnapshotId: "B", Dependencies: []string{"A"}},
+		&protos.SnapshotBackupNode{SnapshotId: "A", Completed: true},
+	)
+	f.task.state.CopyIndex = 1
+	f.metas["A"].BackupPlanID = ""
+	f.metas["A"].BackupCompleted = true
+	f.copy(t, "B", true)
+	f.finishCopy("B")
+	f.copy(t, "C", false)
+	f.finishCopy("C")
+	request, err := proto.Marshal(f.task.request)
+	require.NoError(t, err)
+	state, err := f.task.Save()
+	require.NoError(t, err)
+	require.NoError(t, f.task.Load(request, state))
+	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
+	require.Equal(t, []string{"B", "C"}, f.copies)
+	require.Equal(t, []string{"A", "B", "C"}, f.task.completedSnapshotIDs())
+	f.scheduler.AssertExpectations(t)
 }

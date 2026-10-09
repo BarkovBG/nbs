@@ -2,6 +2,7 @@ package snapshots
 
 import (
 	"context"
+	"sort"
 
 	dataplane_protos "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/protos"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/snapshots/protos"
@@ -21,12 +22,26 @@ func (t *backupSnapshotTask) node(id string) *protos.SnapshotBackupNode {
 
 func (t *backupSnapshotTask) markCompleted(node *protos.SnapshotBackupNode) {
 	node.Completed = true
-	for _, id := range t.state.CompletedSnapshotIds {
-		if id == node.SnapshotId {
-			return
+}
+
+func (t *backupSnapshotTask) completedSnapshotIDs() []string {
+	var ids []string
+	for _, node := range t.state.Nodes {
+		if node.Completed {
+			ids = append(ids, node.SnapshotId)
 		}
 	}
-	t.state.CompletedSnapshotIds = append(t.state.CompletedSnapshotIds, node.SnapshotId)
+	sort.Strings(ids)
+	return ids
+}
+
+func (t *backupSnapshotTask) nextUndiscoveredNode() *protos.SnapshotBackupNode {
+	for _, node := range t.state.Nodes {
+		if !node.Discovered {
+			return node
+		}
+	}
+	return nil
 }
 
 func (t *backupSnapshotTask) prepareGraph(ctx context.Context, execCtx tasks.ExecutionContext) error {
@@ -37,8 +52,7 @@ func (t *backupSnapshotTask) prepareGraph(ctx context.Context, execCtx tasks.Exe
 			return err
 		}
 	}
-	for t.state.DiscoveryIndex < uint32(len(t.state.Nodes)) {
-		node := t.state.Nodes[t.state.DiscoveryIndex]
+	for node := t.nextUndiscoveredNode(); node != nil; node = t.nextUndiscoveredNode() {
 		if !node.Discovered {
 			meta, err := t.storage.GetSnapshotMeta(ctx, node.SnapshotId)
 			if err != nil {
@@ -93,18 +107,15 @@ func (t *backupSnapshotTask) prepareGraph(ctx context.Context, execCtx tasks.Exe
 				}
 			}
 		}
-		t.state.DiscoveryIndex++
 		t.state.ReaderSnapshotId = ""
 		t.state.ReaderTaskId = ""
 		if err := execCtx.SaveState(ctx); err != nil {
 			return err
 		}
 	}
-	order, err := snapshotBackupOrder(t.state.Nodes)
-	if err != nil {
+	if _, err := snapshotBackupOrder(t.state.Nodes); err != nil {
 		return err
 	}
-	t.state.CopyOrder = order
 	t.state.GraphPrepared = true
 	// No copy may start until the full dependency closure is durable.
 	return execCtx.SaveState(ctx)
@@ -197,6 +208,8 @@ func (t *backupSnapshotTask) hasDependent(id string, needed map[string]bool) boo
 	return false
 }
 
+// Order depends only on saved edges, so completing/pruning nodes cannot shift
+// CopyIndex after a restart.
 func snapshotBackupOrder(nodes []*protos.SnapshotBackupNode) ([]string, error) {
 	byID := make(map[string]*protos.SnapshotBackupNode)
 	for _, node := range nodes {
@@ -218,11 +231,9 @@ func snapshotBackupOrder(nodes []*protos.SnapshotBackupNode) ([]string, error) {
 			return errors.NewNonRetriableErrorf("snapshot backup dependency %v is absent from graph", id)
 		}
 		visiting[id] = true
-		if !node.Excluded && !node.Completed {
-			for _, parent := range node.Dependencies {
-				if err := visit(parent); err != nil {
-					return err
-				}
+		for _, parent := range node.Dependencies {
+			if err := visit(parent); err != nil {
+				return err
 			}
 		}
 		visited[id] = true

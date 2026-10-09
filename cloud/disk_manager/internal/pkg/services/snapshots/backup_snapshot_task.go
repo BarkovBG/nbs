@@ -75,8 +75,12 @@ func (t *backupSnapshotTask) run(ctx context.Context, execCtx tasks.ExecutionCon
 			return err
 		}
 	}
-	for t.state.CopyIndex < uint32(len(t.state.CopyOrder)) {
-		node := t.node(t.state.CopyOrder[t.state.CopyIndex])
+	order, err := snapshotBackupOrder(t.state.Nodes)
+	if err != nil {
+		return err
+	}
+	for t.state.CopyIndex < uint32(len(order)) {
+		node := t.node(order[t.state.CopyIndex])
 		needed, err := t.pruneGraph(ctx, execCtx)
 		if err != nil {
 			return err
@@ -123,7 +127,6 @@ func (t *backupSnapshotTask) run(ctx context.Context, execCtx tasks.ExecutionCon
 		}
 		t.state.DataplaneRequest = nil
 		t.state.DataplaneTaskID = ""
-		t.state.EncryptedDek = nil
 		t.state.CopyIndex++
 		if err := execCtx.SaveState(ctx); err != nil {
 			return err
@@ -148,13 +151,13 @@ func (t *backupSnapshotTask) prepareCopy(ctx context.Context, execCtx tasks.Exec
 	if err != nil {
 		return errors.NewNonRetriableError(err)
 	}
-	t.state.EncryptedDek, err = t.backupS3.EnsureEncryptedDEK(t.request.EncryptedDek)
+	encryptedDEK, err := t.backupS3.EnsureEncryptedDEK(t.request.EncryptedDek)
 	if err != nil {
 		return err
 	}
 	t.state.DataplaneRequest = &dataplane_protos.BackupSnapshotDataRequest{
-		SnapshotId: meta.ID, OwnerId: t.ownerID(execCtx), EncryptedDek: t.state.EncryptedDek,
-		CompletedSnapshotIds: append([]string(nil), t.state.CompletedSnapshotIds...),
+		SnapshotId: meta.ID, OwnerId: t.ownerID(execCtx), EncryptedDek: encryptedDEK,
+		CompletedSnapshotIds: t.completedSnapshotIDs(),
 		MetaKey:              backup.SnapshotMetaKey(meta.Disk.DiskId, meta.ID), Meta: data,
 	}
 	// Cancellation recovers this exact request if the child ID was not saved.
@@ -233,7 +236,7 @@ func (t *backupSnapshotTask) GetResponse() proto.Message {
 	root := t.node(t.request.SnapshotId)
 	return &protos.BackupSnapshotResponse{
 		Completed:            root != nil && root.Completed,
-		CompletedSnapshotIds: append([]string(nil), t.state.CompletedSnapshotIds...),
+		CompletedSnapshotIds: t.completedSnapshotIDs(),
 	}
 }
 
