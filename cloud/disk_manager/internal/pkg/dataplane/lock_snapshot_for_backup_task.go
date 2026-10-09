@@ -71,7 +71,7 @@ func (t *lockSnapshotForBackupTask) run(ctx context.Context, execCtx tasks.Execu
 		}
 		t.state.Ready = true
 	}
-	// Repeat persistence after a failed save in the same execution instance.
+	// Ready and Locked are durable before CP can read them through metadata.
 	if err := execCtx.SaveState(ctx); err != nil {
 		return err
 	}

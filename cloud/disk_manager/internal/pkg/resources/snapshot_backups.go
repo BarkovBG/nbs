@@ -151,10 +151,8 @@ func (s *storageYDB) reserveSnapshotBackup(
 		!(state.status == snapshotStatusDeleting && state.backupPlanID == backupTaskID && neededByDependents)) {
 		return nil, tx.Commit(ctx)
 	}
-	if state.backupTaskID != "" || (state.backupPlanID != "" && state.backupPlanID != backupTaskID) {
-		return nil, errors.NewInterruptExecutionError()
-	}
-	if state.backupPlanID != backupTaskID {
+	// Only the plan that holds the source may accept its copy.
+	if state.backupTaskID != "" || state.backupPlanID != backupTaskID {
 		return nil, errors.NewInterruptExecutionError()
 	}
 	if err := s.checkSnapshotBackupPlan(ctx, tx, backupTaskID); err != nil {
