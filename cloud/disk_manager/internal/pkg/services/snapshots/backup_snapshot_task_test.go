@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -178,37 +177,87 @@ func TestBackupSnapshotTaskFinishesAcceptedCopyOfDeletingSnapshot(t *testing.T) 
 	f.scheduler.AssertExpectations(t)
 }
 
-func TestBackupSnapshotTaskRestoresAcceptedRequestAndDEK(t *testing.T) {
-	for _, encrypted := range []bool{false, true} {
-		t.Run(fmt.Sprint(encrypted), func(t *testing.T) {
+func TestBackupSnapshotTaskWaitsForAcceptedCopy(t *testing.T) {
+	f := newBackupSnapshotFixture(t)
+	f.task.state.DataplaneTaskID = "copy"
+	f.scheduler.On("WaitTask", mock.Anything, f.execCtx, "copy").Return(
+		&empty.Empty{},
+		nil,
+	).Once()
+
+	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
+	require.True(t, f.meta.BackupCompleted)
+	f.storage.AssertNotCalled(t, "GetSnapshotMeta", mock.Anything, mock.Anything)
+	f.scheduler.AssertNotCalled(
+		t,
+		"ScheduleTask",
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+	)
+	f.scheduler.AssertExpectations(t)
+}
+
+func TestBackupSnapshotTaskSchedulesCopyWithMetadataAndSavedDEK(t *testing.T) {
+	for _, saved := range []bool{false, true} {
+		t.Run(fmt.Sprint(saved), func(t *testing.T) {
 			f := newBackupSnapshotFixture(t)
+			var err error
+			f.task.backupS3, err = backup.NewS3(
+				nil, // s3
+				"bucket",
+				"prefix",
+				"key",
+				make([]byte, 32),
+			)
+			require.NoError(t, err)
 
 			var dek []byte
-			if encrypted {
-				var err error
-				f.task.backupS3, err = backup.NewS3(
-					nil, // s3
-					"bucket",
-					"prefix",
-					"key",
-					make([]byte, 32),
-				)
-				require.NoError(t, err)
+			if saved {
 				dek, err = f.task.backupS3.NewEncryptedDEK()
 				require.NoError(t, err)
+				f.task.state.EncryptedDek = dek
 			}
-			data, err := json.Marshal(backup.SnapshotMeta{ID: "snapshot", FolderID: "folder"})
-			require.NoError(t, err)
-			f.task.state.EncryptedDek = dek
-			f.task.state.Meta = data
+
+			// A generated DEK is saved before the copy is scheduled.
+			var savedDEK []byte
+			f.execCtx.ExpectedCalls = nil
+			f.execCtx.On("GetTaskID").Return("task")
+			f.execCtx.On("SaveState", mock.Anything).Run(func(mock.Arguments) {
+				if savedDEK == nil {
+					savedDEK = bytes.Clone(f.task.state.EncryptedDek)
+				}
+			}).Return(nil)
 			f.scheduler.On(
 				"ScheduleTask",
 				mock.Anything,
 				"dataplane.BackupSnapshotData",
 				"",
-				mock.MatchedBy(func(r *dataplane_protos.BackupSnapshotDataRequest) bool {
-					return bytes.Equal(r.EncryptedDek, dek) && bytes.Equal(r.Meta, data)
-				}),
+				mock.Anything,
+			).Run(
+				func(a mock.Arguments) {
+					request := a.Get(3).(*dataplane_protos.BackupSnapshotDataRequest)
+					if saved {
+						require.Equal(t, dek, request.EncryptedDek)
+					} else {
+						require.Equal(t, savedDEK, request.EncryptedDek)
+					}
+					require.NoError(
+						t,
+						f.task.backupS3.CheckEncryptedDEK(request.EncryptedDek),
+					)
+					require.Equal(
+						t,
+						backup.SnapshotMetaKey("disk", "snapshot"),
+						request.MetaKey,
+					)
+
+					var meta backup.SnapshotMeta
+					require.NoError(t, json.Unmarshal(request.Meta, &meta))
+					require.Equal(t, "snapshot", meta.ID)
+					require.Equal(t, "folder", meta.FolderID)
+				},
 			).Return("copy", nil).Once()
 			f.scheduler.On("WaitTask", mock.Anything, f.execCtx, "copy").Return(
 				&empty.Empty{},
@@ -216,76 +265,19 @@ func TestBackupSnapshotTaskRestoresAcceptedRequestAndDEK(t *testing.T) {
 			).Once()
 
 			require.NoError(t, f.task.Run(f.ctx, f.execCtx))
-			require.True(t, f.meta.BackupCompleted)
+			require.Equal(t, "copy", f.task.state.DataplaneTaskID)
 			f.scheduler.AssertExpectations(t)
 		})
 	}
 }
 
-func TestBackupSnapshotTaskSavesMetadataAndDEKBeforeScheduling(t *testing.T) {
-	f := newBackupSnapshotFixture(t)
-	var err error
-	f.task.backupS3, err = backup.NewS3(
-		nil, // s3
-		"bucket",
-		"prefix",
-		"key",
-		make([]byte, 32),
-	)
-	require.NoError(t, err)
-
-	var saved *protos.BackupSnapshotTaskState
-	f.execCtx.ExpectedCalls = nil
-	f.execCtx.On("GetTaskID").Return("task")
-	f.execCtx.On("SaveState", mock.Anything).Run(func(mock.Arguments) {
-		if len(f.task.state.Meta) != 0 && saved == nil {
-			saved = proto.Clone(f.task.state).(*protos.BackupSnapshotTaskState)
-		}
-	}).Return(nil)
-	f.scheduler.On(
-		"ScheduleTask",
-		mock.Anything,
-		"dataplane.BackupSnapshotData",
-		"",
-		mock.Anything,
-	).Run(
-		func(a mock.Arguments) {
-			request := a.Get(3).(*dataplane_protos.BackupSnapshotDataRequest)
-			require.NotNil(t, saved)
-			require.Equal(t, saved.EncryptedDek, request.EncryptedDek)
-			require.Equal(t, saved.MetaKey, request.MetaKey)
-			require.Equal(t, saved.Meta, request.Meta)
-			require.NoError(t, f.task.backupS3.CheckEncryptedDEK(request.EncryptedDek))
-			require.Equal(t, backup.SnapshotMetaKey("disk", "snapshot"), request.MetaKey)
-
-			var meta backup.SnapshotMeta
-			require.NoError(t, json.Unmarshal(request.Meta, &meta))
-			require.Equal(t, "snapshot", meta.ID)
-			require.Equal(t, "folder", meta.FolderID)
-		},
-	).Return("copy", nil).Once()
-	f.scheduler.On("WaitTask", mock.Anything, f.execCtx, "copy").Return(&empty.Empty{}, nil).Once()
-
-	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
-	f.scheduler.AssertExpectations(t)
-}
-
 func TestBackupSnapshotTaskCancellationStopsCopy(t *testing.T) {
 	f := newBackupSnapshotFixture(t)
-	f.task.state.Meta = []byte("{}")
-	// The copy was scheduled, but its ID was not saved.
-	f.scheduler.On(
-		"ScheduleTask",
-		mock.Anything,
-		"dataplane.BackupSnapshotData",
-		"",
-		mock.Anything,
-	).Return("copy", nil).Once()
+	f.task.state.DataplaneTaskID = "copy"
 	f.scheduler.On("CancelTask", mock.Anything, "copy").Return(true, nil).Once()
 
 	require.NoError(t, f.task.Cancel(f.ctx, f.execCtx))
 	f.storage.AssertCalled(t, "RemoveSnapshotFromBackupQueue", mock.Anything, "snapshot", "attempt")
-	f.scheduler.AssertNotCalled(t, "WaitTaskEnded", mock.Anything, mock.Anything)
 	f.scheduler.AssertExpectations(t)
 }
 

@@ -14,7 +14,4 @@ message BackupSnapshotRequest {
 message BackupSnapshotTaskState {
     string DataplaneTaskID = 1;
     bytes EncryptedDek = 2;
-    // Saved metadata accepts the copy.
-    string MetaKey = 3;
-    bytes Meta = 4;
 }

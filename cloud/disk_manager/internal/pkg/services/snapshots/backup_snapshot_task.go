@@ -78,7 +78,9 @@ func (t *backupSnapshotTask) run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	if len(t.state.Meta) == 0 {
+	// A saved copy ID accepts the copy. The copy holds the snapshot, so it
+	// finishes even if the snapshot is being deleted.
+	if len(t.state.DataplaneTaskID) == 0 {
 		meta, err := t.storage.GetSnapshotMeta(ctx, t.request.SnapshotId)
 		if err != nil {
 			return err
@@ -89,20 +91,13 @@ func (t *backupSnapshotTask) run(
 			return t.removeFromQueue(ctx)
 		}
 
-		err = t.prepareCopy(ctx, execCtx, meta)
+		err = t.scheduleCopy(ctx, execCtx, meta)
 		if err != nil {
 			return err
 		}
 	}
 
-	// The saved request accepts the copy. The copy holds the snapshot, so it
-	// finishes even if the snapshot is being deleted.
-	taskID, err := t.scheduleCopy(ctx, execCtx)
-	if err != nil {
-		return err
-	}
-
-	_, err = t.scheduler.WaitTask(ctx, execCtx, taskID)
+	_, err := t.scheduler.WaitTask(ctx, execCtx, t.state.DataplaneTaskID)
 	if err != nil {
 		return err
 	}
@@ -123,15 +118,10 @@ func (t *backupSnapshotTask) cancel(
 ) error {
 
 	// The copy clears its chunks and releases the snapshot in its own Cancel.
-	// A next attempt cannot hold the snapshot before that, so there is no
-	// need to wait here.
-	if len(t.state.Meta) != 0 {
-		taskID, err := t.scheduleCopy(ctx, execCtx)
-		if err != nil {
-			return err
-		}
-
-		_, err = t.scheduler.CancelTask(ctx, taskID)
+	// A copy scheduled without a saved ID runs to the end and releases the
+	// snapshot itself.
+	if len(t.state.DataplaneTaskID) != 0 {
+		_, err := t.scheduler.CancelTask(ctx, t.state.DataplaneTaskID)
 		if err != nil {
 			return err
 		}
@@ -148,7 +138,7 @@ func (t *backupSnapshotTask) removeFromQueue(ctx context.Context) error {
 	)
 }
 
-func (t *backupSnapshotTask) prepareCopy(
+func (t *backupSnapshotTask) scheduleCopy(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
 	meta *resources.SnapshotMeta,
@@ -168,7 +158,7 @@ func (t *backupSnapshotTask) prepareCopy(
 		return errors.NewNonRetriableError(err)
 	}
 
-	// Reuses the DEK saved by a task started before metadata was saved.
+	generated := len(t.state.EncryptedDek) == 0
 	t.state.EncryptedDek, err = t.backupS3.EnsureEncryptedDEK(
 		t.state.EncryptedDek,
 	)
@@ -176,18 +166,11 @@ func (t *backupSnapshotTask) prepareCopy(
 		return err
 	}
 
-	t.state.MetaKey = backup.SnapshotMetaKey(meta.Disk.DiskId, meta.ID)
-	t.state.Meta = data
-	return execCtx.SaveState(ctx)
-}
-
-func (t *backupSnapshotTask) scheduleCopy(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-) (string, error) {
-
-	if t.state.DataplaneTaskID != "" {
-		return t.state.DataplaneTaskID, nil
+	if generated && len(t.state.EncryptedDek) != 0 {
+		err = execCtx.SaveState(ctx)
+		if err != nil {
+			return err
+		}
 	}
 
 	taskID, err := t.scheduler.ScheduleTask(
@@ -198,18 +181,18 @@ func (t *backupSnapshotTask) scheduleCopy(
 		"dataplane.BackupSnapshotData",
 		"",
 		&dataplane_protos.BackupSnapshotDataRequest{
-			SnapshotId:   t.request.SnapshotId,
+			SnapshotId:   meta.ID,
 			EncryptedDek: t.state.EncryptedDek,
-			MetaKey:      t.state.MetaKey,
-			Meta:         t.state.Meta,
+			MetaKey:      backup.SnapshotMetaKey(meta.Disk.DiskId, meta.ID),
+			Meta:         data,
 		},
 	)
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	t.state.DataplaneTaskID = taskID
-	return taskID, execCtx.SaveState(ctx)
+	return execCtx.SaveState(ctx)
 }
 
 func retrySnapshotBackupError(err error) error {
