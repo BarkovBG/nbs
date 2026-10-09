@@ -827,6 +827,36 @@ func TestBackupSnapshotDataTaskCancellationClearsQueue(t *testing.T) {
 	require.Len(t, queue, 1)
 }
 
+func TestBackupSnapshotDataTaskNextAttemptWaitsForCancelledCopy(t *testing.T) {
+	ctx := test.NewContext()
+	storage, closeFunc := newStorage(t, ctx)
+	defer closeFunc()
+	follower := newTestFollower(t, ctx)
+	createSnapshotWithChunk(t, ctx, storage, "snap1")
+
+	cancelled := newBackupSnapshotDataTask(storage, follower, "snap1")
+	cancelledCtx := newBackupExecutionContext(ctx)
+	err := cancelled.Run(ctx, cancelledCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+
+	// The next attempt cannot start while the cancelled copy holds the
+	// snapshot, so it never sees the chunks being cleared.
+	next := newBackupSnapshotDataTask(storage, follower, "snap1")
+	nextCtx := mocks.NewExecutionContextMock()
+	nextCtx.On("SaveState", ctx).Return(nil)
+	nextCtx.On("GetTaskID").Return("next")
+	err = next.Run(ctx, nextCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	require.Zero(t, next.state.MilestoneChunkIndex)
+
+	require.NoError(t, cancelled.Cancel(ctx, cancelledCtx))
+	err = next.Run(ctx, nextCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, queue, 1)
+}
+
 func TestBackupSnapshotDataTaskCancellationRetriesCleanupErrors(t *testing.T) {
 	ctx := test.NewContext()
 	storage := storage_mocks.NewStorageMock()

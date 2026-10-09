@@ -131,6 +131,9 @@ func (t *backupSnapshotTask) cancel(
 	execCtx tasks.ExecutionContext,
 ) error {
 
+	// The copy clears its chunks and releases the snapshot in its own Cancel.
+	// A next attempt cannot hold the snapshot before that, so there is no
+	// need to wait here.
 	if t.state.DataplaneRequest != nil {
 		taskID, err := t.scheduleCopy(ctx, execCtx)
 		if err != nil {
@@ -138,11 +141,6 @@ func (t *backupSnapshotTask) cancel(
 		}
 
 		_, err = t.scheduler.CancelTask(ctx, taskID)
-		if err != nil {
-			return err
-		}
-
-		err = t.scheduler.WaitTaskEnded(ctx, taskID)
 		if err != nil {
 			return err
 		}
