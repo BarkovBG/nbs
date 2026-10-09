@@ -233,7 +233,6 @@ func snapshotStateTableDescription() persistence.CreateTableDescription {
 		),
 		persistence.WithColumn("status", persistence.Optional(persistence.TypeInt64)),
 		persistence.WithPrimaryKeyColumn("id"),
-		persistence.WithSecondaryKeyColumn("folder_id"),
 	)
 }
 
@@ -543,26 +542,27 @@ func (s *storageYDB) snapshotCreated(
 		return err
 	}
 
-	// A selected folder also queues new ready snapshots in this transaction.
-	if s.backupEnabled {
+	// A new ready snapshot of a configured folder is queued in the same
+	// transaction. Other snapshots are queued by EnqueueSnapshotBackup. The
+	// snapshot becomes ready once, so its create task identifies the attempt.
+	_, backupFolder := s.backupFolderIDs[state.folderID]
+	if s.backupEnabled && backupFolder {
 		_, err = tx.Execute(ctx, fmt.Sprintf(`
 			--!syntax_v1
 			pragma TablePathPrefix = "%v";
 			declare $snapshot_id as Utf8;
-			declare $folder_id as Utf8;
+			declare $backup_id as Utf8;
 
 			upsert into backup_queue (snapshot_id, backup_id)
-			select $snapshot_id as snapshot_id, generation as backup_id
-			from backup_folders
-			where folder_id = $folder_id and enabled
+			values ($snapshot_id, $backup_id)
 		`, s.snapshotsPath),
 			persistence.ValueParam(
 				"$snapshot_id",
 				persistence.UTF8Value(snapshotID),
 			),
 			persistence.ValueParam(
-				"$folder_id",
-				persistence.UTF8Value(state.folderID),
+				"$backup_id",
+				persistence.UTF8Value(state.createTaskID),
 			),
 		)
 		if err != nil {
@@ -868,12 +868,22 @@ func (s *storageYDB) listSnapshots(
 	)
 }
 
-func (s *storageYDB) enqueueSnapshotBackupTx(
+func (s *storageYDB) enqueueSnapshotBackup(
 	ctx context.Context,
-	tx *persistence.Transaction,
+	session *persistence.Session,
 	snapshotID string,
 	backupID string,
 ) error {
+
+	if len(snapshotID) == 0 || len(backupID) == 0 {
+		return errors.NewNonRetriableErrorf("empty snapshot or backup ID")
+	}
+
+	tx, err := session.BeginRWTransaction(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
 
 	res, err := tx.Execute(ctx, fmt.Sprintf(`
 		--!syntax_v1
@@ -905,7 +915,7 @@ func (s *storageYDB) enqueueSnapshotBackupTx(
 
 	state := states[0]
 	if state.backupCompleted {
-		return nil
+		return tx.Commit(ctx)
 	}
 	if state.status != snapshotStatusReady {
 		return errors.NewNonRetriableErrorf(
@@ -937,7 +947,7 @@ func (s *storageYDB) enqueueSnapshotBackupTx(
 		return err
 	}
 	if found {
-		return nil
+		return tx.Commit(ctx)
 	}
 
 	_, err = tx.Execute(ctx, fmt.Sprintf(`
@@ -958,31 +968,6 @@ func (s *storageYDB) enqueueSnapshotBackupTx(
 	if err != nil {
 		return err
 	}
-	return nil
-}
-
-func (s *storageYDB) enqueueSnapshotBackup(
-	ctx context.Context,
-	session *persistence.Session,
-	snapshotID string,
-	backupID string,
-) error {
-
-	if len(snapshotID) == 0 || len(backupID) == 0 {
-		return errors.NewNonRetriableErrorf("empty snapshot or backup ID")
-	}
-
-	tx, err := session.BeginRWTransaction(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-
-	err = s.enqueueSnapshotBackupTx(ctx, tx, snapshotID, backupID)
-	if err != nil {
-		return err
-	}
-
 	return tx.Commit(ctx)
 }
 
@@ -1347,10 +1332,6 @@ func createSnapshotsYDBTables(
 	}
 	logging.Info(ctx, "Created backup_queue table")
 
-	if err := createSnapshotBackupFolderTable(ctx, folder, db, dropUnusedColumns); err != nil {
-		return err
-	}
-
 	logging.Info(ctx, "Created tables for snapshots")
 
 	return nil
@@ -1387,10 +1368,6 @@ func dropSnapshotsYDBTables(
 		return err
 	}
 	logging.Info(ctx, "Dropped backup_queue table")
-
-	if err := db.DropTable(ctx, folder, "backup_folders"); err != nil {
-		return err
-	}
 
 	logging.Info(ctx, "Dropped tables for snapshots")
 

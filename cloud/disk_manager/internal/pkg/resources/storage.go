@@ -120,11 +120,6 @@ type PlacementGroupMeta struct {
 	DeleteTaskID            string                  `json:"delete_task_id"`
 }
 
-type SnapshotBackupFolder struct {
-	FolderID   string
-	Generation string
-}
-
 type SnapshotBackupRequest struct {
 	SnapshotID string
 	BackupID   string
@@ -231,31 +226,6 @@ type Storage interface {
 		folderID string,
 		creatingBefore time.Time,
 	) ([]string, error)
-
-	SetSnapshotBackupFolder(
-		ctx context.Context,
-		folderID string,
-		generation string,
-		enabled bool,
-	) error
-
-	ListSnapshotBackupFolders(ctx context.Context) ([]SnapshotBackupFolder, error)
-
-	ListSnapshotBackupCandidates(
-		ctx context.Context,
-		folderID string,
-		afterID string,
-		limit int,
-	) ([]string, error)
-
-	// Returns false if the folder is no longer selected with this generation.
-	EnqueueSnapshotBackupForFolder(
-		ctx context.Context,
-		snapshotID string,
-		backupID string,
-		folderID string,
-		generation string,
-	) (bool, error)
 
 	EnqueueSnapshotBackup(
 		ctx context.Context,

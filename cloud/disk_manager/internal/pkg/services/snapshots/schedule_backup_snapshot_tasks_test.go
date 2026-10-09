@@ -24,12 +24,8 @@ func TestScheduleBackupSnapshotTasks(t *testing.T) {
 	)
 
 	storage := resources_mocks.NewStorageMock()
-	storage.On("ListSnapshotBackupFolders", mock.Anything).Return([]resources.SnapshotBackupFolder{{FolderID: "folder", Generation: "cycle"}}, nil)
 	scheduler := tasks_mocks.NewSchedulerMock()
 	execCtx := tasks_mocks.NewExecutionContextMock()
-	scheduler.On("ScheduleTask", mock.MatchedBy(func(ctx context.Context) bool {
-		return headers.GetIdempotencyKey(ctx) == "backup_snapshot_folder_folder_cycle"
-	}), "snapshots.BackupFolder", "", &protos.BackupFolderRequest{FolderId: "folder", Generation: "cycle"}).Return("producer", nil).Once()
 
 	storage.On("ListSnapshotsToBackup", mock.Anything, 2).Return(
 		[]resources.SnapshotBackupRequest{
