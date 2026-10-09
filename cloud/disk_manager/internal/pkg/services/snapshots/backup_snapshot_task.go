@@ -68,7 +68,7 @@ func (t *backupSnapshotTask) GetMetadata(
 }
 
 func (t *backupSnapshotTask) GetResponse() proto.Message {
-	return &protos.BackupSnapshotResponse{Completed: t.state.Completed}
+	return &empty.Empty{}
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -78,22 +78,52 @@ func (t *backupSnapshotTask) run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	completed, err := t.backup(ctx, execCtx)
+	if t.state.DataplaneRequest == nil {
+		meta, err := t.storage.GetSnapshotMeta(ctx, t.request.SnapshotId)
+		if err != nil {
+			return err
+		}
+
+		// Nothing to copy: the snapshot is gone or already backed up.
+		if meta == nil || !meta.Ready || meta.BackupCompleted {
+			return t.removeFromQueue(ctx)
+		}
+
+		err = t.prepareCopy(ctx, execCtx, meta)
+		if err != nil {
+			return err
+		}
+	}
+
+	// The saved request accepts the copy. The copy holds the snapshot, so it
+	// finishes even if the snapshot is being deleted.
+	taskID, err := t.scheduleCopy(ctx, execCtx)
 	if err != nil {
 		return err
 	}
 
-	t.state.Completed = completed
-	err = execCtx.SaveState(ctx)
+	response, err := t.scheduler.WaitTask(ctx, execCtx, taskID)
 	if err != nil {
 		return err
 	}
 
-	return t.storage.RemoveSnapshotFromBackupQueue(
-		ctx,
-		t.request.SnapshotId,
-		t.request.BackupId,
-	)
+	typedResponse, ok := response.(*dataplane_protos.BackupSnapshotDataResponse)
+	if !ok {
+		return errors.NewNonRetriableErrorf(
+			"invalid backup snapshot data response type %T",
+			response,
+		)
+	}
+
+	// Skipped means deletion won before the copy took its hold.
+	if !typedResponse.Skipped {
+		err = t.storage.SnapshotBackupCompleted(ctx, t.request.SnapshotId)
+		if err != nil {
+			return err
+		}
+	}
+
+	return t.removeFromQueue(ctx)
 }
 
 func (t *backupSnapshotTask) cancel(
@@ -118,65 +148,15 @@ func (t *backupSnapshotTask) cancel(
 		}
 	}
 
+	return t.removeFromQueue(ctx)
+}
+
+func (t *backupSnapshotTask) removeFromQueue(ctx context.Context) error {
 	return t.storage.RemoveSnapshotFromBackupQueue(
 		ctx,
 		t.request.SnapshotId,
 		t.request.BackupId,
 	)
-}
-
-// Returns whether the snapshot has a complete copy in the follower. Saving the
-// request accepts the copy: from then on it finishes even if the snapshot is
-// being deleted, unless deletion won before the copy took its hold.
-func (t *backupSnapshotTask) backup(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-) (bool, error) {
-
-	if t.state.DataplaneRequest == nil {
-		meta, err := t.storage.GetSnapshotMeta(ctx, t.request.SnapshotId)
-		if err != nil {
-			return false, err
-		}
-
-		if meta == nil || !meta.Ready || meta.BackupCompleted {
-			return meta != nil && meta.BackupCompleted, nil
-		}
-
-		err = t.prepareCopy(ctx, execCtx, meta)
-		if err != nil {
-			return false, err
-		}
-	}
-
-	taskID, err := t.scheduleCopy(ctx, execCtx)
-	if err != nil {
-		return false, err
-	}
-
-	response, err := t.scheduler.WaitTask(ctx, execCtx, taskID)
-	if err != nil {
-		return false, err
-	}
-
-	typedResponse, ok := response.(*dataplane_protos.BackupSnapshotDataResponse)
-	if !ok {
-		return false, errors.NewNonRetriableErrorf(
-			"invalid backup snapshot data response type %T",
-			response,
-		)
-	}
-
-	if typedResponse.Skipped {
-		return false, nil
-	}
-
-	err = t.storage.SnapshotBackupCompleted(ctx, t.request.SnapshotId)
-	if err != nil {
-		return false, err
-	}
-
-	return true, nil
 }
 
 func (t *backupSnapshotTask) prepareCopy(

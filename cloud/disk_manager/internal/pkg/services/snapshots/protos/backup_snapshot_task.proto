@@ -18,9 +18,4 @@ message BackupSnapshotTaskState {
     // interrupted ScheduleTask.
     string DataplaneTaskID = 1;
     dataplane.BackupSnapshotDataRequest DataplaneRequest = 2;
-    bool Completed = 3;
-}
-
-message BackupSnapshotResponse {
-    bool Completed = 1;
 }
