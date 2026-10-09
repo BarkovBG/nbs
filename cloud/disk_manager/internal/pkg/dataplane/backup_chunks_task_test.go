@@ -55,7 +55,6 @@ func TestBackupChunksTask(t *testing.T) {
 
 	task := newBackupChunksTask(storage, follower)
 	execCtx := mocks.NewExecutionContextMock()
-	execCtx.On("GetTaskID").Return("worker")
 
 	err = task.Run(ctx, execCtx)
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
@@ -117,7 +116,6 @@ func TestBackupChunksTaskCopiesSeveralBatches(t *testing.T) {
 	task := newBackupChunksTask(storage, follower)
 	task.batchSize = 1
 	execCtx := mocks.NewExecutionContextMock()
-	execCtx.On("GetTaskID").Return("worker")
 
 	err = task.Run(ctx, execCtx)
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
@@ -161,7 +159,6 @@ func TestBackupChunksTaskGoesOnPastMissingChunk(t *testing.T) {
 
 	task := newBackupChunksTask(storage, follower)
 	execCtx := mocks.NewExecutionContextMock()
-	execCtx.On("GetTaskID").Return("worker")
 
 	err = task.Run(ctx, execCtx)
 	require.Error(t, err)
@@ -170,7 +167,6 @@ func TestBackupChunksTaskGoesOnPastMissingChunk(t *testing.T) {
 	_, err = follower.getObject(ctx, backup.ChunkKey(chunkID))
 	require.NoError(t, err)
 
-	// The missing chunk stays queued for the next worker attempt.
 	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
 	require.NoError(t, err)
 	require.Equal(
@@ -178,7 +174,4 @@ func TestBackupChunksTaskGoesOnPastMissingChunk(t *testing.T) {
 		[]snapshot_storage.BackupChunkQueueEntry{missing},
 		queue,
 	)
-	err = storage.CheckBackupChunksCompleted(ctx, "snap1")
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
-	require.NoError(t, storage.CheckBackupChunksCompleted(ctx, "snap2"))
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path"
-	"strings"
 	"sync"
 	"time"
 
@@ -31,26 +30,6 @@ func makeChunkID(
 ) string {
 
 	return fmt.Sprintf("%v.%v.%v", uniqueID, snapshotID, chunk.Index)
-}
-
-func getSnapshotIDFromChunkID(chunkID string) string {
-	_, after, ok := strings.Cut(chunkID, ".")
-	if !ok {
-		return ""
-	}
-
-	index := strings.LastIndex(after, ".")
-	if index < 0 {
-		return ""
-	}
-
-	return after[:index]
-}
-
-// Zero chunks and the chunks shallow copied from another snapshot (the
-// snapshot only references them) are not created by the snapshot.
-func IsChunkCreatedBySnapshot(chunkID string, snapshotID string) bool {
-	return len(chunkID) != 0 && getSnapshotIDFromChunkID(chunkID) == snapshotID
 }
 
 func makeShardID(s string) uint64 {
@@ -1907,9 +1886,4 @@ func (s *storageYDB) CheckBackupChunksCompleted(
 	}
 
 	return res.Err()
-}
-
-// GetSnapshotIDFromChunkID returns the creator encoded in a chunk ID.
-func GetSnapshotIDFromChunkID(chunkID string) string {
-	return getSnapshotIDFromChunkID(chunkID)
 }

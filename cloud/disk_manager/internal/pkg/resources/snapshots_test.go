@@ -465,17 +465,23 @@ func TestSnapshotsBackup(t *testing.T) {
 	err = storage.SnapshotCreated(ctx, snapshot.ID, "checkpoint", time.Now(), 0, 0)
 	require.NoError(t, err)
 
+	// A snapshot is backed up only when it is queued explicitly.
 	ids, err = storage.ListSnapshotsToBackup(ctx, 10)
 	require.NoError(t, err)
-	require.Empty(t, ids, "new snapshots are backed up only when explicitly queued")
-	err = storage.EnqueueSnapshotBackup(ctx, snapshot.ID, "manual")
-	require.NoError(t, err)
-	ids, err = storage.ListSnapshotsToBackup(ctx, 10)
-	require.NoError(t, err)
-	require.Equal(t, []SnapshotBackupRequest{{SnapshotID: snapshot.ID, BackupID: "manual"}}, ids)
+	require.Empty(t, ids)
 
-	completeSnapshotBackupForTest(t, ctx, storage, snapshot.ID)
-	err = storage.RemoveSnapshotFromBackupQueue(ctx, snapshot.ID, "manual")
+	err = storage.EnqueueSnapshotBackup(ctx, snapshot.ID, "backup")
+	require.NoError(t, err)
+
+	ids, err = storage.ListSnapshotsToBackup(ctx, 10)
+	require.NoError(t, err)
+	require.Equal(
+		t,
+		[]SnapshotBackupRequest{{SnapshotID: snapshot.ID, BackupID: "backup"}},
+		ids,
+	)
+
+	err = storage.RemoveSnapshotFromBackupQueue(ctx, snapshot.ID, "backup")
 	require.NoError(t, err)
 
 	ids, err = storage.ListSnapshotsToBackup(ctx, 10)
@@ -483,19 +489,11 @@ func TestSnapshotsBackup(t *testing.T) {
 	require.Empty(t, ids)
 
 	// Check idempotency.
-	err = storage.RemoveSnapshotFromBackupQueue(ctx, snapshot.ID, "manual")
+	err = storage.RemoveSnapshotFromBackupQueue(ctx, snapshot.ID, "backup")
 	require.NoError(t, err)
-
-	err = storage.RemoveSnapshotFromBackupQueue(ctx, snapshot.ID, "manual")
-	require.NoError(t, err)
-	err = storage.EnqueueSnapshotBackup(ctx, snapshot.ID, "manual")
-	require.NoError(t, err)
-	ids, err = storage.ListSnapshotsToBackup(ctx, 10)
-	require.NoError(t, err)
-	require.Empty(t, ids)
 }
 
-func newSnapshotBackupTestStorage(t *testing.T) (context.Context, *storageYDB) {
+func newSnapshotBackupTestStorage(t *testing.T) (context.Context, Storage) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(newContext())
 	t.Cleanup(cancel)
@@ -503,8 +501,7 @@ func newSnapshotBackupTestStorage(t *testing.T) (context.Context, *storageYDB) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close(ctx)) })
 
-	storage := newStorage(t, ctx, db).(*storageYDB)
-	storage.backupEnabled = false
+	storage := newStorage(t, ctx, db)
 	_, err = storage.CreateSnapshot(ctx, SnapshotMeta{
 		ID:            "snapshot",
 		FolderID:      "folder",
@@ -516,22 +513,11 @@ func newSnapshotBackupTestStorage(t *testing.T) (context.Context, *storageYDB) {
 	require.NoError(t, err)
 	err = storage.SnapshotCreated(ctx, "snapshot", "cp", time.Now(), 0, 0)
 	require.NoError(t, err)
-	storage.backupEnabled = true
-	return ctx, storage
-}
-
-func newEnqueueSnapshotBackupTestStorage(
-	t *testing.T,
-) (context.Context, *storageYDB) {
-
-	t.Helper()
-	ctx, storage := newSnapshotBackupTestStorage(t)
-
 	return ctx, storage
 }
 
 func TestEnqueueSnapshotBackupIsIdempotent(t *testing.T) {
-	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
+	ctx, storage := newSnapshotBackupTestStorage(t)
 
 	meta, err := storage.GetSnapshotMeta(ctx, "snapshot")
 	require.NoError(t, err)
@@ -555,7 +541,8 @@ func TestEnqueueSnapshotBackupIsIdempotent(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, meta.BackupCompleted)
 
-	completeSnapshotBackupForTest(t, ctx, storage, "snapshot")
+	err = storage.SnapshotBackupCompleted(ctx, "snapshot")
+	require.NoError(t, err)
 	err = storage.RemoveSnapshotFromBackupQueue(ctx, "snapshot", "first")
 	require.NoError(t, err)
 	meta, err = storage.GetSnapshotMeta(ctx, "snapshot")
@@ -575,7 +562,7 @@ func TestEnqueueSnapshotBackupIsIdempotent(t *testing.T) {
 }
 
 func TestEnqueueSnapshotBackupAfterCancellation(t *testing.T) {
-	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
+	ctx, storage := newSnapshotBackupTestStorage(t)
 
 	err := storage.EnqueueSnapshotBackup(ctx, "snapshot", "first")
 	require.NoError(t, err)
@@ -614,7 +601,7 @@ func TestEnqueueSnapshotBackupAfterCancellation(t *testing.T) {
 }
 
 func TestEnqueueSnapshotBackupRejectsUnavailableSnapshot(t *testing.T) {
-	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
+	ctx, storage := newSnapshotBackupTestStorage(t)
 
 	_, err := storage.CreateSnapshot(ctx, SnapshotMeta{
 		ID:            "creating",
@@ -646,7 +633,7 @@ func TestEnqueueSnapshotBackupRejectsUnavailableSnapshot(t *testing.T) {
 }
 
 func TestEnqueueSnapshotBackupConcurrentRequests(t *testing.T) {
-	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
+	ctx, storage := newSnapshotBackupTestStorage(t)
 	start := make(chan struct{})
 	results := make(chan error, 2)
 	for _, id := range []string{"first", "second"} {
@@ -668,39 +655,8 @@ func TestEnqueueSnapshotBackupConcurrentRequests(t *testing.T) {
 	require.Contains(t, []string{"first", "second"}, queue[0].BackupID)
 }
 
-func TestEnqueueSnapshotBackupRacesWithCompletion(t *testing.T) {
-	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
-	err := storage.EnqueueSnapshotBackup(ctx, "snapshot", "first")
-	require.NoError(t, err)
-
-	start := make(chan struct{})
-	results := make(chan error, 2)
-	go func() {
-		<-start
-		results <- storage.EnqueueSnapshotBackup(ctx, "snapshot", "second")
-	}()
-	go func() {
-		<-start
-		results <- storage.SnapshotBackupCompleted(ctx, "snapshot")
-	}()
-	close(start)
-	first, second := <-results, <-results
-	require.NoError(t, first)
-	require.NoError(t, second)
-
-	// The first attempt removes its own row; the second never created one.
-	err = storage.RemoveSnapshotFromBackupQueue(ctx, "snapshot", "first")
-	require.NoError(t, err)
-	queue, err := storage.ListSnapshotsToBackup(ctx, 10)
-	require.NoError(t, err)
-	require.Empty(t, queue)
-	meta, err := storage.GetSnapshotMeta(ctx, "snapshot")
-	require.NoError(t, err)
-	require.True(t, meta.BackupCompleted)
-}
-
 func TestEnqueueSnapshotBackupRacesWithDeletion(t *testing.T) {
-	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
+	ctx, storage := newSnapshotBackupTestStorage(t)
 	start := make(chan struct{})
 	enqueued := make(chan error, 1)
 	deleted := make(chan error, 1)
@@ -768,32 +724,12 @@ func TestSnapshotsDeletionStopsBackup(t *testing.T) {
 	require.Empty(t, ids)
 }
 
-func completeSnapshotBackupForTest(
-	t *testing.T,
-	ctx context.Context,
-	storage Storage,
-	id string,
-) {
-
-	t.Helper()
-	require.NoError(t, storage.SnapshotBackupCompleted(ctx, id))
-}
-
 func TestSnapshotBackupCompletedMarksOnlyReadySnapshot(t *testing.T) {
-	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
+	ctx, storage := newSnapshotBackupTestStorage(t)
 	_, err := storage.DeleteSnapshot(ctx, "snapshot", "delete", time.Now())
 	require.NoError(t, err)
 
 	require.NoError(t, storage.SnapshotBackupCompleted(ctx, "snapshot"))
-	meta, err := storage.GetSnapshotMeta(ctx, "snapshot")
-	require.NoError(t, err)
-	require.False(t, meta.BackupCompleted)
-}
-
-func TestSnapshotBackupQueueRemovalDoesNotMarkSnapshotCompleted(t *testing.T) {
-	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
-	require.NoError(t, storage.EnqueueSnapshotBackup(ctx, "snapshot", "attempt"))
-	require.NoError(t, storage.RemoveSnapshotFromBackupQueue(ctx, "snapshot", "attempt"))
 	meta, err := storage.GetSnapshotMeta(ctx, "snapshot")
 	require.NoError(t, err)
 	require.False(t, meta.BackupCompleted)

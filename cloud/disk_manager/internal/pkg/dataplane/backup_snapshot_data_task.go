@@ -46,8 +46,50 @@ func (t *backupSnapshotDataTask) Run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	// Only success or explicit cancellation ends an accepted copy.
-	return retrySnapshotBackupError(t.run(ctx, execCtx))
+	snapshotID := t.request.SnapshotId
+
+	// Deletion waits until the copy releases the snapshot. A repeated hold by
+	// the same copy succeeds.
+	held, err := t.storage.HoldSnapshotForBackup(
+		ctx,
+		snapshotID,
+		execCtx.GetTaskID(),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Deletion started first: there is nothing to copy.
+	if !held {
+		return nil
+	}
+
+	// A DEK that cannot be opened fails the chunk copier on every
+	// chunk and leaves those queue rows unfinished, so this task
+	// interrupts forever. Reject it before anything is enqueued.
+	err = t.backupS3.CheckEncryptedDEK(t.request.EncryptedDek)
+	if err != nil {
+		return err
+	}
+
+	meta, err := t.storage.CheckSnapshotReady(ctx, snapshotID)
+	if err != nil {
+		return err
+	}
+
+	t.state.ChunkCount = meta.ChunkCount
+
+	err = t.enqueueChunks(ctx, execCtx)
+	if err != nil {
+		return err
+	}
+
+	err = t.backupChunkMap(ctx, execCtx, meta)
+	if err != nil {
+		return err
+	}
+
+	return t.finish(ctx, execCtx)
 }
 
 func (t *backupSnapshotDataTask) Cancel(
@@ -55,7 +97,7 @@ func (t *backupSnapshotDataTask) Cancel(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	return retrySnapshotBackupError(t.finish(ctx, execCtx))
+	return t.finish(ctx, execCtx)
 }
 
 func (t *backupSnapshotDataTask) GetMetadata(
@@ -70,117 +112,6 @@ func (t *backupSnapshotDataTask) GetResponse() proto.Message {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-
-func (t *backupSnapshotDataTask) run(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-) error {
-
-	if t.state.Finished {
-		return t.finish(ctx, execCtx)
-	}
-
-	// The reference blocks deletion, so a repeated hold of an accepted copy
-	// succeeds too.
-	held, err := t.storage.HoldSnapshotForBackup(
-		ctx,
-		t.request.SnapshotId,
-		execCtx.GetTaskID(),
-	)
-	if err != nil {
-		return err
-	}
-
-	// Deletion started first: there is nothing to copy. The snapshot is not
-	// marked as backed up because it is not ready.
-	if !held {
-		return nil
-	}
-
-	// A DEK that cannot be opened fails the chunk copier on every
-	// chunk and leaves those queue rows unfinished, so this task
-	// interrupts forever. Reject it before anything is enqueued.
-	err = t.backupS3.CheckEncryptedDEK(t.request.EncryptedDek)
-	if err != nil {
-		return err
-	}
-
-	meta, err := t.storage.CheckSnapshotReady(ctx, t.request.SnapshotId)
-	if err != nil {
-		return err
-	}
-	t.state.ChunkCount = meta.ChunkCount
-
-	err = t.enqueueChunks(ctx, execCtx)
-	if err != nil {
-		return err
-	}
-
-	err = t.backupChunkMap(ctx, execCtx, meta)
-	if err != nil {
-		return err
-	}
-
-	if len(t.request.MetaKey) != 0 {
-		err = t.backupS3.PutObject(
-			ctx,
-			t.request.MetaKey,
-			t.request.EncryptedDek,
-			persistence.S3Object{Data: t.request.Meta},
-		)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Persist success before cleanup so a restarted task only cleans up.
-	t.state.Finished = true
-	err = execCtx.SaveState(ctx)
-	if err != nil {
-		return err
-	}
-
-	return t.finish(ctx, execCtx)
-}
-
-// Clears the chunk entries of the snapshot and drops the reference. A copy
-// ends this way both on success and on cancellation; a cancelled copy is
-// enqueued again by its next attempt.
-func (t *backupSnapshotDataTask) finish(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-) error {
-
-	err := t.clearChunks(ctx)
-	if err != nil {
-		return err
-	}
-
-	return t.storage.ReleaseSnapshotForBackup(
-		ctx,
-		t.request.SnapshotId,
-		execCtx.GetTaskID(),
-	)
-}
-
-func (t *backupSnapshotDataTask) clearChunks(ctx context.Context) error {
-	for {
-		cleared, err := t.storage.ClearBackupChunks(
-			ctx,
-			t.request.SnapshotId,
-			t.batchSize,
-		)
-		if err != nil {
-			return err
-		}
-
-		// The storage clears fewer than batchSize entries only when no
-		// entries are left.
-		if cleared < t.batchSize {
-			return nil
-		}
-	}
-}
 
 func validateChunkMapEntry(
 	entry storage.ChunkMapEntry,
@@ -301,6 +232,45 @@ func (t *backupSnapshotDataTask) waitForChunksBackupCompleted(
 	return err
 }
 
+// Clears the chunk entries of the snapshot and drops the reference. A copy
+// ends this way both on success and on cancellation; a cancelled copy is
+// enqueued again by its next attempt.
+func (t *backupSnapshotDataTask) finish(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
+
+	err := t.clearChunks(ctx)
+	if err != nil {
+		return err
+	}
+
+	return t.storage.ReleaseSnapshotForBackup(
+		ctx,
+		t.request.SnapshotId,
+		execCtx.GetTaskID(),
+	)
+}
+
+func (t *backupSnapshotDataTask) clearChunks(ctx context.Context) error {
+	for {
+		cleared, err := t.storage.ClearBackupChunks(
+			ctx,
+			t.request.SnapshotId,
+			t.batchSize,
+		)
+		if err != nil {
+			return err
+		}
+
+		// The storage clears fewer than batchSize entries only when no
+		// entries are left.
+		if cleared < t.batchSize {
+			return nil
+		}
+	}
+}
+
 // The full map is published only after every queued chunk has completed.
 func (t *backupSnapshotDataTask) backupChunkMap(
 	ctx context.Context,
@@ -360,20 +330,4 @@ func (t *backupSnapshotDataTask) backupChunkMap(
 
 	t.state.ChunkMapBackedUp = true
 	return execCtx.SaveState(ctx)
-}
-
-func retrySnapshotBackupError(err error) error {
-	if err == nil ||
-		errors.Is(err, errors.NewInterruptExecutionError()) ||
-		errors.Is(err, errors.NewWrongGenerationError()) ||
-		errors.Is(err, context.Canceled) {
-
-		return err
-	}
-
-	// A typed non-retriable cause would still trigger runner cancellation.
-	return errors.NewRetriableErrorWithIgnoreRetryLimitf(
-		"snapshot backup waits for recovery: %v",
-		err,
-	)
 }

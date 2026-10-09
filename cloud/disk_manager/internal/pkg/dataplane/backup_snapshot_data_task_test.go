@@ -6,14 +6,12 @@ import (
 	"testing"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/backup"
 	dataplane_common "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/common"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/protos"
 	snapshot_storage "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/chunks"
-	storage_mocks "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/mocks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/test"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/types"
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
@@ -245,8 +243,6 @@ func TestBackupSnapshotDataTask(t *testing.T) {
 
 	execCtx := newBackupExecutionContext(ctx)
 	task := newBackupSnapshotDataTask(storage, follower, "snap1")
-	task.request.MetaKey = backup.SnapshotMetaKey("disk1", "snap1")
-	task.request.Meta = []byte(`{"id":"snap1"}`)
 
 	err = task.Run(ctx, execCtx)
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
@@ -282,10 +278,6 @@ func TestBackupSnapshotDataTask(t *testing.T) {
 	err = task.Run(ctx, execCtx)
 	require.NoError(t, err)
 
-	object, err := follower.getObject(ctx, task.request.MetaKey)
-	require.NoError(t, err)
-	require.Equal(t, task.request.Meta, object.Data)
-
 	chunkMap := readBackupChunkMap(t, ctx, follower, "snap1")
 	require.Equal(t, []string{chunk0, ""}, chunkMap.ChunkIds)
 
@@ -306,151 +298,6 @@ func TestBackupSnapshotDataTask(t *testing.T) {
 
 	_, err = storage.DeletingSnapshot(ctx, "snap1", "delete")
 	require.NoError(t, err)
-}
-
-func TestBackupSnapshotDataTaskBacksUpInheritedChunksAfterCreatorDeletion(t *testing.T) {
-	ctx := test.NewContext()
-
-	storage, closeFunc := newStorage(t, ctx)
-	defer closeFunc()
-
-	follower := newTestFollower(t, ctx)
-
-	disk := &types.Disk{ZoneId: "zone", DiskId: "disk1"}
-	_, err := storage.CreateSnapshot(
-		ctx,
-		snapshot_storage.SnapshotMeta{
-			ID:           "snap1",
-			Disk:         disk,
-			CheckpointID: "checkpoint1",
-		},
-	)
-	require.NoError(t, err)
-
-	chunk0, err := storage.WriteChunk(
-		ctx,
-		"task1",
-		"snap1",
-		dataplane_common.Chunk{Index: 0, Data: []byte("abc")},
-		true, // useS3
-	)
-	require.NoError(t, err)
-
-	err = storage.SnapshotCreated(
-		ctx,
-		"snap1",
-		4096, // size
-		4096, // storageSize
-		1,    // chunkCount
-		nil,  // encryption
-	)
-	require.NoError(t, err)
-
-	snap2, err := storage.CreateSnapshot(
-		ctx,
-		snapshot_storage.SnapshotMeta{
-			ID:           "snap2",
-			Disk:         disk,
-			CheckpointID: "checkpoint2",
-		},
-	)
-	require.NoError(t, err)
-	require.Equal(t, "snap1", snap2.BaseSnapshotID)
-
-	err = storage.ShallowCopyChunk(
-		ctx,
-		snapshot_storage.ChunkMapEntry{
-			ChunkIndex: 0,
-			ChunkID:    chunk0,
-			StoredInS3: true,
-		},
-		"snap2",
-	)
-	require.NoError(t, err)
-
-	chunk1, err := storage.WriteChunk(
-		ctx,
-		"task2",
-		"snap2",
-		dataplane_common.Chunk{Index: 1, Data: []byte("def")},
-		true, // useS3
-	)
-	require.NoError(t, err)
-
-	err = storage.SnapshotCreated(
-		ctx,
-		"snap2",
-		8192, // size
-		8192, // storageSize
-		2,    // chunkCount
-		nil,  // encryption
-	)
-	require.NoError(t, err)
-
-	// C inherits both A's and B's chunks. Neither ancestor has a backup,
-	// and both may disappear before backfilling C.
-	_, err = storage.CreateSnapshot(ctx, snapshot_storage.SnapshotMeta{
-		ID: "snap3", Disk: disk, CheckpointID: "checkpoint3",
-	})
-	require.NoError(t, err)
-	for index, id := range []string{chunk0, chunk1} {
-		require.NoError(t, storage.ShallowCopyChunk(ctx, snapshot_storage.ChunkMapEntry{
-			ChunkIndex: uint32(index), ChunkID: id, StoredInS3: true,
-		}, "snap3"))
-	}
-	require.NoError(t, storage.SnapshotCreated(ctx, "snap3", 8192, 8192, 2, nil))
-	finishSnapshotDeletion(t, ctx, storage, "snap1")
-	finishSnapshotDeletion(t, ctx, storage, "snap2")
-
-	execCtx := newBackupExecutionContext(ctx)
-	task := newBackupSnapshotDataTask(storage, follower, "snap3")
-
-	err = task.Run(ctx, execCtx)
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
-
-	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
-	require.NoError(t, err)
-	require.ElementsMatch(
-		t,
-		[]snapshot_storage.BackupChunkQueueEntry{
-			{
-				SnapshotID:   "snap3",
-				ChunkID:      chunk0,
-				StoredInS3:   true,
-				EncryptedDEK: follower.encryptedDEK,
-			},
-			{
-				SnapshotID:   "snap3",
-				ChunkID:      chunk1,
-				StoredInS3:   true,
-				EncryptedDEK: follower.encryptedDEK,
-			},
-		},
-		queue,
-	)
-
-	workerCtx := mocks.NewExecutionContextMock()
-	workerCtx.On("GetTaskID").Return("worker")
-	err = newBackupChunksTask(storage, follower).Run(ctx, workerCtx)
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
-	for _, id := range []string{chunk0, chunk1} {
-		object, err := follower.getObject(ctx, backup.ChunkKey(id))
-		require.NoError(t, err)
-		blob, err := storage.ReadChunkBlob(ctx, id, true)
-		require.NoError(t, err)
-		require.Equal(t, blob.Data, object.Data)
-		require.Equal(
-			t,
-			*chunks.NewS3Object(blob).Metadata["Checksum"],
-			*object.Metadata["Checksum"],
-		)
-	}
-
-	err = task.Run(ctx, execCtx)
-	require.NoError(t, err)
-
-	chunkMap := readBackupChunkMap(t, ctx, follower, "snap3")
-	require.Equal(t, []string{chunk0, chunk1}, chunkMap.ChunkIds)
 }
 
 func TestBackupSnapshotDataTaskEnqueuesInBatches(t *testing.T) {
@@ -672,7 +519,7 @@ func TestBackupSnapshotDataTaskFailsOnChunkIndexOutOfRange(t *testing.T) {
 	task := newBackupSnapshotDataTask(storage, follower, "snap1")
 
 	err = task.Run(ctx, execCtx)
-	require.True(t, errors.Is(err, errors.NewEmptyRetriableError()))
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
 
 	_, err = follower.getObject(ctx, backup.ChunkMapKey("snap1"))
 	require.Error(t, err)
@@ -727,7 +574,6 @@ func TestBackupSnapshotDataTaskBacksUpShallowCopyWithoutCreatorBackup(t *testing
 	err = task.Run(ctx, execCtx)
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 	workerCtx := mocks.NewExecutionContextMock()
-	workerCtx.On("GetTaskID").Return("worker")
 	err = newBackupChunksTask(storage, follower).Run(ctx, workerCtx)
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 	require.NoError(t, task.Run(ctx, execCtx))
@@ -779,33 +625,19 @@ func TestBackupSnapshotDataTaskEnqueuesNothingOnBadDEK(t *testing.T) {
 	task.request.EncryptedDek = []byte("bad")
 
 	err := task.Run(ctx, execCtx)
-	require.True(t, errors.Is(err, errors.NewEmptyRetriableError()))
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
 	require.Zero(t, task.state.MilestoneChunkIndex)
 
 	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
 	require.NoError(t, err)
 	require.Empty(t, queue)
 
-	// The copy keeps its reference until it is cancelled.
+	// The failed copy keeps its reference until its Cancel runs.
 	_, err = storage.DeletingSnapshot(ctx, "snap1", "delete")
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 	require.NoError(t, task.Cancel(ctx, execCtx))
 	_, err = storage.DeletingSnapshot(ctx, "snap1", "delete")
 	require.NoError(t, err)
-}
-
-func TestBackupSnapshotDataTaskRetriesBadDEKWithoutRetryLimit(t *testing.T) {
-	ctx := test.NewContext()
-	storage := storage_mocks.NewStorageMock()
-	task := newBackupSnapshotDataTask(storage, newTestFollower(t, ctx), "snapshot")
-	storage.On("HoldSnapshotForBackup", ctx, "snapshot", "backup").Return(true, nil).Once()
-	task.request.EncryptedDek = []byte("bad")
-	err := task.Run(ctx, newBackupExecutionContext(ctx))
-	retriable := errors.NewEmptyRetriableError()
-	require.True(t, errors.As(err, &retriable))
-	require.True(t, retriable.IgnoreRetryLimit)
-	require.False(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
-	storage.AssertExpectations(t)
 }
 
 func TestBackupSnapshotDataTaskCancellationClearsQueue(t *testing.T) {
@@ -870,20 +702,6 @@ func TestBackupSnapshotDataTaskNextAttemptWaitsForCancelledCopy(t *testing.T) {
 	require.Len(t, queue, 1)
 }
 
-func TestBackupSnapshotDataTaskCancellationRetriesCleanupErrors(t *testing.T) {
-	ctx := test.NewContext()
-	storage := storage_mocks.NewStorageMock()
-	storage.On("ClearBackupChunks", mock.Anything, "snap1", 1000).Return(
-		0,
-		errors.NewNonRetriableErrorf("storage failure"),
-	).Once()
-	task := newBackupSnapshotDataTask(storage, testFollower{}, "snap1")
-	err := task.Cancel(ctx, newBackupExecutionContext(ctx))
-	require.True(t, errors.Is(err, errors.NewEmptyRetriableError()))
-	require.False(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
-	storage.AssertExpectations(t)
-}
-
 func TestBackupSnapshotDataTaskHandlesRepeatedChunkIDs(t *testing.T) {
 	for _, batchSize := range []int{1, 1000} {
 		t.Run(fmt.Sprint(batchSize), func(t *testing.T) {
@@ -909,7 +727,6 @@ func TestBackupSnapshotDataTaskHandlesRepeatedChunkIDs(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, queue, 1)
 			workerCtx := mocks.NewExecutionContextMock()
-			workerCtx.On("GetTaskID").Return("worker")
 			err = newBackupChunksTask(storage, follower).Run(ctx, workerCtx)
 			require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 			for i := 0; i < 3; i++ {
@@ -953,7 +770,6 @@ func TestBackupSnapshotDataTaskWaitsForChunkRetriedByAnotherWorker(t *testing.T)
 	require.True(t, errors.Is(task.Run(ctx, execCtx), errors.NewInterruptExecutionError()))
 
 	workerCtx := mocks.NewExecutionContextMock()
-	workerCtx.On("GetTaskID").Return("worker")
 	worker := newBackupChunksTask(failingBackupChunkStorage{Storage: storage}, follower)
 	require.True(t, errors.Is(worker.Run(ctx, workerCtx), errors.NewEmptyNonRetriableError()))
 
@@ -999,7 +815,6 @@ func backUpSnapshot(
 	task := newBackupSnapshotDataTask(storage, follower, snapshotID)
 	execCtx := newBackupExecutionContext(ctx)
 	workerCtx := mocks.NewExecutionContextMock()
-	workerCtx.On("GetTaskID").Return("worker")
 
 	err := task.Run(ctx, execCtx)
 	if err == nil {
