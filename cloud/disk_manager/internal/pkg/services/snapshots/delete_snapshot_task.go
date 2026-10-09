@@ -62,8 +62,8 @@ func (t *deleteSnapshotTask) deleteSnapshot(
 		return nil
 	}
 
-	// A CP reservation also covers the interval before DP installs its hold.
-	if snapshotMeta.BackupTaskID != "" {
+	// Both graph preparation and an accepted copy protect the source before DP installs its hold.
+	if snapshotMeta.BackupTaskID != "" || snapshotMeta.BackupPlanID != "" {
 		return errors.NewInterruptExecutionError()
 	}
 

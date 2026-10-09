@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources"
 	resources_mocks "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources/mocks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/snapshots/protos"
 	"github.com/ydb-platform/nbs/cloud/tasks/headers"
@@ -25,22 +26,30 @@ func TestScheduleBackupSnapshotTasks(t *testing.T) {
 	scheduler := tasks_mocks.NewSchedulerMock()
 	execCtx := tasks_mocks.NewExecutionContextMock()
 
-	storage.On("ListSnapshotsToBackup", mock.Anything, 2).Return(
-		[]string{"snap1", "snap2"},
+	storage.On("ListSnapshotBackupFolders", mock.Anything).Return(
+		[]resources.SnapshotBackupFolder{
+			{FolderID: "folder1", Generation: "first"},
+			{FolderID: "folder2", Generation: "generation"},
+		},
 		nil,
 	)
 
-	for _, snapshotID := range []string{"snap1", "snap2"} {
-		id := snapshotID
+	for _, backup := range []resources.SnapshotBackupFolder{
+		{FolderID: "folder1", Generation: "first"},
+		{FolderID: "folder2", Generation: "generation"},
+	} {
+		id := backup.FolderID
+		backupID := backup.Generation
+		key := "backup_snapshot_folder_" + id + "_" + backupID
 		scheduler.On(
 			"ScheduleTask",
 			mock.MatchedBy(func(ctx context.Context) bool {
-				return headers.GetIdempotencyKey(ctx) == "backup_snapshot_"+id
+				return headers.GetIdempotencyKey(ctx) == key
 			}),
-			"snapshots.BackupSnapshot",
+			"snapshots.BackupFolder",
 			"",
-			mock.MatchedBy(func(request *protos.BackupSnapshotRequest) bool {
-				return request.SnapshotId == id
+			mock.MatchedBy(func(request *protos.BackupFolderRequest) bool {
+				return request.FolderId == id && request.Generation == backupID
 			}),
 		).Return(id+"_task", nil)
 	}
@@ -48,7 +57,6 @@ func TestScheduleBackupSnapshotTasks(t *testing.T) {
 	task := &scheduleBackupSnapshotTasks{
 		scheduler: scheduler,
 		storage:   storage,
-		limit:     2,
 	}
 
 	err := task.Run(ctx, execCtx)

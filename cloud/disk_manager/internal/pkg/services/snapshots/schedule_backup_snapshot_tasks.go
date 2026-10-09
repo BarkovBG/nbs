@@ -17,7 +17,6 @@ import (
 type scheduleBackupSnapshotTasks struct {
 	scheduler tasks.Scheduler
 	storage   resources.Storage
-	limit     int
 }
 
 func (t *scheduleBackupSnapshotTasks) Save() ([]byte, error) {
@@ -33,22 +32,14 @@ func (t *scheduleBackupSnapshotTasks) Run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	snapshotIDs, err := t.storage.ListSnapshotsToBackup(ctx, t.limit)
+	folders, err := t.storage.ListSnapshotBackupFolders(ctx)
 	if err != nil {
 		return err
 	}
-
-	for _, snapshotID := range snapshotIDs {
-		idempotencyKey := fmt.Sprintf("backup_snapshot_%v", snapshotID)
-
-		_, err := t.scheduler.ScheduleTask(
-			headers.SetIncomingIdempotencyKey(ctx, idempotencyKey),
-			"snapshots.BackupSnapshot",
-			"",
-			&protos.BackupSnapshotRequest{
-				SnapshotId: snapshotID,
-			},
-		)
+	for _, folder := range folders {
+		key := fmt.Sprintf("backup_snapshot_folder_%v_%v", folder.FolderID, folder.Generation)
+		_, err := t.scheduler.ScheduleTask(headers.SetIncomingIdempotencyKey(ctx, key),
+			"snapshots.BackupFolder", "", &protos.BackupFolderRequest{FolderId: folder.FolderID, Generation: folder.Generation})
 		if err != nil {
 			return err
 		}

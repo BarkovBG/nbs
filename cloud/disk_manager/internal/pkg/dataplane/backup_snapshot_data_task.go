@@ -199,6 +199,21 @@ func (t *backupSnapshotDataTask) enqueueBatch(
 	return execCtx.SaveState(ctx)
 }
 
+// A completed dependency guarantees its own immutable chunks are already
+// present in the same follower. Unknown or removed creators use this source.
+func (t *backupSnapshotDataTask) chunkHasCompletedDependency(chunkID string) bool {
+	creator := storage.GetSnapshotIDFromChunkID(chunkID)
+	if creator == "" || creator == t.request.SnapshotId {
+		return false
+	}
+	for _, id := range t.request.CompletedSnapshotIds {
+		if id == creator {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *backupSnapshotDataTask) enqueueChunks(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
@@ -230,9 +245,9 @@ func (t *backupSnapshotDataTask) enqueueChunks(
 			return err
 		}
 
-		// Every referenced chunk must exist in the follower, even if its
-		// creator was never backed up or has already been deleted.
-		if len(entry.ChunkID) == 0 {
+		// Copy this snapshot's chunks and chunks without a completed creator.
+		// Other creators are durable task dependencies completed before Run.
+		if len(entry.ChunkID) == 0 || t.chunkHasCompletedDependency(entry.ChunkID) {
 			continue
 		}
 
@@ -352,7 +367,7 @@ func (t *backupSnapshotDataTask) buildVerifiedChunkMap(
 			return nil, err
 		}
 		chunkMap.ChunkIds[entry.ChunkIndex] = entry.ChunkID
-		if entry.ChunkID == "" {
+		if entry.ChunkID == "" || t.chunkHasCompletedDependency(entry.ChunkID) {
 			continue
 		}
 		if _, ok := verified[entry.ChunkID]; ok {
