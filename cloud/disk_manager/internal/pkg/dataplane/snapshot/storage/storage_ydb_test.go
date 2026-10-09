@@ -696,48 +696,37 @@ func requireNotHeldForBackup(t *testing.T, f *fixture, snapshotID, taskID string
 	require.False(t, held)
 }
 
-func TestSnapshotBackupReferencesAreIndependentAndIdempotent(t *testing.T) {
+func TestSnapshotBackupHoldIsIdempotentAndOwnedByOneCopy(t *testing.T) {
 	f := createFixture(t)
 	defer f.teardown()
 
 	_, err := f.storage.CreateSnapshot(f.ctx, SnapshotMeta{ID: "snapshot", CreateTaskID: "create"})
 	require.NoError(t, err)
 	require.NoError(t, f.storage.SnapshotCreated(f.ctx, "snapshot", 0, 0, 0, nil))
+
+	// The backup hold is independent of the lock of incremental snapshots.
 	locked, err := f.storage.LockSnapshot(f.ctx, "snapshot", "incremental")
 	require.NoError(t, err)
 	require.True(t, locked)
-
 	for i := 0; i != 2; i++ {
-		requireHeldForBackup(t, f, "snapshot", "first-copy")
-		requireHeldForBackup(t, f, "snapshot", "second-copy")
+		requireHeldForBackup(t, f, "snapshot", "copy")
 	}
 	require.NoError(t, f.storage.UnlockSnapshot(f.ctx, "snapshot", "incremental"))
-	require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "unknown"))
-	for _, taskID := range []string{"delete", "first-copy", "second-copy"} {
-		_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", taskID)
-		require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
-	}
 
-	// Finishing one copy cannot remove the reference of another.
-	for i := 0; i != 2; i++ {
-		require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "first-copy"))
-	}
-	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
+	// Another copy waits for the current one.
+	_, err = f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "next")
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "next"))
 
-	// A new copy keeps its reference when an older one finishes.
-	requireHeldForBackup(t, f, "snapshot", "third-copy")
-	require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "second-copy"))
-	require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "first-copy"))
 	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 
 	for i := 0; i != 2; i++ {
-		require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "third-copy"))
+		require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "copy"))
 	}
 	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
 	require.NoError(t, err)
-	requireNotHeldForBackup(t, f, "snapshot", "late")
+	requireNotHeldForBackup(t, f, "snapshot", "next")
 }
 
 func TestSnapshotBackupHoldPreservesInheritedChunks(t *testing.T) {

@@ -461,25 +461,10 @@ func (s *storageYDB) deletingSnapshot(
 		return nil, err
 	}
 
-	// Read the reference range in the same serializable transaction that
-	// changes the source status. A concurrent hold must read that status
-	// before inserting its reference, so deletion and admission serialize.
-	held, err := tx.Execute(ctx, fmt.Sprintf(`
-		--!syntax_v1
-		pragma TablePathPrefix = "%v";
-		declare $id as Utf8;
-
-		select task_id from backup_snapshot_refs where snapshot_id = $id limit 1
-	`, s.tablesPath), persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)))
-	if err != nil {
-		return nil, err
-	}
-	defer held.Close()
-	if held.NextResultSet(ctx) && held.NextRow() {
+	// A backup copy holds the snapshot: deletion waits until it ends. Both
+	// change the same row, so the hold and the deletion serialize.
+	if len(states) != 0 && len(states[0].backupTaskID) != 0 {
 		return nil, task_errors.NewInterruptExecutionError()
-	}
-	if err := held.Err(); err != nil {
-		return nil, err
 	}
 
 	var state snapshotState
@@ -1559,16 +1544,34 @@ func (s *storageYDB) holdSnapshotForBackup(
 		return false, tx.Commit(ctx)
 	}
 
+	state := states[0]
+	if state.backupTaskID == taskID {
+		// Should be idempotent.
+		return true, tx.Commit(ctx)
+	}
+
+	if len(state.backupTaskID) != 0 {
+		// A snapshot has one backup copy at a time; wait for the previous one.
+		err = tx.Commit(ctx)
+		if err != nil {
+			return false, err
+		}
+
+		return false, task_errors.NewInterruptExecutionError()
+	}
+
+	state.backupTaskID = taskID
+
 	_, err = tx.Execute(ctx, fmt.Sprintf(`
 		--!syntax_v1
 		pragma TablePathPrefix = "%v";
-		declare $id as Utf8;
-		declare $task_id as Utf8;
+		declare $states as List<%v>;
 
-		upsert into backup_snapshot_refs (snapshot_id, task_id) values ($id, $task_id)
-	`, s.tablesPath),
-		persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)),
-		persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)),
+		upsert into snapshots
+		select *
+		from AS_TABLE($states)
+	`, s.tablesPath, snapshotStateStructTypeString()),
+		persistence.ValueParam("$states", persistence.ListValue(state.structValue())),
 	)
 	if err != nil {
 		return false, err
@@ -1591,8 +1594,9 @@ func (s *storageYDB) ReleaseSnapshotForBackup(
 		declare $id as Utf8;
 		declare $task_id as Utf8;
 
-		delete from backup_snapshot_refs
-		where snapshot_id = $id and task_id = $task_id
+		update snapshots
+		set backup_task_id = ""
+		where id = $id and backup_task_id = $task_id
 	`, s.tablesPath),
 		persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)),
 		persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)),
@@ -1603,7 +1607,6 @@ func (s *storageYDB) ReleaseSnapshotForBackup(
 func (s *storageYDB) findBackupChunkIDsTx(
 	ctx context.Context,
 	tx *persistence.Transaction,
-	snapshotID string,
 	entries []BackupChunkQueueEntry,
 ) (tasks_common.StringSet, error) {
 
@@ -1617,21 +1620,12 @@ func (s *storageYDB) findBackupChunkIDsTx(
 	res, err := tx.Execute(ctx, fmt.Sprintf(`
 		--!syntax_v1
 		pragma TablePathPrefix = "%v";
-		declare $snapshot_id as Utf8;
 		declare $chunk_ids as List<Utf8>;
 
-		select chunk_id
-		from backup_chunks
-		where snapshot_id = $snapshot_id and chunk_id in $chunk_ids
-		union all
 		select chunk_id
 		from follower_chunks
 		where chunk_id in $chunk_ids
 	`, s.tablesPath),
-		persistence.ValueParam(
-			"$snapshot_id",
-			persistence.UTF8Value(snapshotID),
-		),
 		persistence.ValueParam("$chunk_ids", persistence.ListValue(values...)),
 	)
 	if err != nil {
@@ -1674,9 +1668,9 @@ func (s *storageYDB) enqueueBackupChunks(
 	}
 	defer tx.Rollback(ctx)
 
-	// Chunks that are found are queued for this snapshot or already in the
-	// follower, whichever snapshot copied them.
-	found, err := s.findBackupChunkIDsTx(ctx, tx, snapshotID, entries)
+	// Chunks in the follower are skipped, whichever snapshot copied them.
+	// Enqueueing a queued chunk again writes the same rows.
+	found, err := s.findBackupChunkIDsTx(ctx, tx, entries)
 	if err != nil {
 		return err
 	}
