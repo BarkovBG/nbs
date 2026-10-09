@@ -47,8 +47,10 @@ func (t *backupChunksTask) Run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	// A restarted execution has no local IO from its previous batch. Clear
-	// claims left by an interrupted invocation before starting another batch.
+	// Claims describe a worker batch, not a snapshot hold. Recover rows left
+	// by the previous invocation; otherwise drain would wait for it forever.
+	// This assumes the previous invocation has stopped: a logical task ID
+	// alone does not fence a stale execution on another host.
 	taskID := execCtx.GetTaskID()
 	err := t.storage.ReleaseBackupChunkClaims(ctx, taskID)
 	if err != nil {
@@ -104,16 +106,13 @@ func (t *backupChunksTask) Run(
 func (t *backupChunksTask) Cancel(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
-) (err error) {
+) error {
 
-	// Cancellation must not be marked complete while cleanup has failed.
-	defer func() {
-		if err != nil && !errors.Is(err, errors.NewInterruptExecutionError()) {
-			err = errors.NewRetriableErrorf("failed to cancel backup worker: %v", err)
-		}
-	}()
-
-	return t.storage.ReleaseBackupChunkClaims(ctx, execCtx.GetTaskID())
+	// runnerForCancel treats non-retriable errors as completed cancellation.
+	// Keep retrying cleanup until this worker's claims have been released.
+	return retrySnapshotBackupError(
+		t.storage.ReleaseBackupChunkClaims(ctx, execCtx.GetTaskID()),
+	)
 }
 
 func (t *backupChunksTask) GetMetadata(

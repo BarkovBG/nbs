@@ -20,5 +20,5 @@ message BackupSnapshotDataTaskState {
     reserved 3; // Former EnqueuedChunkCount counted duplicate chunk IDs.
     bool ChunkMapBackedUp = 4;
     bool Finished = 5;
-    bool ChunkMapPrepared = 6;
+    reserved 6; // Temporary map storage is no longer needed.
 }
