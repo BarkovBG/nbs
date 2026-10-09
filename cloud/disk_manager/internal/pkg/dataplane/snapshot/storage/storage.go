@@ -199,8 +199,8 @@ type Storage interface {
 		entries []BackupChunkQueueEntry,
 	) error
 
-	// Removes queued and completed entries of the snapshot. Returns the number
-	// of cleared entries: limit, or fewer if no entries are left.
+	// Removes queued chunks of the snapshot. Returns the number of cleared
+	// entries: limit, or fewer if no entries are left.
 	ClearBackupChunks(
 		ctx context.Context,
 		snapshotID string,

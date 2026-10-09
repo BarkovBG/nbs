@@ -188,43 +188,6 @@ func snapshotStateStructTypeString() string {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-type backupChunkStatus int64
-
-const (
-	backupChunkStatusQueued    backupChunkStatus = iota
-	backupChunkStatusCompleted backupChunkStatus = iota
-)
-
-func backupChunkStructTypeString() string {
-	return "Struct<snapshot_id: Utf8, chunk_id: Utf8, status: Int64>"
-}
-
-func backupChunkListValue(
-	entries []BackupChunkQueueEntry,
-	status backupChunkStatus,
-) persistence.Value {
-
-	values := make([]persistence.Value, 0, len(entries))
-	for _, entry := range entries {
-		values = append(values, persistence.StructValue(
-			persistence.StructFieldValue(
-				"snapshot_id",
-				persistence.UTF8Value(entry.SnapshotID),
-			),
-			persistence.StructFieldValue(
-				"chunk_id",
-				persistence.UTF8Value(entry.ChunkID),
-			),
-			persistence.StructFieldValue(
-				"status",
-				persistence.Int64Value(int64(status)),
-			),
-		))
-	}
-
-	return persistence.ListValue(values...)
-}
-
 func backupChunkKeyStructTypeString() string {
 	return "Struct<snapshot_id: Utf8, chunk_id: Utf8>"
 }
