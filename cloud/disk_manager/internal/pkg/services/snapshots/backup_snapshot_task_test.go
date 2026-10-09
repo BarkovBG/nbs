@@ -86,10 +86,6 @@ func (f *backupSnapshotFixture) copy(skipped bool) {
 	).Once()
 }
 
-func (f *backupSnapshotFixture) completed() bool {
-	return f.task.GetResponse().(*protos.BackupSnapshotResponse).Completed
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 
 func TestBackupSnapshotTask(t *testing.T) {
@@ -97,7 +93,6 @@ func TestBackupSnapshotTask(t *testing.T) {
 	f.copy(false)
 
 	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
-	require.True(t, f.completed())
 	require.True(t, f.meta.BackupCompleted)
 	f.storage.AssertCalled(t, "RemoveSnapshotFromBackupQueue", mock.Anything, "snapshot", "attempt")
 	f.scheduler.AssertExpectations(t)
@@ -108,8 +103,8 @@ func TestBackupSnapshotTaskAlreadyCompletedNeedsNoCopy(t *testing.T) {
 	f.meta.BackupCompleted = true
 
 	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
-	require.True(t, f.completed())
 	f.scheduler.AssertNotCalled(t, "ScheduleTask", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	f.storage.AssertCalled(t, "RemoveSnapshotFromBackupQueue", mock.Anything, "snapshot", "attempt")
 }
 
 func TestBackupSnapshotTaskSkipsDeletingSnapshot(t *testing.T) {
@@ -117,7 +112,7 @@ func TestBackupSnapshotTaskSkipsDeletingSnapshot(t *testing.T) {
 	f.meta.Ready = false
 
 	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
-	require.False(t, f.completed())
+	require.False(t, f.meta.BackupCompleted)
 	f.scheduler.AssertNotCalled(t, "ScheduleTask", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	f.storage.AssertCalled(t, "RemoveSnapshotFromBackupQueue", mock.Anything, "snapshot", "attempt")
 }
@@ -127,7 +122,6 @@ func TestBackupSnapshotTaskSkipsSnapshotWhoseDeletionWonTheHold(t *testing.T) {
 	f.copy(true)
 
 	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
-	require.False(t, f.completed())
 	require.False(t, f.meta.BackupCompleted)
 }
 
@@ -144,7 +138,7 @@ func TestBackupSnapshotTaskFinishesAcceptedCopyOfDeletingSnapshot(t *testing.T) 
 
 	f.meta.Ready = false
 	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
-	require.True(t, f.completed())
+	require.True(t, f.meta.BackupCompleted)
 	f.scheduler.AssertExpectations(t)
 }
 
@@ -185,7 +179,7 @@ func TestBackupSnapshotTaskRestoresAcceptedRequestAndDEK(t *testing.T) {
 			).Once()
 
 			require.NoError(t, f.task.Run(f.ctx, f.execCtx))
-			require.True(t, f.completed())
+			require.True(t, f.meta.BackupCompleted)
 			f.scheduler.AssertExpectations(t)
 		})
 	}
