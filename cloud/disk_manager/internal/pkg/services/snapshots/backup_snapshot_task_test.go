@@ -70,7 +70,12 @@ func newBackupSnapshotFixture(t *testing.T) *backupSnapshotFixture {
 			f.meta.BackupCompleted = f.meta.BackupCompleted || f.meta.Ready
 		},
 	).Return(nil).Maybe()
-	f.storage.On("RemoveSnapshotFromBackupQueue", mock.Anything, "snapshot", "attempt").Return(nil).Maybe()
+	f.storage.On(
+		"RemoveSnapshotFromBackupQueue",
+		mock.Anything,
+		"snapshot",
+		"attempt",
+	).Return(nil).Maybe()
 	return f
 }
 
@@ -105,7 +110,14 @@ func TestBackupSnapshotTaskAlreadyCompletedNeedsNoCopy(t *testing.T) {
 	f.meta.BackupCompleted = true
 
 	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
-	f.scheduler.AssertNotCalled(t, "ScheduleTask", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	f.scheduler.AssertNotCalled(
+		t,
+		"ScheduleTask",
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+	)
 	f.storage.AssertCalled(t, "RemoveSnapshotFromBackupQueue", mock.Anything, "snapshot", "attempt")
 }
 
@@ -115,13 +127,26 @@ func TestBackupSnapshotTaskSkipsDeletingSnapshot(t *testing.T) {
 
 	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
 	require.False(t, f.meta.BackupCompleted)
-	f.scheduler.AssertNotCalled(t, "ScheduleTask", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	f.scheduler.AssertNotCalled(
+		t,
+		"ScheduleTask",
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+	)
 	f.storage.AssertCalled(t, "RemoveSnapshotFromBackupQueue", mock.Anything, "snapshot", "attempt")
 }
 
 func TestBackupSnapshotTaskDoesNotMarkSnapshotDeletedBeforeTheCopy(t *testing.T) {
 	f := newBackupSnapshotFixture(t)
-	f.scheduler.On("ScheduleTask", mock.Anything, "dataplane.BackupSnapshotData", "", mock.Anything).Run(
+	f.scheduler.On(
+		"ScheduleTask",
+		mock.Anything,
+		"dataplane.BackupSnapshotData",
+		"",
+		mock.Anything,
+	).Run(
 		func(mock.Arguments) {
 			// Deleted while the copy waits to start: the copy copies nothing.
 			f.meta.Ready = false
@@ -161,7 +186,13 @@ func TestBackupSnapshotTaskRestoresAcceptedRequestAndDEK(t *testing.T) {
 			var dek []byte
 			if encrypted {
 				var err error
-				f.task.backupS3, err = backup.NewS3(nil, "bucket", "prefix", "key", make([]byte, 32))
+				f.task.backupS3, err = backup.NewS3(
+					nil, // s3
+					"bucket",
+					"prefix",
+					"key",
+					make([]byte, 32),
+				)
 				require.NoError(t, err)
 				dek, err = f.task.backupS3.NewEncryptedDEK()
 				require.NoError(t, err)
@@ -182,7 +213,10 @@ func TestBackupSnapshotTaskRestoresAcceptedRequestAndDEK(t *testing.T) {
 					return bytes.Equal(r.EncryptedDek, dek) && bytes.Equal(r.Meta, data)
 				}),
 			).Return("copy", nil).Once()
-			f.scheduler.On("WaitTask", mock.Anything, f.execCtx, "copy").Return(&empty.Empty{}, nil).Once()
+			f.scheduler.On("WaitTask", mock.Anything, f.execCtx, "copy").Return(
+				&empty.Empty{},
+				nil,
+			).Once()
 
 			require.NoError(t, f.task.Run(f.ctx, f.execCtx))
 			require.True(t, f.meta.BackupCompleted)
@@ -194,7 +228,13 @@ func TestBackupSnapshotTaskRestoresAcceptedRequestAndDEK(t *testing.T) {
 func TestBackupSnapshotTaskSavesMetadataAndDEKBeforeScheduling(t *testing.T) {
 	f := newBackupSnapshotFixture(t)
 	var err error
-	f.task.backupS3, err = backup.NewS3(nil, "bucket", "prefix", "key", make([]byte, 32))
+	f.task.backupS3, err = backup.NewS3(
+		nil, // s3
+		"bucket",
+		"prefix",
+		"key",
+		make([]byte, 32),
+	)
 	require.NoError(t, err)
 
 	var saved *dataplane_protos.BackupSnapshotDataRequest
@@ -202,10 +242,18 @@ func TestBackupSnapshotTaskSavesMetadataAndDEKBeforeScheduling(t *testing.T) {
 	f.execCtx.On("GetTaskID").Return("task")
 	f.execCtx.On("SaveState", mock.Anything).Run(func(mock.Arguments) {
 		if f.task.state.DataplaneRequest != nil {
-			saved = proto.Clone(f.task.state.DataplaneRequest).(*dataplane_protos.BackupSnapshotDataRequest)
+			saved = proto.Clone(
+				f.task.state.DataplaneRequest,
+			).(*dataplane_protos.BackupSnapshotDataRequest)
 		}
 	}).Return(nil)
-	f.scheduler.On("ScheduleTask", mock.Anything, "dataplane.BackupSnapshotData", "", mock.Anything).Run(
+	f.scheduler.On(
+		"ScheduleTask",
+		mock.Anything,
+		"dataplane.BackupSnapshotData",
+		"",
+		mock.Anything,
+	).Run(
 		func(a mock.Arguments) {
 			request := a.Get(3).(*dataplane_protos.BackupSnapshotDataRequest)
 			require.True(t, proto.Equal(saved, request))
@@ -226,9 +274,17 @@ func TestBackupSnapshotTaskSavesMetadataAndDEKBeforeScheduling(t *testing.T) {
 
 func TestBackupSnapshotTaskCancellationStopsCopy(t *testing.T) {
 	f := newBackupSnapshotFixture(t)
-	f.task.state.DataplaneRequest = &dataplane_protos.BackupSnapshotDataRequest{SnapshotId: "snapshot"}
+	f.task.state.DataplaneRequest = &dataplane_protos.BackupSnapshotDataRequest{
+		SnapshotId: "snapshot",
+	}
 	// The copy was scheduled, but its ID was not saved.
-	f.scheduler.On("ScheduleTask", mock.Anything, "dataplane.BackupSnapshotData", "", mock.Anything).Return("copy", nil).Once()
+	f.scheduler.On(
+		"ScheduleTask",
+		mock.Anything,
+		"dataplane.BackupSnapshotData",
+		"",
+		mock.Anything,
+	).Return("copy", nil).Once()
 	f.scheduler.On("CancelTask", mock.Anything, "copy").Return(true, nil).Once()
 
 	require.NoError(t, f.task.Cancel(f.ctx, f.execCtx))

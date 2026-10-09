@@ -684,13 +684,25 @@ func TestSnapshotsLocks(t *testing.T) {
 	}
 }
 
-func requireHeldForBackup(t *testing.T, f *fixture, snapshotID, taskID string) {
+func requireHeldForBackup(
+	t *testing.T,
+	f *fixture,
+	snapshotID string,
+	taskID string,
+) {
+
 	held, err := f.storage.HoldSnapshotForBackup(f.ctx, snapshotID, taskID)
 	require.NoError(t, err)
 	require.True(t, held)
 }
 
-func requireNotHeldForBackup(t *testing.T, f *fixture, snapshotID, taskID string) {
+func requireNotHeldForBackup(
+	t *testing.T,
+	f *fixture,
+	snapshotID string,
+	taskID string,
+) {
+
 	held, err := f.storage.HoldSnapshotForBackup(f.ctx, snapshotID, taskID)
 	require.NoError(t, err)
 	require.False(t, held)
@@ -1957,20 +1969,39 @@ func TestBackupChunkInFollowerIsNotEnqueuedForAnotherSnapshot(t *testing.T) {
 	defer f.teardown()
 
 	first := BackupChunkQueueEntry{SnapshotID: "snap1", ChunkID: "t.creator.0"}
-	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snap1", []BackupChunkQueueEntry{first}))
+	err := f.storage.EnqueueBackupChunks(
+		f.ctx,
+		"snap1",
+		[]BackupChunkQueueEntry{first},
+	)
+	require.NoError(t, err)
 
 	// Not copied yet: another snapshot enqueues the chunk too.
 	second := BackupChunkQueueEntry{SnapshotID: "snap2", ChunkID: "t.creator.0"}
-	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snap2", []BackupChunkQueueEntry{second}))
+	err = f.storage.EnqueueBackupChunks(
+		f.ctx,
+		"snap2",
+		[]BackupChunkQueueEntry{second},
+	)
+	require.NoError(t, err)
 	got, err := f.storage.GetQueuedChunksToBackup(f.ctx, 10)
 	require.NoError(t, err)
 	require.ElementsMatch(t, []BackupChunkQueueEntry{first, second}, got)
 
 	// One batch may complete the same chunk for both snapshots.
-	require.NoError(t, f.storage.ChunksBackupCompleted(f.ctx, []BackupChunkQueueEntry{first, second}))
+	err = f.storage.ChunksBackupCompleted(
+		f.ctx,
+		[]BackupChunkQueueEntry{first, second},
+	)
+	require.NoError(t, err)
 
 	third := BackupChunkQueueEntry{SnapshotID: "snap3", ChunkID: "t.creator.0"}
-	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snap3", []BackupChunkQueueEntry{third}))
+	err = f.storage.EnqueueBackupChunks(
+		f.ctx,
+		"snap3",
+		[]BackupChunkQueueEntry{third},
+	)
+	require.NoError(t, err)
 	got, err = f.storage.GetQueuedChunksToBackup(f.ctx, 10)
 	require.NoError(t, err)
 	require.Empty(t, got)

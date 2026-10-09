@@ -542,7 +542,8 @@ func (s *storageYDB) snapshotCreated(
 		return err
 	}
 
-	// Backup is opt-in through EnqueueSnapshotBackup; creation does not enqueue.
+	// Backup is opt-in through EnqueueSnapshotBackup: creation does not
+	// enqueue the snapshot.
 
 	return tx.Commit(ctx)
 }
@@ -1014,16 +1015,25 @@ func (s *storageYDB) listSnapshotsToBackup(
 	return backups, res.Err()
 }
 
-func (s *storageYDB) finishSnapshotBackup(
-	ctx context.Context, session *persistence.Session, snapshotID, backupID string,
+func (s *storageYDB) removeSnapshotFromBackupQueue(
+	ctx context.Context,
+	session *persistence.Session,
+	snapshotID string,
+	backupID string,
 ) error {
+
 	_, err := session.ExecuteRW(ctx, fmt.Sprintf(`
-  --!syntax_v1
-  pragma TablePathPrefix = "%v";
-  declare $snapshot_id as Utf8;
-  declare $backup_id as Utf8;
-  delete from backup_queue where snapshot_id = $snapshot_id and backup_id = $backup_id;
- `, s.snapshotsPath), persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)), persistence.ValueParam("$backup_id", persistence.UTF8Value(backupID)))
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $snapshot_id as Utf8;
+		declare $backup_id as Utf8;
+
+		delete from backup_queue
+		where snapshot_id = $snapshot_id and backup_id = $backup_id
+	`, s.snapshotsPath),
+		persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)),
+		persistence.ValueParam("$backup_id", persistence.UTF8Value(backupID)),
+	)
 	return err
 }
 
@@ -1211,7 +1221,7 @@ func (s *storageYDB) RemoveSnapshotFromBackupQueue(
 	return s.db.Execute(
 		ctx,
 		func(ctx context.Context, session *persistence.Session) error {
-			return s.finishSnapshotBackup(
+			return s.removeSnapshotFromBackupQueue(
 				ctx,
 				session,
 				snapshotID,
