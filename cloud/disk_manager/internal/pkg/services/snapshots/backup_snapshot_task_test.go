@@ -199,11 +199,8 @@ func TestBackupSnapshotTaskRestoresAcceptedRequestAndDEK(t *testing.T) {
 			}
 			data, err := json.Marshal(backup.SnapshotMeta{ID: "snapshot", FolderID: "folder"})
 			require.NoError(t, err)
-			f.task.state.DataplaneRequest = &dataplane_protos.BackupSnapshotDataRequest{
-				SnapshotId:   "snapshot",
-				EncryptedDek: dek,
-				Meta:         data,
-			}
+			f.task.state.EncryptedDek = dek
+			f.task.state.Meta = data
 			f.scheduler.On(
 				"ScheduleTask",
 				mock.Anything,
@@ -237,14 +234,12 @@ func TestBackupSnapshotTaskSavesMetadataAndDEKBeforeScheduling(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	var saved *dataplane_protos.BackupSnapshotDataRequest
+	var saved *protos.BackupSnapshotTaskState
 	f.execCtx.ExpectedCalls = nil
 	f.execCtx.On("GetTaskID").Return("task")
 	f.execCtx.On("SaveState", mock.Anything).Run(func(mock.Arguments) {
-		if f.task.state.DataplaneRequest != nil {
-			saved = proto.Clone(
-				f.task.state.DataplaneRequest,
-			).(*dataplane_protos.BackupSnapshotDataRequest)
+		if len(f.task.state.Meta) != 0 && saved == nil {
+			saved = proto.Clone(f.task.state).(*protos.BackupSnapshotTaskState)
 		}
 	}).Return(nil)
 	f.scheduler.On(
@@ -256,7 +251,10 @@ func TestBackupSnapshotTaskSavesMetadataAndDEKBeforeScheduling(t *testing.T) {
 	).Run(
 		func(a mock.Arguments) {
 			request := a.Get(3).(*dataplane_protos.BackupSnapshotDataRequest)
-			require.True(t, proto.Equal(saved, request))
+			require.NotNil(t, saved)
+			require.Equal(t, saved.EncryptedDek, request.EncryptedDek)
+			require.Equal(t, saved.MetaKey, request.MetaKey)
+			require.Equal(t, saved.Meta, request.Meta)
 			require.NoError(t, f.task.backupS3.CheckEncryptedDEK(request.EncryptedDek))
 			require.Equal(t, backup.SnapshotMetaKey("disk", "snapshot"), request.MetaKey)
 
@@ -274,9 +272,7 @@ func TestBackupSnapshotTaskSavesMetadataAndDEKBeforeScheduling(t *testing.T) {
 
 func TestBackupSnapshotTaskCancellationStopsCopy(t *testing.T) {
 	f := newBackupSnapshotFixture(t)
-	f.task.state.DataplaneRequest = &dataplane_protos.BackupSnapshotDataRequest{
-		SnapshotId: "snapshot",
-	}
+	f.task.state.Meta = []byte("{}")
 	// The copy was scheduled, but its ID was not saved.
 	f.scheduler.On(
 		"ScheduleTask",

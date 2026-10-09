@@ -4,8 +4,6 @@ package snapshots;
 
 option go_package = "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/snapshots/protos";
 
-import "cloud/disk_manager/internal/pkg/dataplane/protos/backup_snapshot_data_task.proto";
-
 ////////////////////////////////////////////////////////////////////////////////
 
 message BackupSnapshotRequest {
@@ -14,8 +12,9 @@ message BackupSnapshotRequest {
 }
 
 message BackupSnapshotTaskState {
-    // The saved request accepts the copy; the child ID survives an
-    // interrupted ScheduleTask.
     string DataplaneTaskID = 1;
-    dataplane.BackupSnapshotDataRequest DataplaneRequest = 2;
+    bytes EncryptedDek = 2;
+    // Saved metadata accepts the copy.
+    string MetaKey = 3;
+    bytes Meta = 4;
 }
