@@ -10,53 +10,102 @@ import (
 
 ////////////////////////////////////////////////////////////////////////////////
 
-type SnapshotBackupFolder struct {
-	FolderID   string
-	Generation string
-}
-
-// snapshotBackupFolderState maps one backup_folders row. Transactions use it
-// to serialize folder ownership, graph preparation and copy admission across
-// coordinator retries and service restarts.
-type snapshotBackupFolderState struct {
-	generation  string // Enable cycle; fences requests from earlier coordinators.
-	enabled     bool   // Allows new graph holds and copy admissions.
-	coordinator string // BackupFolder task ID owning this folder.
-	activeOwner string // Accepted copy owner, retained through DP cleanup.
-	activePlan  string // Graph owner, retained until all source holds are released.
-}
-
-func (s *storageYDB) getSnapshotBackupFolderTx(
-	ctx context.Context,
-	tx *persistence.Transaction,
-	folderID string,
-) (*snapshotBackupFolderState, error) {
+// All manual requests share one durable queue slot. Source holds are acquired
+// only after taking it, so intersecting graphs cannot deadlock each other.
+func (s *storageYDB) snapshotBackupPlanTaskID(ctx context.Context, tx *persistence.Transaction) (string, error) {
 	res, err := tx.Execute(ctx, fmt.Sprintf(`
-        --!syntax_v1
-        pragma TablePathPrefix = "%v";
-        declare $folder as Utf8;
-        select generation, enabled, coordinator_task_id, active_owner, active_plan
-        from backup_folders where folder_id = $folder;
-    `, s.snapshotsPath), persistence.ValueParam("$folder", persistence.UTF8Value(folderID)))
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		select task_id from backup_plan where id = "snapshots";
+ `, s.snapshotsPath))
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	defer res.Close()
-	if !res.NextResultSet(ctx) || !res.NextRow() {
-		return nil, res.Err()
+	var taskID string
+	if res.NextResultSet(ctx) && res.NextRow() {
+		if err := res.ScanWithDefaults(&taskID); err != nil {
+			return "", err
+		}
 	}
-	var state snapshotBackupFolderState
-	err = res.ScanNamed(
-		persistence.OptionalWithDefault("generation", &state.generation),
-		persistence.OptionalWithDefault("enabled", &state.enabled),
-		persistence.OptionalWithDefault("coordinator_task_id", &state.coordinator),
-		persistence.OptionalWithDefault("active_owner", &state.activeOwner),
-		persistence.OptionalWithDefault("active_plan", &state.activePlan),
-	)
+	return taskID, res.Err()
+}
+
+func (s *storageYDB) checkSnapshotBackupPlan(ctx context.Context, tx *persistence.Transaction, taskID string) error {
+	actual, err := s.snapshotBackupPlanTaskID(ctx, tx)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &state, res.Err()
+	if actual != taskID {
+		return errors.NewInterruptExecutionError()
+	}
+	return nil
+}
+
+func (s *storageYDB) claimSnapshotBackupPlan(ctx context.Context, session *persistence.Session, taskID string) error {
+	tx, err := session.BeginRWTransaction(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	actual, err := s.snapshotBackupPlanTaskID(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if actual != "" && actual != taskID {
+		return errors.NewInterruptExecutionError()
+	}
+	_, err = tx.Execute(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $task as Utf8;
+		upsert into backup_plan (id, task_id) values ("snapshots", $task);
+ `, s.snapshotsPath), persistence.ValueParam("$task", persistence.UTF8Value(taskID)))
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *storageYDB) finishSnapshotBackupPlan(ctx context.Context, session *persistence.Session, taskID string) error {
+	tx, err := session.BeginRWTransaction(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	actual, err := s.snapshotBackupPlanTaskID(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if actual != taskID {
+		return tx.Commit(ctx)
+	}
+	res, err := tx.Execute(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $task as Utf8;
+		select id from snapshots view backup_plan_id_index where backup_plan_id = $task limit 1;
+ `, s.snapshotsPath), persistence.ValueParam("$task", persistence.UTF8Value(taskID)))
+	if err != nil {
+		return err
+	}
+	defer res.Close()
+	if res.NextResultSet(ctx) && res.NextRow() {
+		return errors.NewInterruptExecutionError()
+	}
+	if err := res.Err(); err != nil {
+		return err
+	}
+	_, err = tx.Execute(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $task as Utf8;
+		delete from backup_plan where id = "snapshots" and task_id = $task;
+ `, s.snapshotsPath), persistence.ValueParam("$task", persistence.UTF8Value(taskID)))
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // Admission and Delete serialize on the source row. A held deleting ancestor
@@ -65,8 +114,7 @@ func (s *storageYDB) reserveSnapshotBackup(
 	ctx context.Context,
 	session *persistence.Session,
 	snapshotID string,
-	ownerID string,
-	coordinatorID string,
+	backupTaskID string,
 	neededByDependents bool,
 ) (*SnapshotMeta, error) {
 	tx, err := session.BeginRWTransaction(ctx)
@@ -75,10 +123,10 @@ func (s *storageYDB) reserveSnapshotBackup(
 	}
 	defer tx.Rollback(ctx)
 	res, err := tx.Execute(ctx, fmt.Sprintf(`
-        --!syntax_v1
-        pragma TablePathPrefix = "%v";
-        declare $id as Utf8;
-        select * from snapshots where id = $id;
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $id as Utf8;
+		select * from snapshots where id = $id;
     `, s.snapshotsPath), persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)))
 	if err != nil {
 		return nil, err
@@ -95,41 +143,31 @@ func (s *storageYDB) reserveSnapshotBackup(
 		return nil, tx.Commit(ctx)
 	}
 	state := states[0]
-	// An accepted copy survives Delete or disabling its folder.
-	if state.backupTaskID == ownerID {
+	// An accepted copy survives Delete.
+	if state.backupTaskID == backupTaskID {
 		return state.toSnapshotMeta(), tx.Commit(ctx)
 	}
 	if state.backupCompleted || (state.status != snapshotStatusReady &&
-		!(state.status == snapshotStatusDeleting && state.backupPlanID == ownerID && neededByDependents)) {
+		!(state.status == snapshotStatusDeleting && state.backupPlanID == backupTaskID && neededByDependents)) {
 		return nil, tx.Commit(ctx)
 	}
-	if state.backupTaskID != "" || (state.backupPlanID != "" && state.backupPlanID != ownerID) {
+	if state.backupTaskID != "" || (state.backupPlanID != "" && state.backupPlanID != backupTaskID) {
 		return nil, errors.NewInterruptExecutionError()
 	}
-	folder, err := s.getSnapshotBackupFolderTx(ctx, tx, state.folderID)
-	if err != nil {
+	if state.backupPlanID != backupTaskID {
+		return nil, errors.NewInterruptExecutionError()
+	}
+	if err := s.checkSnapshotBackupPlan(ctx, tx, backupTaskID); err != nil {
 		return nil, err
 	}
-	if folder == nil || !folder.enabled || folder.coordinator != coordinatorID {
-		return nil, tx.Commit(ctx)
-	}
-	if (folder.activeOwner != "" && folder.activeOwner != ownerID) ||
-		(folder.activePlan != "" && folder.activePlan != ownerID) {
-		return nil, errors.NewInterruptExecutionError()
-	}
-	state.backupTaskID = ownerID
+	state.backupTaskID = backupTaskID
 	_, err = tx.Execute(ctx, fmt.Sprintf(`
-        --!syntax_v1
-        pragma TablePathPrefix = "%v";
-        declare $states as List<%v>;
-        declare $folder as Utf8;
-        declare $owner as Utf8;
-        upsert into snapshots select * from AS_TABLE($states);
-        update backup_folders set active_owner = $owner where folder_id = $folder;
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $states as List<%v>;
+		upsert into snapshots select * from AS_TABLE($states);
     `, s.snapshotsPath, snapshotStateStructTypeString()),
-		persistence.ValueParam("$states", persistence.ListValue(state.structValue())),
-		persistence.ValueParam("$folder", persistence.UTF8Value(state.folderID)),
-		persistence.ValueParam("$owner", persistence.UTF8Value(ownerID)))
+		persistence.ValueParam("$states", persistence.ListValue(state.structValue())))
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +179,7 @@ func (s *storageYDB) reserveSnapshotBackup(
 func (s *storageYDB) holdSnapshotBackupPlan(
 	ctx context.Context,
 	session *persistence.Session,
-	snapshotID, ownerID, coordinatorID string,
+	snapshotID, backupTaskID string,
 ) (*SnapshotMeta, error) {
 	tx, err := session.BeginRWTransaction(ctx)
 	if err != nil {
@@ -149,10 +187,10 @@ func (s *storageYDB) holdSnapshotBackupPlan(
 	}
 	defer tx.Rollback(ctx)
 	res, err := tx.Execute(ctx, fmt.Sprintf(`
-        --!syntax_v1
-        pragma TablePathPrefix = "%v";
-        declare $id as Utf8;
-        select * from snapshots where id = $id;
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $id as Utf8;
+		select * from snapshots where id = $id;
     `, s.snapshotsPath), persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)))
 	if err != nil {
 		return nil, err
@@ -169,7 +207,7 @@ func (s *storageYDB) holdSnapshotBackupPlan(
 		return nil, tx.Commit(ctx)
 	}
 	state := states[0]
-	if state.backupPlanID == ownerID {
+	if state.backupPlanID == backupTaskID {
 		return state.toSnapshotMeta(), tx.Commit(ctx)
 	}
 	if state.status != snapshotStatusReady || state.backupCompleted {
@@ -178,362 +216,105 @@ func (s *storageYDB) holdSnapshotBackupPlan(
 	if state.backupPlanID != "" || state.backupTaskID != "" {
 		return nil, errors.NewInterruptExecutionError()
 	}
-	folder, err := s.getSnapshotBackupFolderTx(ctx, tx, state.folderID)
-	if err != nil {
+	if err := s.checkSnapshotBackupPlan(ctx, tx, backupTaskID); err != nil {
 		return nil, err
 	}
-	if folder == nil || !folder.enabled || folder.coordinator != coordinatorID {
-		return nil, tx.Commit(ctx)
-	}
-	if folder.activePlan != "" && folder.activePlan != ownerID {
-		return nil, errors.NewInterruptExecutionError()
-	}
-	if folder.activeOwner != "" && folder.activeOwner != ownerID {
-		return nil, errors.NewInterruptExecutionError()
-	}
-	state.backupPlanID = ownerID
+	state.backupPlanID = backupTaskID
 	_, err = tx.Execute(ctx, fmt.Sprintf(`
-        --!syntax_v1
-        pragma TablePathPrefix = "%v";
-        declare $states as List<%v>;
-        declare $folder as Utf8;
-        declare $owner as Utf8;
-        upsert into snapshots select * from AS_TABLE($states);
-        update backup_folders set active_plan = $owner where folder_id = $folder;
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $states as List<%v>;
+		upsert into snapshots select * from AS_TABLE($states);
     `, s.snapshotsPath, snapshotStateStructTypeString()),
-		persistence.ValueParam("$states", persistence.ListValue(state.structValue())),
-		persistence.ValueParam("$folder", persistence.UTF8Value(state.folderID)),
-		persistence.ValueParam("$owner", persistence.UTF8Value(ownerID)))
+		persistence.ValueParam("$states", persistence.ListValue(state.structValue())))
 	if err != nil {
 		return nil, err
 	}
 	return state.toSnapshotMeta(), tx.Commit(ctx)
 }
 
-func (s *storageYDB) finishSnapshotBackupPlan(ctx context.Context, session *persistence.Session, folderID, ownerID string) error {
-	tx, err := session.BeginRWTransaction(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	folder, err := s.getSnapshotBackupFolderTx(ctx, tx, folderID)
-	if err != nil {
-		return err
-	}
-	if folder == nil || folder.activePlan != ownerID {
-		return tx.Commit(ctx)
-	}
-	if folder.activeOwner != "" {
-		return errors.NewInterruptExecutionError()
-	}
-	res, err := tx.Execute(ctx, fmt.Sprintf(`
-        --!syntax_v1
-        pragma TablePathPrefix = "%v";
-        declare $folder as Utf8;
-        declare $owner as Utf8;
-        select count(*) from snapshots view folder_id_index
-            where folder_id = $folder and backup_plan_id = $owner;
-    `, s.snapshotsPath), persistence.ValueParam("$folder", persistence.UTF8Value(folderID)), persistence.ValueParam("$owner", persistence.UTF8Value(ownerID)))
-	if err != nil {
-		return err
-	}
-	defer res.Close()
-	if !res.NextResultSet(ctx) || !res.NextRow() {
-		if res.Err() != nil {
-			return res.Err()
-		}
-		return errors.NewInterruptExecutionError()
-	}
-	var count uint64
-	if err := res.ScanWithDefaults(&count); err != nil {
-		return err
-	}
-	if res.Err() != nil {
-		return res.Err()
-	}
-	if count != 0 {
-		return errors.NewInterruptExecutionError()
-	}
-	_, err = tx.Execute(ctx, fmt.Sprintf(`
-        --!syntax_v1
-        pragma TablePathPrefix = "%v";
-        declare $folder as Utf8;
-        declare $owner as Utf8;
-        update backup_folders set active_plan = ""
-            where folder_id = $folder and active_plan = $owner;
-    `, s.snapshotsPath), persistence.ValueParam("$folder", persistence.UTF8Value(folderID)), persistence.ValueParam("$owner", persistence.UTF8Value(ownerID)))
-	if err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
-}
-
-func (s *storageYDB) claimSnapshotBackupFolder(
-	ctx context.Context,
-	session *persistence.Session,
-	folderID string,
-	generation string,
-	taskID string,
-) (bool, error) {
-	tx, err := session.BeginRWTransaction(ctx)
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback(ctx)
-	state, err := s.getSnapshotBackupFolderTx(ctx, tx, folderID)
-	if err != nil {
-		return false, err
-	}
-	if state == nil || !state.enabled || state.generation != generation {
-		return false, tx.Commit(ctx)
-	}
-	if state.coordinator != "" && state.coordinator != taskID {
-		return false, errors.NewInterruptExecutionError()
-	}
-	_, err = tx.Execute(ctx, fmt.Sprintf(`
-        --!syntax_v1
-        pragma TablePathPrefix = "%v";
-        declare $folder as Utf8;
-        declare $task as Utf8;
-        update backup_folders set coordinator_task_id = $task where folder_id = $folder;
-    `, s.snapshotsPath), persistence.ValueParam("$folder", persistence.UTF8Value(folderID)), persistence.ValueParam("$task", persistence.UTF8Value(taskID)))
-	if err != nil {
-		return false, err
-	}
-	return true, tx.Commit(ctx)
-}
-
-func (s *storageYDB) setSnapshotBackupFolder(
-	ctx context.Context,
-	session *persistence.Session,
-	folderID string,
-	generation string,
-	enabled bool,
-) error {
-	tx, err := session.BeginRWTransaction(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	state, err := s.getSnapshotBackupFolderTx(ctx, tx, folderID)
-	if err != nil {
-		return err
-	}
-	if !enabled {
-		if state == nil || (generation != "" && generation != state.generation) {
-			return tx.Commit(ctx)
-		}
-		// Retain ownership until the old coordinator has finished its child.
-		_, err = tx.Execute(ctx, fmt.Sprintf(`
-            --!syntax_v1
-            pragma TablePathPrefix = "%v";
-            declare $folder as Utf8;
-            update backup_folders set enabled = false where folder_id = $folder;
-        `, s.snapshotsPath), persistence.ValueParam("$folder", persistence.UTF8Value(folderID)))
-	} else {
-		if state != nil {
-			if state.enabled {
-				return tx.Commit(ctx)
-			}
-			if state.coordinator != "" || state.activeOwner != "" || state.activePlan != "" {
-				return errors.NewInterruptExecutionError()
-			}
-			if state.generation == generation {
-				return errors.NewNonRetriableErrorf("re-enabling snapshot backup requires a new generation")
-			}
-		}
-		_, err = tx.Execute(ctx, fmt.Sprintf(`
-            --!syntax_v1
-            pragma TablePathPrefix = "%v";
-            declare $folder as Utf8;
-            declare $generation as Utf8;
-            upsert into backup_folders (folder_id, generation, enabled)
-            values ($folder, $generation, true);
-        `, s.snapshotsPath), persistence.ValueParam("$folder", persistence.UTF8Value(folderID)), persistence.ValueParam("$generation", persistence.UTF8Value(generation)))
-	}
-	if err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 
-func (s *storageYDB) ListSnapshotBackupFolders(ctx context.Context) ([]SnapshotBackupFolder, error) {
-	res, err := s.db.ExecuteRO(ctx, fmt.Sprintf(`
-        --!syntax_v1
-        pragma TablePathPrefix = "%v";
-        select folder_id, generation from backup_folders
-        where COALESCE(enabled, false) order by folder_id;
-    `, s.snapshotsPath))
-	if err != nil {
-		return nil, err
+// backupTaskID is the durable CP task identity, not a user or a TTL lock.
+// Repeating acquisition resumes its hold; stale cancellation cannot clear it.
+func (s *storageYDB) ClaimSnapshotBackupPlan(ctx context.Context, backupTaskID string) error {
+	if backupTaskID == "" {
+		return errors.NewNonRetriableErrorf("empty snapshot backup task ID")
 	}
-	defer res.Close()
-	var folders []SnapshotBackupFolder
-	for res.NextResultSet(ctx) {
-		for res.NextRow() {
-			var f SnapshotBackupFolder
-			err = res.ScanNamed(persistence.OptionalWithDefault("folder_id", &f.FolderID), persistence.OptionalWithDefault("generation", &f.Generation))
-			if err != nil {
-				return nil, err
-			}
-			folders = append(folders, f)
-		}
-	}
-	return folders, res.Err()
-}
-
-func (s *storageYDB) ListSnapshotBackupCandidates(
-	ctx context.Context,
-	folderID string,
-	afterID string,
-	limit int,
-) ([]string, error) {
-	if folderID == "" || limit <= 0 || limit > 1000 {
-		return nil, errors.NewNonRetriableErrorf("invalid snapshot backfill page")
-	}
-	res, err := s.db.ExecuteRO(ctx, fmt.Sprintf(`
-        --!syntax_v1
-        pragma TablePathPrefix = "%v";
-        declare $folder as Utf8;
-        declare $after as Utf8;
-        declare $ready as Int64;
-        declare $limit as Uint64;
-        select id from snapshots view folder_id_index
-        where folder_id = $folder and id > $after
-            and status = $ready and not COALESCE(backup_completed, false)
-        order by id limit $limit;
-    `, s.snapshotsPath), persistence.ValueParam("$folder", persistence.UTF8Value(folderID)),
-		persistence.ValueParam("$after", persistence.UTF8Value(afterID)),
-		persistence.ValueParam("$ready", persistence.Int64Value(int64(snapshotStatusReady))), persistence.ValueParam("$limit", persistence.Uint64Value(uint64(limit))))
-	if err != nil {
-		return nil, err
-	}
-	defer res.Close()
-	var ids []string
-	for res.NextResultSet(ctx) {
-		for res.NextRow() {
-			var id string
-			if err = res.ScanWithDefaults(&id); err != nil {
-				return nil, err
-			}
-			ids = append(ids, id)
-		}
-	}
-	return ids, res.Err()
+	return s.db.Execute(ctx, func(ctx context.Context, session *persistence.Session) error {
+		return s.claimSnapshotBackupPlan(ctx, session, backupTaskID)
+	})
 }
 
 func (s *storageYDB) ReserveSnapshotBackup(
 	ctx context.Context,
 	snapshotID string,
-	ownerID string,
-	coordinatorID string,
+	backupTaskID string,
 	neededByDependents bool,
 ) (meta *SnapshotMeta, err error) {
-	if ownerID == "" || coordinatorID == "" {
-		return nil, errors.NewNonRetriableErrorf("empty snapshot backup owner or coordinator")
+	if backupTaskID == "" {
+		return nil, errors.NewNonRetriableErrorf("empty snapshot backup task ID")
 	}
 	err = s.db.Execute(ctx, func(ctx context.Context, session *persistence.Session) error {
 		var err error
-		meta, err = s.reserveSnapshotBackup(ctx, session, snapshotID, ownerID, coordinatorID, neededByDependents)
+		meta, err = s.reserveSnapshotBackup(ctx, session, snapshotID, backupTaskID, neededByDependents)
 		return err
 	})
 	return meta, err
 }
 
-func (s *storageYDB) HoldSnapshotBackupPlan(ctx context.Context, snapshotID, ownerID, coordinatorID string) (meta *SnapshotMeta, err error) {
-	if snapshotID == "" || ownerID == "" || coordinatorID == "" {
-		return nil, errors.NewNonRetriableErrorf("empty snapshot backup plan owner")
+func (s *storageYDB) HoldSnapshotBackupPlan(ctx context.Context, snapshotID, backupTaskID string) (meta *SnapshotMeta, err error) {
+	if snapshotID == "" || backupTaskID == "" {
+		return nil, errors.NewNonRetriableErrorf("empty snapshot backup plan task ID")
 	}
 	err = s.db.Execute(ctx, func(ctx context.Context, session *persistence.Session) error {
 		var err error
-		meta, err = s.holdSnapshotBackupPlan(ctx, session, snapshotID, ownerID, coordinatorID)
+		meta, err = s.holdSnapshotBackupPlan(ctx, session, snapshotID, backupTaskID)
 		return err
 	})
 	return meta, err
 }
 
-// The coordinator cannot be replaced until every saved graph hold is released.
-func (s *storageYDB) FinishSnapshotBackupPlan(ctx context.Context, folderID, ownerID string) error {
-	if folderID == "" || ownerID == "" {
-		return errors.NewNonRetriableErrorf("empty snapshot backup plan identity")
+// Release the queue slot only after all saved graph holds have been released.
+func (s *storageYDB) FinishSnapshotBackupPlan(ctx context.Context, backupTaskID string) error {
+	if backupTaskID == "" {
+		return errors.NewNonRetriableErrorf("empty snapshot backup task ID")
 	}
 	return s.db.Execute(ctx, func(ctx context.Context, session *persistence.Session) error {
-		return s.finishSnapshotBackupPlan(ctx, session, folderID, ownerID)
+		return s.finishSnapshotBackupPlan(ctx, session, backupTaskID)
 	})
 }
 
 // A completed copy releases both holds after DP cleanup. A pruned plan node
 // releases only its preparation hold. Stale owners cannot clear either hold.
-func (s *storageYDB) ReleaseSnapshotBackup(ctx context.Context, snapshotID, ownerID string, completed bool) error {
-	if snapshotID == "" || ownerID == "" {
-		return errors.NewNonRetriableErrorf("empty snapshot backup owner")
+func (s *storageYDB) ReleaseSnapshotBackup(ctx context.Context, snapshotID, backupTaskID string, completed bool) error {
+	if snapshotID == "" || backupTaskID == "" {
+		return errors.NewNonRetriableErrorf("empty snapshot backup task ID")
 	}
 	_, err := s.db.ExecuteRW(ctx, fmt.Sprintf(`
-        --!syntax_v1
-        pragma TablePathPrefix = "%v";
-        declare $id as Utf8;
-        declare $owner as Utf8;
-        declare $completed as Bool;
-        $copy_owned = select id, folder_id from snapshots where id = $id and backup_task_id = $owner;
-        $owned = select id, folder_id from snapshots where id = $id
-            and (backup_task_id = $owner or backup_plan_id = $owner)
-            and (COALESCE(backup_task_id, "") = "" or backup_task_id = $owner)
-            and (COALESCE(backup_plan_id, "") = "" or backup_plan_id = $owner);
-        update snapshots set backup_task_id = "", backup_plan_id = "",
-            backup_completed = COALESCE(backup_completed, false) or $completed
-            where id in (select id from $owned);
-        update backup_folders set active_owner = "" where folder_id in (select folder_id from $copy_owned) and active_owner = $owner;
-        delete from backup_queue where snapshot_id in (select id from $owned);
-    `, s.snapshotsPath), persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)), persistence.ValueParam("$owner", persistence.UTF8Value(ownerID)), persistence.ValueParam("$completed", persistence.BoolValue(completed)))
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $id as Utf8;
+		declare $backup_task_id as Utf8;
+		declare $completed as Bool;
+		$owned = select id from snapshots where id = $id
+		and (backup_task_id = $backup_task_id or backup_plan_id = $backup_task_id)
+		and (COALESCE(backup_task_id, "") = "" or backup_task_id = $backup_task_id)
+		and (COALESCE(backup_plan_id, "") = "" or backup_plan_id = $backup_task_id);
+		update snapshots set backup_task_id = "", backup_plan_id = "",
+		backup_completed = COALESCE(backup_completed, false) or ($completed and backup_task_id = $backup_task_id)
+		where id in (select id from $owned);
+		delete from backup_queue where snapshot_id in (select id from $owned);
+    `, s.snapshotsPath), persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)), persistence.ValueParam("$backup_task_id", persistence.UTF8Value(backupTaskID)), persistence.ValueParam("$completed", persistence.BoolValue(completed)))
 	return err
-}
-
-func (s *storageYDB) ClaimSnapshotBackupFolder(ctx context.Context, folderID, generation, taskID string) (claimed bool, err error) {
-	if folderID == "" || generation == "" || taskID == "" {
-		return false, errors.NewNonRetriableErrorf("invalid snapshot backup folder owner")
-	}
-	err = s.db.Execute(ctx, func(ctx context.Context, session *persistence.Session) error {
-		var err error
-		claimed, err = s.claimSnapshotBackupFolder(ctx, session, folderID, generation, taskID)
-		return err
-	})
-	return claimed, err
-}
-
-func (s *storageYDB) ReleaseSnapshotBackupFolder(ctx context.Context, folderID, taskID string) error {
-	_, err := s.db.ExecuteRW(ctx, fmt.Sprintf(`
-        --!syntax_v1
-        pragma TablePathPrefix = "%v";
-        declare $folder as Utf8;
-        declare $task as Utf8;
-        update backup_folders set coordinator_task_id = ""
-        where folder_id = $folder and coordinator_task_id = $task
-            and COALESCE(active_owner, "") = "" and COALESCE(active_plan, "") = "";
-    `, s.snapshotsPath), persistence.ValueParam("$folder", persistence.UTF8Value(folderID)), persistence.ValueParam("$task", persistence.UTF8Value(taskID)))
-	return err
-}
-
-func (s *storageYDB) SetSnapshotBackupFolder(ctx context.Context, folderID, generation string, enabled bool) error {
-	if folderID == "" || (enabled && generation == "") {
-		return errors.NewNonRetriableErrorf("invalid snapshot backup folder selection")
-	}
-	return s.db.Execute(ctx, func(ctx context.Context, session *persistence.Session) error {
-		return s.setSnapshotBackupFolder(ctx, session, folderID, generation, enabled)
-	})
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
 func createSnapshotBackupTables(ctx context.Context, folder string, db *persistence.YDBClient, dropUnusedColumns bool) error {
-	return db.CreateOrAlterTable(ctx, folder, "backup_folders", persistence.NewCreateTableDescription(
-		persistence.WithColumn("folder_id", persistence.Optional(persistence.TypeUTF8)),
-		persistence.WithColumn("generation", persistence.Optional(persistence.TypeUTF8)),
-		persistence.WithColumn("enabled", persistence.Optional(persistence.TypeBool)),
-		persistence.WithColumn("active_owner", persistence.Optional(persistence.TypeUTF8)),
-		persistence.WithColumn("active_plan", persistence.Optional(persistence.TypeUTF8)),
-		persistence.WithColumn("coordinator_task_id", persistence.Optional(persistence.TypeUTF8)),
-		persistence.WithPrimaryKeyColumn("folder_id"),
+	return db.CreateOrAlterTable(ctx, folder, "backup_plan", persistence.NewCreateTableDescription(
+		persistence.WithColumn("id", persistence.Optional(persistence.TypeUTF8)),
+		persistence.WithColumn("task_id", persistence.Optional(persistence.TypeUTF8)),
+		persistence.WithPrimaryKeyColumn("id"),
 	), dropUnusedColumns)
 }

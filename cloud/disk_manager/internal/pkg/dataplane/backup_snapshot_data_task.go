@@ -1,7 +1,6 @@
 package dataplane
 
 import (
-	"bytes"
 	"context"
 
 	"github.com/golang/protobuf/proto"
@@ -9,7 +8,6 @@ import (
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/backup"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/protos"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage"
-	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/chunks"
 	"github.com/ydb-platform/nbs/cloud/tasks"
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
 	"github.com/ydb-platform/nbs/cloud/tasks/logging"
@@ -199,21 +197,6 @@ func (t *backupSnapshotDataTask) enqueueBatch(
 	return execCtx.SaveState(ctx)
 }
 
-// A completed dependency guarantees its own immutable chunks are already
-// present in the same follower. Unknown or removed creators use this source.
-func (t *backupSnapshotDataTask) chunkHasCompletedDependency(chunkID string) bool {
-	creator := storage.GetSnapshotIDFromChunkID(chunkID)
-	if creator == "" || creator == t.request.SnapshotId {
-		return false
-	}
-	for _, id := range t.request.CompletedSnapshotIds {
-		if id == creator {
-			return true
-		}
-	}
-	return false
-}
-
 func (t *backupSnapshotDataTask) enqueueChunks(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
@@ -245,9 +228,9 @@ func (t *backupSnapshotDataTask) enqueueChunks(
 			return err
 		}
 
-		// Copy this snapshot's chunks and chunks without a completed creator.
-		// Other creators are durable task dependencies completed before Run.
-		if len(entry.ChunkID) == 0 || t.chunkHasCompletedDependency(entry.ChunkID) {
+		// Completed creators already have their entire copy in the follower.
+		// Missing/deleting creators without that confirmation are copied here.
+		if len(entry.ChunkID) == 0 || t.creatorCompleted(entry.ChunkID) {
 			continue
 		}
 
@@ -306,7 +289,7 @@ func (t *backupSnapshotDataTask) backupChunkMap(
 		}
 		return err
 	}
-	chunkMap, err := t.buildVerifiedChunkMap(ctx, execCtx, meta)
+	chunkMap, err := t.buildChunkMap(ctx, execCtx, meta)
 	if err != nil {
 		return err
 	}
@@ -342,23 +325,16 @@ func retrySnapshotBackupError(err error) error {
 	return errors.NewRetriableErrorWithIgnoreRetryLimitf("snapshot backup waits for recovery: %v", err)
 }
 
-// Build the full map from the held source. Publish it only when every
-// referenced target chunk matches its source data and metadata.
-func (t *backupSnapshotDataTask) buildVerifiedChunkMap(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-	meta storage.SnapshotMeta,
+// The source stays held until all queued chunks have completed and the full
+// map is published. Dependency ordering never changes the source map.
+func (t *backupSnapshotDataTask) buildChunkMap(
+	ctx context.Context, execCtx tasks.ExecutionContext, meta storage.SnapshotMeta,
 ) (*protos.BackupChunkMap, error) {
-
 	owner := t.ownerID(execCtx)
 	if err := t.storage.CheckSnapshotBackupOwner(ctx, meta.ID, owner); err != nil {
 		return nil, err
 	}
-	chunkMap := &protos.BackupChunkMap{
-		ChunkIds: make([]string, meta.ChunkCount),
-	}
-	verified := make(map[string]struct{})
-	requeued := false
+	chunkMap := &protos.BackupChunkMap{ChunkIds: make([]string, meta.ChunkCount)}
 	readCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	entries, readErrors := t.storage.ReadChunkMap(readCtx, meta.ID, 0)
@@ -367,18 +343,6 @@ func (t *backupSnapshotDataTask) buildVerifiedChunkMap(
 			return nil, err
 		}
 		chunkMap.ChunkIds[entry.ChunkIndex] = entry.ChunkID
-		if entry.ChunkID == "" || t.chunkHasCompletedDependency(entry.ChunkID) {
-			continue
-		}
-		if _, ok := verified[entry.ChunkID]; ok {
-			continue
-		}
-		matches, err := t.verifyChunk(ctx, owner, entry)
-		if err != nil {
-			return nil, err
-		}
-		requeued = requeued || !matches
-		verified[entry.ChunkID] = struct{}{}
 	}
 	if err := <-readErrors; err != nil {
 		return nil, err
@@ -386,42 +350,18 @@ func (t *backupSnapshotDataTask) buildVerifiedChunkMap(
 	if err := t.storage.CheckSnapshotBackupOwner(ctx, meta.ID, owner); err != nil {
 		return nil, err
 	}
-	if requeued {
-		return nil, errors.NewInterruptExecutionError()
-	}
 	return chunkMap, nil
 }
 
-func (t *backupSnapshotDataTask) verifyChunk(
-	ctx context.Context,
-	owner string,
-	entry storage.ChunkMapEntry,
-) (bool, error) {
-
-	blob, err := t.storage.ReadChunkBlob(ctx, entry.ChunkID, entry.StoredInS3)
-	if err != nil {
-		return false, err
+func (t *backupSnapshotDataTask) creatorCompleted(chunkID string) bool {
+	creator := storage.GetSnapshotIDFromChunkID(chunkID)
+	if creator == "" || creator == t.request.SnapshotId {
+		return false
 	}
-	target, err := t.backupS3.GetObject(ctx, backup.ChunkKey(entry.ChunkID))
-	if err != nil && errors.Is(err, errors.NewEmptyRetriableError()) {
-		return false, err
-	}
-	wanted := chunks.NewS3Object(blob)
-	matches := err == nil && bytes.Equal(wanted.Data, target.Data)
-	for key, value := range wanted.Metadata {
-		actual := target.Metadata[key]
-		if value == nil || actual == nil || *actual != *value {
-			matches = false
+	for _, id := range t.request.CompletedSnapshotIds {
+		if creator == id {
+			return true
 		}
 	}
-	if matches {
-		return true, nil
-	}
-	err = t.storage.RequeueBackupChunk(ctx, owner, storage.BackupChunkQueueEntry{
-		SnapshotID:   t.request.SnapshotId,
-		ChunkID:      entry.ChunkID,
-		StoredInS3:   entry.StoredInS3,
-		EncryptedDEK: t.request.EncryptedDek,
-	})
-	return false, err
+	return false
 }

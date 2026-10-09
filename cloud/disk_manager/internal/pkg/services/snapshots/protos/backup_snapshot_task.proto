@@ -12,26 +12,23 @@ message BackupSnapshotRequest {
     string SnapshotId = 1;
     string BackupId = 2;
     bytes EncryptedDek = 3;
-    string CoordinatorId = 4;
-    reserved 5;
 }
 
+// CP coordinates the graph; dataplane.BackupSnapshotData copies one source.
 message BackupSnapshotTaskState {
+    // Exact request and child ID survive an interrupted ScheduleTask/SaveState.
     string DataplaneTaskID = 1;
-    bytes EncryptedDek = 2;
     dataplane.BackupSnapshotDataRequest DataplaneRequest = 3;
     bool Finished = 4;
-    reserved 5 to 9;
-    repeated string CompletedSnapshotIds = 10;
-    reserved 11;
-    bool GraphPrepared = 12;
+
     repeated SnapshotBackupNode Nodes = 13;
-    uint32 DiscoveryIndex = 14;
+    bool GraphPrepared = 12;
     string ReaderSnapshotId = 15;
     string ReaderTaskId = 16;
-    repeated string CopyOrder = 17;
     uint32 CopyIndex = 18;
-    string FolderId = 19;
+
+    // Removed duplicate DEK, completion list and derived traversal/order.
+    reserved 2, 10, 14, 17;
 }
 
 message BackupSnapshotResponse {

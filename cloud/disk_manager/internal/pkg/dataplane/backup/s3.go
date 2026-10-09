@@ -161,10 +161,6 @@ func (s *S3) PutObject(
 	})
 }
 
-func (s *S3) ObjectExists(ctx context.Context, key string) (bool, error) {
-	return s.s3.ObjectExists(ctx, s.bucket, s.Key(key))
-}
-
 func (s *S3) GetObject(
 	ctx context.Context,
 	key string,

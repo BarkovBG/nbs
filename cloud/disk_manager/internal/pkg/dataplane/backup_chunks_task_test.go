@@ -222,32 +222,3 @@ func TestBackupChunksTaskCancellationRetriesClaimCleanupFailure(t *testing.T) {
 	require.False(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
 	storage.AssertExpectations(t)
 }
-
-func TestBackupChunksTaskVerifiesExistingFollowerContent(t *testing.T) {
-	ctx := test.NewContext()
-	storage, closeFunc := newStorage(t, ctx)
-	defer closeFunc()
-	follower := newTestFollower(t, ctx)
-	chunkID := createSnapshotWithChunk(t, ctx, storage, "snapshot")
-	require.NoError(t, follower.backupS3.PutObject(ctx, backup.ChunkKey(chunkID), follower.encryptedDEK,
-		chunks.NewS3Object(chunks.ChunkBlob{Data: []byte("wrong"), Checksum: 1})))
-	task := newBackupChunksTask(storage, follower)
-	entry := snapshot_storage.BackupChunkQueueEntry{SnapshotID: "snapshot", ChunkID: chunkID, StoredInS3: true, EncryptedDEK: follower.encryptedDEK}
-	require.NoError(t, task.copyChunk(ctx, entry))
-	blob, err := storage.ReadChunkBlob(ctx, chunkID, true)
-	require.NoError(t, err)
-	object, err := follower.getObject(ctx, backup.ChunkKey(chunkID))
-	require.NoError(t, err)
-	require.Equal(t, blob.Data, object.Data)
-	rawBefore, err := follower.getRawObject(ctx, backup.ChunkKey(chunkID))
-	require.NoError(t, err)
-	anotherDEK, err := follower.backupS3.NewEncryptedDEK()
-	require.NoError(t, err)
-	entry.EncryptedDEK = anotherDEK
-	require.NoError(t, task.copyChunk(ctx, entry))
-	rawAfter, err := follower.getRawObject(ctx, backup.ChunkKey(chunkID))
-	require.NoError(t, err)
-	// A verified shared object retains its own envelope, independently of the
-	// current resource's DEK; matching data is not rewritten.
-	require.Equal(t, rawBefore, rawAfter)
-}

@@ -229,14 +229,10 @@ type Storage interface {
 		creatingBefore time.Time,
 	) ([]string, error)
 
-	ClaimSnapshotBackupFolder(ctx context.Context, folderID, generation, taskID string) (bool, error)
-	ReleaseSnapshotBackupFolder(ctx context.Context, folderID, taskID string) error
-	SetSnapshotBackupFolder(ctx context.Context, folderID, generation string, enabled bool) error
-	ListSnapshotBackupFolders(ctx context.Context) ([]SnapshotBackupFolder, error)
-	ListSnapshotBackupCandidates(ctx context.Context, folderID, afterID string, limit int) ([]string, error)
-	ReserveSnapshotBackup(ctx context.Context, snapshotID, ownerID, coordinatorID string, neededByDependents bool) (*SnapshotMeta, error)
-	HoldSnapshotBackupPlan(ctx context.Context, snapshotID, ownerID, coordinatorID string) (*SnapshotMeta, error)
-	FinishSnapshotBackupPlan(ctx context.Context, folderID, ownerID string) error
+	ClaimSnapshotBackupPlan(ctx context.Context, backupTaskID string) error
+	ReserveSnapshotBackup(ctx context.Context, snapshotID, backupTaskID string, neededByDependents bool) (*SnapshotMeta, error)
+	HoldSnapshotBackupPlan(ctx context.Context, snapshotID, backupTaskID string) (*SnapshotMeta, error)
+	FinishSnapshotBackupPlan(ctx context.Context, backupTaskID string) error
 	ReleaseSnapshotBackup(ctx context.Context, snapshotID, ownerID string, completed bool) error
 
 	EnqueueSnapshotBackup(
@@ -250,13 +246,10 @@ type Storage interface {
 		limit int,
 	) ([]SnapshotBackupRequest, error)
 
-	SnapshotBackupScheduled(
-		ctx context.Context,
-		snapshotID string,
-		backupID string,
-	) error
+	// Queue cleanup is not proof of a completed copy. ReleaseSnapshotBackup
+	// records success only for the task that owns the source hold.
 
-	SnapshotBackupCancelled(
+	RemoveSnapshotFromBackupQueue(
 		ctx context.Context,
 		snapshotID string,
 		backupID string,

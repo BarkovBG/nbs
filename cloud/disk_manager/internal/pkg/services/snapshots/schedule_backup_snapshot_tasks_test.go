@@ -26,30 +26,30 @@ func TestScheduleBackupSnapshotTasks(t *testing.T) {
 	scheduler := tasks_mocks.NewSchedulerMock()
 	execCtx := tasks_mocks.NewExecutionContextMock()
 
-	storage.On("ListSnapshotBackupFolders", mock.Anything).Return(
-		[]resources.SnapshotBackupFolder{
-			{FolderID: "folder1", Generation: "first"},
-			{FolderID: "folder2", Generation: "generation"},
-		},
+	storage.On("ListSnapshotsToBackup", mock.Anything, 2).Return(
+		[]resources.SnapshotBackupRequest{{SnapshotID: "snap1"}, {SnapshotID: "snap2", BackupID: "attempt"}},
 		nil,
 	)
 
-	for _, backup := range []resources.SnapshotBackupFolder{
-		{FolderID: "folder1", Generation: "first"},
-		{FolderID: "folder2", Generation: "generation"},
-	} {
-		id := backup.FolderID
-		backupID := backup.Generation
-		key := "backup_snapshot_folder_" + id + "_" + backupID
+	for _, snapshotID := range []string{"snap1", "snap2"} {
+		id := snapshotID
 		scheduler.On(
 			"ScheduleTask",
 			mock.MatchedBy(func(ctx context.Context) bool {
+				key := "backup_snapshot_" + id
+				if id == "snap2" {
+					key += "_attempt"
+				}
 				return headers.GetIdempotencyKey(ctx) == key
 			}),
-			"snapshots.BackupFolder",
+			"snapshots.BackupSnapshot",
 			"",
-			mock.MatchedBy(func(request *protos.BackupFolderRequest) bool {
-				return request.FolderId == id && request.Generation == backupID
+			mock.MatchedBy(func(request *protos.BackupSnapshotRequest) bool {
+				attempt := ""
+				if id == "snap2" {
+					attempt = "attempt"
+				}
+				return request.SnapshotId == id && request.BackupId == attempt
 			}),
 		).Return(id+"_task", nil)
 	}
@@ -57,6 +57,7 @@ func TestScheduleBackupSnapshotTasks(t *testing.T) {
 	task := &scheduleBackupSnapshotTasks{
 		scheduler: scheduler,
 		storage:   storage,
+		limit:     2,
 	}
 
 	err := task.Run(ctx, execCtx)

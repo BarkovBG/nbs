@@ -245,7 +245,7 @@ func snapshotStateTableDescription() persistence.CreateTableDescription {
 		persistence.WithColumn("backup_plan_id", persistence.Optional(persistence.TypeUTF8)),
 		persistence.WithColumn("status", persistence.Optional(persistence.TypeInt64)),
 		persistence.WithPrimaryKeyColumn("id"),
-		persistence.WithSecondaryKeyColumn("folder_id"),
+		persistence.WithSecondaryKeyColumn("backup_plan_id"),
 	)
 }
 
@@ -555,24 +555,7 @@ func (s *storageYDB) snapshotCreated(
 		return err
 	}
 
-	if s.backupEnabled {
-		_, err = tx.Execute(ctx, fmt.Sprintf(`
-			--!syntax_v1
-			pragma TablePathPrefix = "%v";
-			declare $snapshot_id as Utf8;
-            declare $folder_id as Utf8;
-
-			upsert into backup_queue (snapshot_id)
-            select $snapshot_id as snapshot_id from backup_folders
-            where folder_id = $folder_id and COALESCE(enabled, false)
-		`, s.snapshotsPath),
-			persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)),
-			persistence.ValueParam("$folder_id", persistence.UTF8Value(state.folderID)),
-		)
-		if err != nil {
-			return err
-		}
-	}
+	// Backup is opt-in through EnqueueSnapshotBackup; creation does not enqueue.
 
 	return tx.Commit(ctx)
 }
@@ -921,24 +904,14 @@ func (s *storageYDB) enqueueSnapshotBackup(
 	}
 
 	state := states[0]
+	if state.backupCompleted {
+		return tx.Commit(ctx)
+	}
 	if state.status != snapshotStatusReady {
 		return errors.NewNonRetriableErrorf(
 			"snapshot with id %v and status %v can't be backed up",
 			snapshotID,
 			snapshotStatusToString(state.status),
-		)
-	}
-	if state.backupCompleted {
-		return tx.Commit(ctx)
-	}
-	folder, err := s.getSnapshotBackupFolderTx(ctx, tx, state.folderID)
-	if err != nil {
-		return err
-	}
-	if folder == nil || !folder.enabled {
-		return errors.NewNonRetriableErrorf(
-			"snapshot backup is not enabled for folder %v",
-			state.folderID,
 		)
 	}
 
@@ -1031,41 +1004,15 @@ func (s *storageYDB) listSnapshotsToBackup(
 }
 
 func (s *storageYDB) finishSnapshotBackup(
-	ctx context.Context,
-	session *persistence.Session,
-	snapshotID string,
-	backupID string,
-	completed bool,
+	ctx context.Context, session *persistence.Session, snapshotID, backupID string,
 ) error {
-
 	_, err := session.ExecuteRW(ctx, fmt.Sprintf(`
-		--!syntax_v1
-		pragma TablePathPrefix = "%v";
-		declare $snapshot_id as Utf8;
-		declare $backup_id as Utf8;
-		declare $completed as Bool;
-
-		$ids = (
-			select snapshot_id as id from backup_queue
-            where snapshot_id = $snapshot_id
-                and snapshot_id in (select id from snapshots where COALESCE(backup_task_id, "") = "" and COALESCE(backup_plan_id, "") = "")
-				and COALESCE(backup_id, "") = $backup_id
-		);
-
-		update snapshots on
-		select id, true as backup_completed from $ids where $completed;
-
-		delete from backup_queue
-		where snapshot_id = $snapshot_id
-			and COALESCE(backup_id, "") = $backup_id
-	`, s.snapshotsPath),
-		persistence.ValueParam(
-			"$snapshot_id",
-			persistence.UTF8Value(snapshotID),
-		),
-		persistence.ValueParam("$backup_id", persistence.UTF8Value(backupID)),
-		persistence.ValueParam("$completed", persistence.BoolValue(completed)),
-	)
+  --!syntax_v1
+  pragma TablePathPrefix = "%v";
+  declare $snapshot_id as Utf8;
+  declare $backup_id as Utf8;
+  delete from backup_queue where snapshot_id = $snapshot_id and COALESCE(backup_id, "") = $backup_id;
+ `, s.snapshotsPath), persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)), persistence.ValueParam("$backup_id", persistence.UTF8Value(backupID)))
 	return err
 }
 
@@ -1231,7 +1178,7 @@ func (s *storageYDB) ListSnapshotsToBackup(
 	return backups, err
 }
 
-func (s *storageYDB) SnapshotBackupScheduled(
+func (s *storageYDB) RemoveSnapshotFromBackupQueue(
 	ctx context.Context,
 	snapshotID string,
 	backupID string,
@@ -1245,27 +1192,6 @@ func (s *storageYDB) SnapshotBackupScheduled(
 				session,
 				snapshotID,
 				backupID,
-				true,
-			)
-		},
-	)
-}
-
-func (s *storageYDB) SnapshotBackupCancelled(
-	ctx context.Context,
-	snapshotID string,
-	backupID string,
-) error {
-
-	return s.db.Execute(
-		ctx,
-		func(ctx context.Context, session *persistence.Session) error {
-			return s.finishSnapshotBackup(
-				ctx,
-				session,
-				snapshotID,
-				backupID,
-				false,
 			)
 		},
 	)
@@ -1389,7 +1315,7 @@ func dropSnapshotsYDBTables(
 	}
 	logging.Info(ctx, "Dropped backup_queue table")
 
-	err = db.DropTable(ctx, folder, "backup_folders")
+	err = db.DropTable(ctx, folder, "backup_plan")
 	if err != nil {
 		return err
 	}

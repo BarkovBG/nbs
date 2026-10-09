@@ -229,9 +229,8 @@ func newBackupSnapshotCmd(
 
 	cmd := &cobra.Command{
 		Use:   "backup",
-		Short: "Enqueue a snapshot backup in an enabled folder; repeated requests are successful",
-		Long: "Enable the folder with snapshots backup-folder --folder-id <id> first. " +
-			"Enqueue a snapshot backup and return OK without waiting for completion. " +
+		Short: "Enqueue a snapshot and its dependencies; repeated requests are successful",
+		Long: "Enqueue a snapshot backup and return OK without waiting for completion. " +
 			"Use snapshots get --id <id> to check backup_completed: true means " +
 			"the backup task completed successfully; false means no recorded success " +
 			"and does not distinguish pending, failed, or never requested backups.",
@@ -248,65 +247,6 @@ func newBackupSnapshotCmd(
 	)
 	if err := cmd.MarkFlagRequired("id"); err != nil {
 		log.Fatalf("Error setting flag id as required: %v", err)
-	}
-	return cmd
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
-type backupSnapshotFolder struct {
-	clientConfig *client_config.ClientConfig
-	serverConfig *server_config.ServerConfig
-	folderID     string
-	disable      bool
-}
-
-func (c *backupSnapshotFolder) run() error {
-	if len(c.folderID) == 0 {
-		return fmt.Errorf("folder ID is required")
-	}
-	if !c.disable && c.serverConfig.GetSnapshotStorageBackupConfig() == nil {
-		return fmt.Errorf("snapshot backup is not configured")
-	}
-	ctx := newContext(c.clientConfig)
-	resourceStorage, db, err := newResourceStorage(ctx, c.serverConfig)
-	if err != nil {
-		return err
-	}
-	defer db.Close(ctx)
-
-	generation := ""
-	if !c.disable {
-		generation = generateID()
-	}
-	err = resourceStorage.SetSnapshotBackupFolder(ctx, c.folderID, generation, !c.disable)
-	if err != nil {
-		return err
-	}
-	fmt.Println("OK")
-	return nil
-}
-
-func newBackupSnapshotFolderCmd(
-	clientConfig *client_config.ClientConfig,
-	serverConfig *server_config.ServerConfig,
-) *cobra.Command {
-
-	c := &backupSnapshotFolder{clientConfig: clientConfig, serverConfig: serverConfig}
-	cmd := &cobra.Command{
-		Use:   "backup-folder",
-		Short: "Enable sequential backup of ready snapshots in a folder",
-		Long: "Enable backup of existing and newly ready snapshots and return OK " +
-			"without waiting for copying. Repeated enable requests are successful. " +
-			"Use snapshots get --id <id> to check backup_completed and backup_task_id. " +
-			"With --disable, stop admitting new copies and let the accepted copy finish. " +
-			"Re-enabling waits until the previous coordinator releases the folder.",
-		RunE: func(cmd *cobra.Command, args []string) error { return c.run() },
-	}
-	cmd.Flags().StringVar(&c.folderID, "folder-id", "", "ID of folder to back up; required")
-	cmd.Flags().BoolVar(&c.disable, "disable", false, "Stop accepting new snapshot backups")
-	if err := cmd.MarkFlagRequired("folder-id"); err != nil {
-		log.Fatalf("Error setting flag folder-id as required: %v", err)
 	}
 	return cmd
 }
@@ -568,7 +508,6 @@ func newSnapshotsCmd(
 		newGetSnapshotCmd(clientConfig, serverConfig),
 		newListSnapshotsCmd(clientConfig, serverConfig),
 		newBackupSnapshotCmd(clientConfig, serverConfig),
-		newBackupSnapshotFolderCmd(clientConfig, serverConfig),
 		newCreateSnapshotCmd(clientConfig),
 		newDeleteSnapshotCmd(clientConfig),
 		newScheduleMigrateSnapshotTaskCmd(
