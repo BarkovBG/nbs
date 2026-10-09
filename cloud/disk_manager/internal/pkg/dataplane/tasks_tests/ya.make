@@ -6,7 +6,7 @@ INCLUDE(${ARCADIA_ROOT}/cloud/disk_manager/test/recipe/recipe.inc)
 GO_TEST_SRCS(
     ../backup_chunks_task_test.go
     ../backup_snapshot_data_task_test.go
-    ../lock_snapshot_for_backup_task_test.go
+    ../list_snapshot_chunk_creators_task_test.go
     ../delete_snapshot_data_task_test.go
 )
 

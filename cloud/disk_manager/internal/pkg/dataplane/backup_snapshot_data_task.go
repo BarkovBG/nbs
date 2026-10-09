@@ -16,8 +16,8 @@ import (
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// The source is held by the caller's dataplane.LockSnapshotForBackup task for
-// the whole copy, so this task takes no reference of its own.
+// Holds a reference to the snapshot for the whole copy, so the snapshot and
+// the chunks it uses stay until the copy ends.
 type backupSnapshotDataTask struct {
 	storage   storage.Storage
 	backupS3  *backup.S3
@@ -55,7 +55,7 @@ func (t *backupSnapshotDataTask) Cancel(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	return retrySnapshotBackupError(t.clearChunks(ctx))
+	return retrySnapshotBackupError(t.finish(ctx, execCtx))
 }
 
 func (t *backupSnapshotDataTask) GetMetadata(
@@ -66,7 +66,7 @@ func (t *backupSnapshotDataTask) GetMetadata(
 }
 
 func (t *backupSnapshotDataTask) GetResponse() proto.Message {
-	return &empty.Empty{}
+	return &protos.BackupSnapshotDataResponse{Skipped: t.state.Skipped}
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -77,13 +77,29 @@ func (t *backupSnapshotDataTask) run(
 ) error {
 
 	if t.state.Finished {
-		return t.clearChunks(ctx)
+		return t.finish(ctx, execCtx)
+	}
+
+	// The reference blocks deletion, so a repeated hold of an accepted copy
+	// succeeds too.
+	held, err := t.storage.HoldSnapshotForBackup(
+		ctx,
+		t.request.SnapshotId,
+		execCtx.GetTaskID(),
+	)
+	if err != nil {
+		return err
+	}
+
+	if !held {
+		t.state.Skipped = true
+		return execCtx.SaveState(ctx)
 	}
 
 	// A DEK that cannot be opened fails the chunk copier on every
 	// chunk and leaves those queue rows unfinished, so this task
 	// interrupts forever. Reject it before anything is enqueued.
-	err := t.backupS3.CheckEncryptedDEK(t.request.EncryptedDek)
+	err = t.backupS3.CheckEncryptedDEK(t.request.EncryptedDek)
 	if err != nil {
 		return err
 	}
@@ -123,11 +139,29 @@ func (t *backupSnapshotDataTask) run(
 		return err
 	}
 
-	return t.clearChunks(ctx)
+	return t.finish(ctx, execCtx)
 }
 
-// Removes the queued and completed chunk entries of the snapshot: the copy is
-// complete, or cancelled and must be copied again by its next attempt.
+// Clears the chunk entries of the snapshot and drops the reference. A copy
+// ends this way both on success and on cancellation; a cancelled copy is
+// enqueued again by its next attempt.
+func (t *backupSnapshotDataTask) finish(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
+
+	err := t.clearChunks(ctx)
+	if err != nil {
+		return err
+	}
+
+	return t.storage.ReleaseSnapshotForBackup(
+		ctx,
+		t.request.SnapshotId,
+		execCtx.GetTaskID(),
+	)
+}
+
 func (t *backupSnapshotDataTask) clearChunks(ctx context.Context) error {
 	for {
 		cleared, err := t.storage.ClearBackupChunks(

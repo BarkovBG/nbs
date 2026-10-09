@@ -280,20 +280,23 @@ func (s *storageYDB) HoldSnapshotForBackup(
 	ctx context.Context,
 	snapshotID string,
 	taskID string,
-) (err error) {
+) (held bool, err error) {
 
 	defer s.metrics.StatOperation("HoldSnapshotForBackup")(&err)
 
 	if len(taskID) == 0 {
-		return task_errors.NewNonRetriableErrorf("empty backup task ID")
+		return false, task_errors.NewNonRetriableErrorf("empty backup task ID")
 	}
 
-	return s.db.Execute(
+	err = s.db.Execute(
 		ctx,
 		func(ctx context.Context, session *persistence.Session) error {
-			return s.holdSnapshotForBackup(ctx, session, snapshotID, taskID)
+			var err error
+			held, err = s.holdSnapshotForBackup(ctx, session, snapshotID, taskID)
+			return err
 		},
 	)
+	return held, err
 }
 
 func (s *storageYDB) EnqueueBackupChunks(

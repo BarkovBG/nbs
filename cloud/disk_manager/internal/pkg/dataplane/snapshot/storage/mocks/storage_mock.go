@@ -241,10 +241,10 @@ func (s *StorageMock) HoldSnapshotForBackup(
 	ctx context.Context,
 	snapshotID string,
 	taskID string,
-) error {
+) (bool, error) {
 
 	args := s.Called(ctx, snapshotID, taskID)
-	return args.Error(0)
+	return args.Bool(0), args.Error(1)
 }
 
 func (s *StorageMock) ReleaseSnapshotForBackup(

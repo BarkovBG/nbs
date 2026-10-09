@@ -1525,11 +1525,11 @@ func (s *storageYDB) holdSnapshotForBackup(
 	session *persistence.Session,
 	snapshotID string,
 	taskID string,
-) error {
+) (bool, error) {
 
 	tx, err := session.BeginRWTransaction(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback(ctx)
 
@@ -1543,23 +1543,20 @@ func (s *storageYDB) holdSnapshotForBackup(
 		persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)),
 	)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer res.Close()
 
 	states, err := scanSnapshotStates(ctx, res)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err = res.Err(); err != nil {
-		return err
+		return false, err
 	}
 
 	if len(states) == 0 || states[0].status != snapshotStatusReady {
-		return task_errors.NewSilentNonRetriableErrorf(
-			"snapshot %v is not ready for backup",
-			snapshotID,
-		)
+		return false, tx.Commit(ctx)
 	}
 
 	_, err = tx.Execute(ctx, fmt.Sprintf(`
@@ -1574,10 +1571,10 @@ func (s *storageYDB) holdSnapshotForBackup(
 		persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)),
 	)
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	return tx.Commit(ctx)
+	return true, tx.Commit(ctx)
 }
 
 func (s *storageYDB) ReleaseSnapshotForBackup(
