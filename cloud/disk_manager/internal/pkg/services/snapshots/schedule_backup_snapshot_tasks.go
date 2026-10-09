@@ -55,10 +55,11 @@ func (t *scheduleBackupSnapshotTasks) Run(
 	}
 
 	for _, item := range backups {
-		idempotencyKey := fmt.Sprintf("backup_snapshot_%v", item.SnapshotID)
-		if item.BackupID != "" {
-			idempotencyKey += "_" + item.BackupID
-		}
+		idempotencyKey := fmt.Sprintf(
+			"backup_snapshot_%v_%v",
+			item.SnapshotID,
+			item.BackupID,
+		)
 
 		taskID, err := t.scheduler.ScheduleTask(
 			headers.SetIncomingIdempotencyKey(ctx, idempotencyKey),

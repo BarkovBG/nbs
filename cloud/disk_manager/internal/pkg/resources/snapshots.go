@@ -1033,7 +1033,7 @@ func (s *storageYDB) finishSnapshotBackup(
   pragma TablePathPrefix = "%v";
   declare $snapshot_id as Utf8;
   declare $backup_id as Utf8;
-  delete from backup_queue where snapshot_id = $snapshot_id and COALESCE(backup_id, "") = $backup_id;
+  delete from backup_queue where snapshot_id = $snapshot_id and backup_id = $backup_id;
  `, s.snapshotsPath), persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)), persistence.ValueParam("$backup_id", persistence.UTF8Value(backupID)))
 	return err
 }

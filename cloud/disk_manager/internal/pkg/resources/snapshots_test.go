@@ -585,10 +585,9 @@ func TestEnqueueSnapshotBackupAfterCancellation(t *testing.T) {
 	err = storage.EnqueueSnapshotBackup(ctx, "snapshot", "second")
 	require.NoError(t, err)
 
-	for _, backupID := range []string{"", "first"} {
-		err = storage.RemoveSnapshotFromBackupQueue(ctx, "snapshot", backupID)
-		require.NoError(t, err)
-		err = storage.RemoveSnapshotFromBackupQueue(ctx, "snapshot", backupID)
+	// A stale attempt cannot remove the row of the next one.
+	for i := 0; i != 2; i++ {
+		err = storage.RemoveSnapshotFromBackupQueue(ctx, "snapshot", "first")
 		require.NoError(t, err)
 	}
 	queue, err := storage.ListSnapshotsToBackup(ctx, 10)
