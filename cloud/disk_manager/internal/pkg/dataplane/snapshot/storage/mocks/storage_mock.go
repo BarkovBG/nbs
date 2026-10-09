@@ -387,10 +387,10 @@ func (s *StorageMock) ChunkBackupFailed(ctx context.Context, entry storage.Backu
 	return s.Called(ctx, entry).Error(0)
 }
 
-func (s *StorageMock) EnqueueBackupChunksForOwner(ctx context.Context, snapshotID, ownerID string, entries []storage.BackupChunkQueueEntry) error {
-	return s.Called(ctx, snapshotID, ownerID, entries).Error(0)
+func (s *StorageMock) EnqueueBackupChunksForTask(ctx context.Context, snapshotID, taskID string, entries []storage.BackupChunkQueueEntry) error {
+	return s.Called(ctx, snapshotID, taskID, entries).Error(0)
 }
 
-func (s *StorageMock) CheckSnapshotBackupOwner(ctx context.Context, snapshotID, ownerID string) error {
-	return s.Called(ctx, snapshotID, ownerID).Error(0)
+func (s *StorageMock) CheckSnapshotHeldForBackup(ctx context.Context, snapshotID, taskID string) error {
+	return s.Called(ctx, snapshotID, taskID).Error(0)
 }

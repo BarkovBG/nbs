@@ -50,10 +50,6 @@ func (t *backupSnapshotDataTask) Run(
 
 	err := t.holdSource(ctx, execCtx)
 	if err != nil {
-		// OwnerId means CP has already accepted and retained the source.
-		if t.request.OwnerId != "" {
-			return retrySnapshotBackupError(err)
-		}
 		return err
 	}
 
@@ -87,14 +83,10 @@ func (t *backupSnapshotDataTask) holdSource(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	err := t.backupS3.CheckEncryptedDEK(t.request.EncryptedDek)
-	if err != nil {
-		return err
-	}
 	return t.storage.HoldSnapshotForBackup(
 		ctx,
 		t.request.SnapshotId,
-		t.ownerID(execCtx),
+		execCtx.GetTaskID(),
 	)
 }
 
@@ -102,6 +94,10 @@ func (t *backupSnapshotDataTask) backupHeldSource(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
 ) error {
+
+	if err := t.backupS3.CheckEncryptedDEK(t.request.EncryptedDek); err != nil {
+		return err
+	}
 
 	meta, err := t.storage.CheckSnapshotReady(ctx, t.request.SnapshotId)
 	if err != nil {
@@ -143,7 +139,7 @@ func (t *backupSnapshotDataTask) finish(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	taskID := t.ownerID(execCtx)
+	taskID := execCtx.GetTaskID()
 	err := t.storage.DrainSnapshotBackup(
 		ctx,
 		t.request.SnapshotId,
@@ -152,10 +148,6 @@ func (t *backupSnapshotDataTask) finish(
 	)
 	if err != nil {
 		return err
-	}
-	// The graph lock task owns release of a CP-owned hold.
-	if t.request.OwnerId != "" {
-		return nil
 	}
 	return t.storage.ReleaseSnapshotForBackup(ctx, t.request.SnapshotId, taskID)
 }
@@ -186,10 +178,10 @@ func (t *backupSnapshotDataTask) enqueueBatch(
 ) error {
 
 	if len(batch) != 0 {
-		err := t.storage.EnqueueBackupChunksForOwner(
+		err := t.storage.EnqueueBackupChunksForTask(
 			ctx,
 			t.request.SnapshotId,
-			t.ownerID(execCtx),
+			execCtx.GetTaskID(),
 			batch,
 		)
 		if err != nil {
@@ -314,13 +306,6 @@ func (t *backupSnapshotDataTask) backupChunkMap(
 	return execCtx.SaveState(ctx)
 }
 
-func (t *backupSnapshotDataTask) ownerID(execCtx tasks.ExecutionContext) string {
-	if t.request.OwnerId != "" {
-		return t.request.OwnerId
-	}
-	return execCtx.GetTaskID()
-}
-
 func retrySnapshotBackupError(err error) error {
 	if err == nil || errors.Is(err, errors.NewInterruptExecutionError()) || errors.Is(err, errors.NewWrongGenerationError()) || errors.Is(err, context.Canceled) {
 		return err
@@ -334,8 +319,8 @@ func retrySnapshotBackupError(err error) error {
 func (t *backupSnapshotDataTask) buildChunkMap(
 	ctx context.Context, execCtx tasks.ExecutionContext, meta storage.SnapshotMeta,
 ) (*protos.BackupChunkMap, error) {
-	owner := t.ownerID(execCtx)
-	if err := t.storage.CheckSnapshotBackupOwner(ctx, meta.ID, owner); err != nil {
+	taskID := execCtx.GetTaskID()
+	if err := t.storage.CheckSnapshotHeldForBackup(ctx, meta.ID, taskID); err != nil {
 		return nil, err
 	}
 	chunkMap := &protos.BackupChunkMap{ChunkIds: make([]string, meta.ChunkCount)}
@@ -351,7 +336,7 @@ func (t *backupSnapshotDataTask) buildChunkMap(
 	if err := <-readErrors; err != nil {
 		return nil, err
 	}
-	if err := t.storage.CheckSnapshotBackupOwner(ctx, meta.ID, owner); err != nil {
+	if err := t.storage.CheckSnapshotHeldForBackup(ctx, meta.ID, taskID); err != nil {
 		return nil, err
 	}
 	return chunkMap, nil

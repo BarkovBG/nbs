@@ -733,7 +733,7 @@ func TestBackupSnapshotDataTaskFailsOnDeletedSnapshot(t *testing.T) {
 	require.Empty(t, queue)
 }
 
-func TestBackupSnapshotDataTaskRejectsBadDEK(t *testing.T) {
+func TestBackupSnapshotDataTaskRetainsItsReferenceOnBadDEK(t *testing.T) {
 	ctx := test.NewContext()
 
 	storage, closeFunc := newStorage(t, ctx)
@@ -747,26 +747,30 @@ func TestBackupSnapshotDataTaskRejectsBadDEK(t *testing.T) {
 	task.request.EncryptedDek = []byte("bad")
 
 	err := task.Run(ctx, execCtx)
-	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+	require.True(t, errors.Is(err, errors.NewEmptyRetriableError()))
+	require.NoError(t, storage.CheckSnapshotHeldForBackup(ctx, "snap1", "backup"))
 	require.Zero(t, task.state.MilestoneChunkIndex)
 
 	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
 	require.NoError(t, err)
 	require.Empty(t, queue)
+	require.NoError(t, task.Cancel(ctx, execCtx))
+	_, err = storage.DeletingSnapshot(ctx, "snap1", "delete")
+	require.NoError(t, err)
 }
 
-func TestBackupSnapshotDataTaskRetriesBadDEKForAcceptedCPOwner(t *testing.T) {
+func TestBackupSnapshotDataTaskRetriesBadDEKAfterTakingItsOwnReference(t *testing.T) {
 	ctx := test.NewContext()
 	storage := storage_mocks.NewStorageMock()
 	task := newBackupSnapshotDataTask(storage, newTestFollower(t, ctx), "snapshot")
-	task.request.OwnerId = "accepted"
+	storage.On("HoldSnapshotForBackup", ctx, "snapshot", "backup").Return(nil).Once()
 	task.request.EncryptedDek = []byte("bad")
 	err := task.Run(ctx, newBackupExecutionContext(ctx))
 	retriable := errors.NewEmptyRetriableError()
 	require.True(t, errors.As(err, &retriable))
 	require.True(t, retriable.IgnoreRetryLimit)
 	require.False(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
-	storage.AssertNotCalled(t, "HoldSnapshotForBackup", mock.Anything, mock.Anything, mock.Anything)
+	storage.AssertExpectations(t)
 }
 
 func TestBackupSnapshotDataTaskCancellationDrainsWorkers(t *testing.T) {

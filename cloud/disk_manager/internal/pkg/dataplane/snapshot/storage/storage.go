@@ -151,19 +151,18 @@ type Storage interface {
 
 	UnlockSnapshot(ctx context.Context, snapshotID string, lockTaskID string) error
 
-	// HoldSnapshotForBackup prevents deletion of a ready snapshot until the
-	// owning task releases it. The hold does not expire automatically.
+	// HoldSnapshotForBackup adds an idempotent (snapshotID, taskID) reference.
+	// Deletion waits for all references; they do not expire automatically.
 	HoldSnapshotForBackup(
 		ctx context.Context,
 		snapshotID string,
 		taskID string,
 	) error
 
-	// ReleaseSnapshotForBackup releases only the matching task's hold.
-	// Callers must retain it across retries and release it after success or
-	// cancellation, once all backup workers have stopped using the snapshot.
-	CheckSnapshotBackupOwner(ctx context.Context, snapshotID, ownerID string) error
+	CheckSnapshotHeldForBackup(ctx context.Context, snapshotID, taskID string) error
 
+	// ReleaseSnapshotForBackup removes only this task's reference, after its
+	// work and all registered workers have stopped using the snapshot.
 	ReleaseSnapshotForBackup(
 		ctx context.Context,
 		snapshotID string,
@@ -182,7 +181,7 @@ type Storage interface {
 
 	ListSnapshots(ctx context.Context) (tasks_common.StringSet, error)
 
-	EnqueueBackupChunksForOwner(ctx context.Context, snapshotID, ownerID string, entries []BackupChunkQueueEntry) error
+	EnqueueBackupChunksForTask(ctx context.Context, snapshotID, taskID string, entries []BackupChunkQueueEntry) error
 
 	EnqueueBackupChunks(
 		ctx context.Context,
