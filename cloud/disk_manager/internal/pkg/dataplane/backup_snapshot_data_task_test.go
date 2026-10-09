@@ -745,7 +745,6 @@ func TestBackupSnapshotDataTaskSkipsDeletedSnapshot(t *testing.T) {
 
 	err = task.Run(ctx, execCtx)
 	require.NoError(t, err)
-	require.True(t, task.GetResponse().(*protos.BackupSnapshotDataResponse).Skipped)
 
 	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
 	require.NoError(t, err)

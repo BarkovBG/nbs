@@ -102,25 +102,16 @@ func (t *backupSnapshotTask) run(
 		return err
 	}
 
-	response, err := t.scheduler.WaitTask(ctx, execCtx, taskID)
+	_, err = t.scheduler.WaitTask(ctx, execCtx, taskID)
 	if err != nil {
 		return err
 	}
 
-	typedResponse, ok := response.(*dataplane_protos.BackupSnapshotDataResponse)
-	if !ok {
-		return errors.NewNonRetriableErrorf(
-			"invalid backup snapshot data response type %T",
-			response,
-		)
-	}
-
-	// Skipped means deletion won before the copy took its hold.
-	if !typedResponse.Skipped {
-		err = t.storage.SnapshotBackupCompleted(ctx, t.request.SnapshotId)
-		if err != nil {
-			return err
-		}
+	// Marks only a ready snapshot: if deletion won before the copy took its
+	// hold, the snapshot is already deleting and the copy copied nothing.
+	err = t.storage.SnapshotBackupCompleted(ctx, t.request.SnapshotId)
+	if err != nil {
+		return err
 	}
 
 	return t.removeFromQueue(ctx)

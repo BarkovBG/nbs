@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/backup"
@@ -65,14 +66,15 @@ func newBackupSnapshotFixture(t *testing.T) *backupSnapshotFixture {
 	f.storage.On("GetSnapshotMeta", mock.Anything, "snapshot").Return(f.meta, nil).Maybe()
 	f.storage.On("SnapshotBackupCompleted", mock.Anything, "snapshot").Run(
 		func(mock.Arguments) {
-			f.meta.BackupCompleted = true
+			// Only a ready snapshot is marked.
+			f.meta.BackupCompleted = f.meta.BackupCompleted || f.meta.Ready
 		},
 	).Return(nil).Maybe()
 	f.storage.On("RemoveSnapshotFromBackupQueue", mock.Anything, "snapshot", "attempt").Return(nil).Maybe()
 	return f
 }
 
-func (f *backupSnapshotFixture) copy(skipped bool) {
+func (f *backupSnapshotFixture) copy() {
 	f.scheduler.On(
 		"ScheduleTask",
 		mock.Anything,
@@ -81,7 +83,7 @@ func (f *backupSnapshotFixture) copy(skipped bool) {
 		mock.Anything,
 	).Return("copy", nil).Once()
 	f.scheduler.On("WaitTask", mock.Anything, f.execCtx, "copy").Return(
-		&dataplane_protos.BackupSnapshotDataResponse{Skipped: skipped},
+		&empty.Empty{},
 		nil,
 	).Once()
 }
@@ -90,7 +92,7 @@ func (f *backupSnapshotFixture) copy(skipped bool) {
 
 func TestBackupSnapshotTask(t *testing.T) {
 	f := newBackupSnapshotFixture(t)
-	f.copy(false)
+	f.copy()
 
 	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
 	require.True(t, f.meta.BackupCompleted)
@@ -117,12 +119,19 @@ func TestBackupSnapshotTaskSkipsDeletingSnapshot(t *testing.T) {
 	f.storage.AssertCalled(t, "RemoveSnapshotFromBackupQueue", mock.Anything, "snapshot", "attempt")
 }
 
-func TestBackupSnapshotTaskSkipsSnapshotWhoseDeletionWonTheHold(t *testing.T) {
+func TestBackupSnapshotTaskDoesNotMarkSnapshotDeletedBeforeTheCopy(t *testing.T) {
 	f := newBackupSnapshotFixture(t)
-	f.copy(true)
+	f.scheduler.On("ScheduleTask", mock.Anything, "dataplane.BackupSnapshotData", "", mock.Anything).Run(
+		func(mock.Arguments) {
+			// Deleted while the copy waits to start: the copy copies nothing.
+			f.meta.Ready = false
+		},
+	).Return("copy", nil).Once()
+	f.scheduler.On("WaitTask", mock.Anything, f.execCtx, "copy").Return(&empty.Empty{}, nil).Once()
 
 	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
 	require.False(t, f.meta.BackupCompleted)
+	f.storage.AssertCalled(t, "RemoveSnapshotFromBackupQueue", mock.Anything, "snapshot", "attempt")
 }
 
 func TestBackupSnapshotTaskFinishesAcceptedCopyOfDeletingSnapshot(t *testing.T) {
@@ -131,14 +140,16 @@ func TestBackupSnapshotTaskFinishesAcceptedCopyOfDeletingSnapshot(t *testing.T) 
 		nil,
 		errors.NewInterruptExecutionError(),
 	).Once()
-	f.copy(false)
+	f.copy()
 
 	err := f.task.Run(f.ctx, f.execCtx)
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 
+	// The accepted copy finishes although the snapshot is being deleted;
+	// a deleting snapshot is not marked.
 	f.meta.Ready = false
 	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
-	require.True(t, f.meta.BackupCompleted)
+	require.False(t, f.meta.BackupCompleted)
 	f.scheduler.AssertExpectations(t)
 }
 
@@ -162,8 +173,6 @@ func TestBackupSnapshotTaskRestoresAcceptedRequestAndDEK(t *testing.T) {
 				EncryptedDek: dek,
 				Meta:         data,
 			}
-			f.meta.Ready = false
-
 			f.scheduler.On(
 				"ScheduleTask",
 				mock.Anything,
@@ -173,10 +182,7 @@ func TestBackupSnapshotTaskRestoresAcceptedRequestAndDEK(t *testing.T) {
 					return bytes.Equal(r.EncryptedDek, dek) && bytes.Equal(r.Meta, data)
 				}),
 			).Return("copy", nil).Once()
-			f.scheduler.On("WaitTask", mock.Anything, f.execCtx, "copy").Return(
-				&dataplane_protos.BackupSnapshotDataResponse{},
-				nil,
-			).Once()
+			f.scheduler.On("WaitTask", mock.Anything, f.execCtx, "copy").Return(&empty.Empty{}, nil).Once()
 
 			require.NoError(t, f.task.Run(f.ctx, f.execCtx))
 			require.True(t, f.meta.BackupCompleted)
@@ -212,10 +218,7 @@ func TestBackupSnapshotTaskSavesMetadataAndDEKBeforeScheduling(t *testing.T) {
 			require.Equal(t, "folder", meta.FolderID)
 		},
 	).Return("copy", nil).Once()
-	f.scheduler.On("WaitTask", mock.Anything, f.execCtx, "copy").Return(
-		&dataplane_protos.BackupSnapshotDataResponse{},
-		nil,
-	).Once()
+	f.scheduler.On("WaitTask", mock.Anything, f.execCtx, "copy").Return(&empty.Empty{}, nil).Once()
 
 	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
 	f.scheduler.AssertExpectations(t)
