@@ -920,47 +920,128 @@ func TestBackupSnapshotDataTaskWaitsForChunkRetriedByAnotherWorker(t *testing.T)
 	require.Equal(t, []string{chunkID}, readBackupChunkMap(t, ctx, follower, "snapshot").ChunkIds)
 }
 
-type completedDependencyStorage struct {
+// Fails reading a chunk, so the test sees which chunks a copy reads.
+type unreadableChunkStorage struct {
 	snapshot_storage.Storage
 	chunkID string
 }
 
-func (s completedDependencyStorage) ReadChunkBlob(ctx context.Context, chunkID string, storedInS3 bool) (chunks.ChunkBlob, error) {
+func (s unreadableChunkStorage) ReadChunkBlob(
+	ctx context.Context,
+	chunkID string,
+	storedInS3 bool,
+) (chunks.ChunkBlob, error) {
+
 	if chunkID == s.chunkID {
-		return chunks.ChunkBlob{}, errors.NewNonRetriableErrorf("completed ancestor must not be reread")
+		return chunks.ChunkBlob{}, errors.NewNonRetriableErrorf("chunk already in the follower must not be read")
 	}
 	return s.Storage.ReadChunkBlob(ctx, chunkID, storedInS3)
 }
 
-func TestBackupSnapshotDataTaskCopiesOwnChunksAfterCompletedDependency(t *testing.T) {
+func backUpSnapshot(
+	t *testing.T,
+	ctx context.Context,
+	storage snapshot_storage.Storage,
+	follower testFollower,
+	snapshotID string,
+) []snapshot_storage.BackupChunkQueueEntry {
+
+	task := newBackupSnapshotDataTask(storage, follower, snapshotID)
+	execCtx := newBackupExecutionContext(ctx)
+	workerCtx := mocks.NewExecutionContextMock()
+	workerCtx.On("GetTaskID").Return("worker")
+
+	err := task.Run(ctx, execCtx)
+	if err == nil {
+		return nil
+	}
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+
+	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
+	require.NoError(t, err)
+
+	err = newBackupChunksTask(storage, follower).Run(ctx, workerCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	require.NoError(t, task.Run(ctx, execCtx))
+	return queue
+}
+
+func createSnapshotFromChunks(
+	t *testing.T,
+	ctx context.Context,
+	storage snapshot_storage.Storage,
+	snapshotID string,
+	ownData string,
+	chunkIDs ...string,
+) string {
+
+	_, err := storage.CreateSnapshot(ctx, snapshot_storage.SnapshotMeta{ID: snapshotID})
+	require.NoError(t, err)
+
+	for index, chunkID := range chunkIDs {
+		err = storage.ShallowCopyChunk(
+			ctx,
+			snapshot_storage.ChunkMapEntry{
+				ChunkIndex: uint32(index),
+				ChunkID:    chunkID,
+				StoredInS3: true,
+			},
+			snapshotID,
+		)
+		require.NoError(t, err)
+	}
+
+	own, err := storage.WriteChunk(
+		ctx,
+		"task",
+		snapshotID,
+		dataplane_common.Chunk{Index: uint32(len(chunkIDs)), Data: []byte(ownData)},
+		true, // useS3
+	)
+	require.NoError(t, err)
+
+	count := uint32(len(chunkIDs) + 1)
+	err = storage.SnapshotCreated(ctx, snapshotID, uint64(count)*4096, uint64(count)*4096, count, nil)
+	require.NoError(t, err)
+	return own
+}
+
+func TestBackupSnapshotDataTaskSkipsChunksCopiedByCreator(t *testing.T) {
 	ctx := test.NewContext()
 	storage, closeFunc := newStorage(t, ctx)
 	defer closeFunc()
 	follower := newTestFollower(t, ctx)
-	ancestorChunk := createSnapshotWithChunk(t, ctx, storage, "A")
-	ancestor := newBackupSnapshotDataTask(storage, follower, "A")
-	execCtx := newBackupExecutionContext(ctx)
-	require.True(t, errors.Is(ancestor.Run(ctx, execCtx), errors.NewInterruptExecutionError()))
-	workerCtx := mocks.NewExecutionContextMock()
-	workerCtx.On("GetTaskID").Return("worker")
-	require.True(t, errors.Is(newBackupChunksTask(storage, follower).Run(ctx, workerCtx), errors.NewInterruptExecutionError()))
-	require.NoError(t, ancestor.Run(ctx, execCtx))
 
-	_, err := storage.CreateSnapshot(ctx, snapshot_storage.SnapshotMeta{ID: "C"})
-	require.NoError(t, err)
-	ownChunk, err := storage.WriteChunk(ctx, "task", "C", dataplane_common.Chunk{Index: 0, Data: []byte("own")}, true)
-	require.NoError(t, err)
-	require.NoError(t, storage.ShallowCopyChunk(ctx, snapshot_storage.ChunkMapEntry{ChunkIndex: 1, ChunkID: ancestorChunk, StoredInS3: true}, "C"))
-	require.NoError(t, storage.SnapshotCreated(ctx, "C", 8192, 8192, 2, nil))
-	guarded := completedDependencyStorage{Storage: storage, chunkID: ancestorChunk}
-	task := newBackupSnapshotDataTask(guarded, follower, "C")
-	task.request.CompletedSnapshotIds = []string{"A"}
-	require.True(t, errors.Is(task.Run(ctx, execCtx), errors.NewInterruptExecutionError()))
-	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
-	require.NoError(t, err)
+	a := createSnapshotWithChunk(t, ctx, storage, "A")
+	backUpSnapshot(t, ctx, storage, follower, "A")
+
+	own := createSnapshotFromChunks(t, ctx, storage, "C", "own", a)
+	guarded := unreadableChunkStorage{Storage: storage, chunkID: a}
+	queue := backUpSnapshot(t, ctx, guarded, follower, "C")
+
 	require.Len(t, queue, 1)
-	require.Equal(t, ownChunk, queue[0].ChunkID)
-	require.True(t, errors.Is(newBackupChunksTask(guarded, follower).Run(ctx, workerCtx), errors.NewInterruptExecutionError()))
-	require.NoError(t, task.Run(ctx, execCtx))
-	require.Equal(t, []string{ownChunk, ancestorChunk}, readBackupChunkMap(t, ctx, follower, "C").ChunkIds)
+	require.Equal(t, own, queue[0].ChunkID)
+	require.Equal(t, []string{a, own}, readBackupChunkMap(t, ctx, follower, "C").ChunkIds)
+}
+
+func TestBackupSnapshotDataTaskCopiesChunkOfDeletedCreatorOnce(t *testing.T) {
+	ctx := test.NewContext()
+	storage, closeFunc := newStorage(t, ctx)
+	defer closeFunc()
+	follower := newTestFollower(t, ctx)
+
+	// X created chunk a; S1 and S2 both use it, and X is gone.
+	a := createSnapshotWithChunk(t, ctx, storage, "X")
+	createSnapshotFromChunks(t, ctx, storage, "S1", "b", a)
+	own := createSnapshotFromChunks(t, ctx, storage, "S2", "d", a)
+	finishSnapshotDeletion(t, ctx, storage, "X")
+
+	queue := backUpSnapshot(t, ctx, storage, follower, "S1")
+	require.Len(t, queue, 2)
+
+	guarded := unreadableChunkStorage{Storage: storage, chunkID: a}
+	queue = backUpSnapshot(t, ctx, guarded, follower, "S2")
+	require.Len(t, queue, 1)
+	require.Equal(t, own, queue[0].ChunkID)
+	require.Equal(t, []string{a, own}, readBackupChunkMap(t, ctx, follower, "S2").ChunkIds)
 }

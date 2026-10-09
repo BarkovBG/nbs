@@ -1963,6 +1963,31 @@ func TestBackupChunkQueue(t *testing.T) {
 	require.EqualValues(t, 0, length)
 }
 
+func TestBackupChunkInFollowerIsNotEnqueuedForAnotherSnapshot(t *testing.T) {
+	f := createFixture(t)
+	defer f.teardown()
+
+	first := BackupChunkQueueEntry{SnapshotID: "snap1", ChunkID: "t.creator.0"}
+	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snap1", []BackupChunkQueueEntry{first}))
+
+	// Not copied yet: another snapshot enqueues the chunk too.
+	second := BackupChunkQueueEntry{SnapshotID: "snap2", ChunkID: "t.creator.0"}
+	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snap2", []BackupChunkQueueEntry{second}))
+	got, err := f.storage.GetQueuedChunksToBackup(f.ctx, 10)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []BackupChunkQueueEntry{first, second}, got)
+
+	// One batch may complete the same chunk for both snapshots.
+	require.NoError(t, f.storage.ChunksBackupCompleted(f.ctx, []BackupChunkQueueEntry{first, second}))
+
+	third := BackupChunkQueueEntry{SnapshotID: "snap3", ChunkID: "t.creator.0"}
+	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snap3", []BackupChunkQueueEntry{third}))
+	got, err = f.storage.GetQueuedChunksToBackup(f.ctx, 10)
+	require.NoError(t, err)
+	require.Empty(t, got)
+	require.NoError(t, f.storage.CheckBackupChunksCompleted(f.ctx, "snap3"))
+}
+
 func TestClearBackupChunks(t *testing.T) {
 	f := createFixture(t)
 	defer f.teardown()
@@ -2025,12 +2050,13 @@ func TestClearBackupChunks(t *testing.T) {
 	require.Empty(t, got)
 	require.NoError(t, f.storage.CheckBackupChunksCompleted(f.ctx, "snap1"))
 
-	// Cleared chunks are enqueued again by the next attempt.
-	err = f.storage.EnqueueBackupChunks(f.ctx, "snap1", entries[:1])
+	// The next attempt enqueues the cleared chunk that was not copied; the
+	// copied ones are already in the follower.
+	err = f.storage.EnqueueBackupChunks(f.ctx, "snap1", entries[:3])
 	require.NoError(t, err)
 	got, err = f.storage.GetQueuedChunksToBackup(f.ctx, 10)
 	require.NoError(t, err)
-	require.Equal(t, entries[:1], got)
+	require.Equal(t, entries[2:3], got)
 
 	cleared, err := f.storage.ClearBackupChunks(
 		f.ctx,

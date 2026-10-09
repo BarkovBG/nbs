@@ -252,9 +252,9 @@ func (t *backupSnapshotDataTask) enqueueChunks(
 			return err
 		}
 
-		// Completed creators already have their entire copy in the follower.
-		// Missing/deleting creators without that confirmation are copied here.
-		if len(entry.ChunkID) == 0 || t.creatorCompleted(entry.ChunkID) {
+		// Zero chunks have no data. Chunks already in the follower, including
+		// those of other snapshots, are skipped on enqueue.
+		if len(entry.ChunkID) == 0 {
 			continue
 		}
 
@@ -281,21 +281,6 @@ func (t *backupSnapshotDataTask) enqueueChunks(
 	}
 
 	return t.enqueueBatch(ctx, execCtx, batch, t.state.ChunkCount)
-}
-
-func (t *backupSnapshotDataTask) creatorCompleted(chunkID string) bool {
-	creator := storage.GetSnapshotIDFromChunkID(chunkID)
-	if creator == "" || creator == t.request.SnapshotId {
-		return false
-	}
-
-	for _, id := range t.request.CompletedSnapshotIds {
-		if creator == id {
-			return true
-		}
-	}
-
-	return false
 }
 
 func (t *backupSnapshotDataTask) waitForChunksBackupCompleted(

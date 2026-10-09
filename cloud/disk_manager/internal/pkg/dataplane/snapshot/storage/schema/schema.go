@@ -193,6 +193,22 @@ func Create(
 	}
 	logging.Info(ctx, "Created backup_snapshot_refs table")
 
+	// Chunks whose objects are in the follower, whichever snapshot copied them.
+	err = db.CreateOrAlterTable(
+		ctx,
+		config.GetStorageFolder(),
+		"follower_chunks",
+		persistence.NewCreateTableDescription(
+			persistence.WithColumn("chunk_id", persistence.Optional(persistence.TypeUTF8)),
+			persistence.WithPrimaryKeyColumn("chunk_id"),
+		),
+		dropUnusedColumns,
+	)
+	if err != nil {
+		return err
+	}
+	logging.Info(ctx, "Created follower_chunks table")
+
 	if s3 != nil && len(config.GetS3Bucket()) != 0 {
 		exists, err := s3.BucketExists(ctx, config.GetS3Bucket())
 		if err != nil {
@@ -282,6 +298,12 @@ func Drop(
 		return err
 	}
 	logging.Info(ctx, "Dropped backup_snapshot_refs table")
+
+	err = db.DropTable(ctx, config.GetStorageFolder(), "follower_chunks")
+	if err != nil {
+		return err
+	}
+	logging.Info(ctx, "Dropped follower_chunks table")
 
 	logging.Info(ctx, "Dropped schema for dataplane snapshot storage")
 

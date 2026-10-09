@@ -1623,6 +1623,10 @@ func (s *storageYDB) findBackupChunkIDsTx(
 		select chunk_id
 		from backup_chunks
 		where snapshot_id = $snapshot_id and chunk_id in $chunk_ids
+		union all
+		select chunk_id
+		from follower_chunks
+		where chunk_id in $chunk_ids
 	`, s.tablesPath),
 		persistence.ValueParam(
 			"$snapshot_id",
@@ -1670,7 +1674,8 @@ func (s *storageYDB) enqueueBackupChunks(
 	}
 	defer tx.Rollback(ctx)
 
-	// Chunks that are found are either queued or backed up already.
+	// Chunks that are found are queued for this snapshot or already in the
+	// follower, whichever snapshot copied them.
 	found, err := s.findBackupChunkIDsTx(ctx, tx, snapshotID, entries)
 	if err != nil {
 		return err
@@ -1779,7 +1784,8 @@ func (s *storageYDB) ChunksBackupCompleted(
 	defer s.metrics.StatOperation("ChunksBackupCompleted")(&err)
 
 	// Only existing chunks are updated: a chunk that is not found has already
-	// been backed up and cleared by the backup of its snapshot.
+	// been backed up and cleared by the backup of its snapshot. The object is
+	// in the follower either way, so later copies skip the chunk.
 	_, err = s.db.ExecuteRW(ctx, fmt.Sprintf(`
 		--!syntax_v1
 		pragma TablePathPrefix = "%v";
@@ -1790,7 +1796,10 @@ func (s *storageYDB) ChunksBackupCompleted(
 		on select * from AS_TABLE($chunks);
 
 		delete from backup_chunk_queue
-		on select * from AS_TABLE($keys)
+		on select * from AS_TABLE($keys);
+
+		upsert into follower_chunks
+		select distinct chunk_id from AS_TABLE($keys);
 	`,
 		s.tablesPath,
 		backupChunkStructTypeString(),
