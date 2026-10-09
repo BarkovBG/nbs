@@ -632,3 +632,20 @@ func (s *StorageMock) ClaimSnapshotBackupPlan(ctx context.Context, backupTaskID 
 	a := s.Called(ctx, backupTaskID)
 	return a.Error(0)
 }
+
+func (s *StorageMock) SetSnapshotBackupFolder(ctx context.Context, folderID, generation string, enabled bool) error {
+	a := s.Called(ctx, folderID, generation, enabled)
+	return a.Error(0)
+}
+func (s *StorageMock) ListSnapshotBackupFolders(ctx context.Context) ([]resources.SnapshotBackupFolder, error) {
+	a := s.Called(ctx)
+	return a.Get(0).([]resources.SnapshotBackupFolder), a.Error(1)
+}
+func (s *StorageMock) ListSnapshotBackupCandidates(ctx context.Context, folderID, afterID string, limit int) ([]string, error) {
+	a := s.Called(ctx, folderID, afterID, limit)
+	return a.Get(0).([]string), a.Error(1)
+}
+func (s *StorageMock) EnqueueSnapshotBackupForFolder(ctx context.Context, snapshotID, backupID, folderID, generation string) (bool, error) {
+	a := s.Called(ctx, snapshotID, backupID, folderID, generation)
+	return a.Bool(0), a.Error(1)
+}

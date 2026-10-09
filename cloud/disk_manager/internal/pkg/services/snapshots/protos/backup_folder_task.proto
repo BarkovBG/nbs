@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package snapshots;
+
+option go_package = "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/snapshots/protos";
+
+message BackupFolderRequest {
+    string FolderId = 1;
+    string Generation = 2;
+}
+
+message BackupFolderState {
+    string AfterId = 1;
+    uint64 Round = 2;
+}

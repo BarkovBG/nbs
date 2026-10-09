@@ -33,6 +33,19 @@ func (t *scheduleBackupSnapshotTasks) Run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
+	folders, err := t.storage.ListSnapshotBackupFolders(ctx)
+	if err != nil {
+		return err
+	}
+	for _, folder := range folders {
+		key := fmt.Sprintf("backup_snapshot_folder_%v_%v", folder.FolderID, folder.Generation)
+		_, err := t.scheduler.ScheduleTask(headers.SetIncomingIdempotencyKey(ctx, key),
+			"snapshots.BackupFolder", "", &protos.BackupFolderRequest{FolderId: folder.FolderID, Generation: folder.Generation})
+		if err != nil {
+			return err
+		}
+	}
+
 	backups, err := t.storage.ListSnapshotsToBackup(ctx, t.limit)
 	if err != nil {
 		return err

@@ -122,6 +122,11 @@ type PlacementGroupMeta struct {
 	DeleteTaskID            string                  `json:"delete_task_id"`
 }
 
+type SnapshotBackupFolder struct {
+	FolderID   string
+	Generation string
+}
+
 type SnapshotBackupRequest struct {
 	SnapshotID string
 	BackupID   string
@@ -228,6 +233,11 @@ type Storage interface {
 		folderID string,
 		creatingBefore time.Time,
 	) ([]string, error)
+
+	SetSnapshotBackupFolder(ctx context.Context, folderID, generation string, enabled bool) error
+	ListSnapshotBackupFolders(ctx context.Context) ([]SnapshotBackupFolder, error)
+	ListSnapshotBackupCandidates(ctx context.Context, folderID, afterID string, limit int) ([]string, error)
+	EnqueueSnapshotBackupForFolder(ctx context.Context, snapshotID, backupID, folderID, generation string) (bool, error)
 
 	ClaimSnapshotBackupPlan(ctx context.Context, backupTaskID string) error
 	ReserveSnapshotBackup(ctx context.Context, snapshotID, backupTaskID string, neededByDependents bool) (*SnapshotMeta, error)
