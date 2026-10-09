@@ -232,10 +232,30 @@ type Storage interface {
 		creatingBefore time.Time,
 	) ([]string, error)
 
-	SetSnapshotBackupFolder(ctx context.Context, folderID, generation string, enabled bool) error
+	SetSnapshotBackupFolder(
+		ctx context.Context,
+		folderID string,
+		generation string,
+		enabled bool,
+	) error
+
 	ListSnapshotBackupFolders(ctx context.Context) ([]SnapshotBackupFolder, error)
-	ListSnapshotBackupCandidates(ctx context.Context, folderID, afterID string, limit int) ([]string, error)
-	EnqueueSnapshotBackupForFolder(ctx context.Context, snapshotID, backupID, folderID, generation string) (bool, error)
+
+	ListSnapshotBackupCandidates(
+		ctx context.Context,
+		folderID string,
+		afterID string,
+		limit int,
+	) ([]string, error)
+
+	// Returns false if the folder is no longer selected with this generation.
+	EnqueueSnapshotBackupForFolder(
+		ctx context.Context,
+		snapshotID string,
+		backupID string,
+		folderID string,
+		generation string,
+	) (bool, error)
 
 	EnqueueSnapshotBackup(
 		ctx context.Context,

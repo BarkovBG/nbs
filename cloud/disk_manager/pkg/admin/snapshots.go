@@ -274,14 +274,20 @@ func (c *backupSnapshotFolder) run() error {
 	}
 	defer db.Close(ctx)
 
-	generation := ""
+	var generation string
 	if !c.disable {
 		generation = generateID()
 	}
-	err = resourceStorage.SetSnapshotBackupFolder(ctx, c.folderID, generation, !c.disable)
+	err = resourceStorage.SetSnapshotBackupFolder(
+		ctx,
+		c.folderID,
+		generation,
+		!c.disable,
+	)
 	if err != nil {
 		return err
 	}
+
 	fmt.Println("OK")
 	return nil
 }
@@ -291,19 +297,36 @@ func newBackupSnapshotFolderCmd(
 	serverConfig *server_config.ServerConfig,
 ) *cobra.Command {
 
-	c := &backupSnapshotFolder{clientConfig: clientConfig, serverConfig: serverConfig}
+	c := &backupSnapshotFolder{
+		clientConfig: clientConfig,
+		serverConfig: serverConfig,
+	}
+
 	cmd := &cobra.Command{
 		Use:   "backup-folder",
 		Short: "Enable queueing existing and new ready snapshots in a folder",
 		Long: "Enable backup of existing and newly ready snapshots and return OK " +
 			"without waiting for copying. Repeated enable requests are successful. " +
-			"Use snapshots get --id <id> to check backup_completed and backup_task_id. " +
+			"Use snapshots get --id <id> to check backup_completed. " +
 			"With --disable, stop automatic enqueue; already queued requests continue. " +
 			"Manual single-ID requests remain available while automatic enqueue is disabled.",
-		RunE: func(cmd *cobra.Command, args []string) error { return c.run() },
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return c.run()
+		},
 	}
-	cmd.Flags().StringVar(&c.folderID, "folder-id", "", "ID of folder to back up; required")
-	cmd.Flags().BoolVar(&c.disable, "disable", false, "Stop accepting new snapshot backups")
+
+	cmd.Flags().StringVar(
+		&c.folderID,
+		"folder-id",
+		"",
+		"ID of folder to back up; required",
+	)
+	cmd.Flags().BoolVar(
+		&c.disable,
+		"disable",
+		false,
+		"Stop accepting new snapshot backups",
+	)
 	if err := cmd.MarkFlagRequired("folder-id"); err != nil {
 		log.Fatalf("Error setting flag folder-id as required: %v", err)
 	}

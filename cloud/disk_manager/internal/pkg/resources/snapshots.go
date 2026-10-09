@@ -869,8 +869,12 @@ func (s *storageYDB) listSnapshots(
 }
 
 func (s *storageYDB) enqueueSnapshotBackupTx(
-	ctx context.Context, tx *persistence.Transaction, snapshotID, backupID string,
+	ctx context.Context,
+	tx *persistence.Transaction,
+	snapshotID string,
+	backupID string,
 ) error {
+
 	res, err := tx.Execute(ctx, fmt.Sprintf(`
 		--!syntax_v1
 		pragma TablePathPrefix = "%v";
@@ -958,19 +962,27 @@ func (s *storageYDB) enqueueSnapshotBackupTx(
 }
 
 func (s *storageYDB) enqueueSnapshotBackup(
-	ctx context.Context, session *persistence.Session, snapshotID, backupID string,
+	ctx context.Context,
+	session *persistence.Session,
+	snapshotID string,
+	backupID string,
 ) error {
-	if snapshotID == "" || backupID == "" {
+
+	if len(snapshotID) == 0 || len(backupID) == 0 {
 		return errors.NewNonRetriableErrorf("empty snapshot or backup ID")
 	}
+
 	tx, err := session.BeginRWTransaction(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if err := s.enqueueSnapshotBackupTx(ctx, tx, snapshotID, backupID); err != nil {
+
+	err = s.enqueueSnapshotBackupTx(ctx, tx, snapshotID, backupID)
+	if err != nil {
 		return err
 	}
+
 	return tx.Commit(ctx)
 }
 

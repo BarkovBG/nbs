@@ -59,9 +59,12 @@ func RegisterForExecution(
 	}
 
 	if backupS3 != nil {
-		err = taskRegistry.RegisterForExecution("snapshots.BackupFolder", func() tasks.Task {
-			return &backupFolderTask{storage: storage}
-		})
+		err = taskRegistry.RegisterForExecution(
+			"snapshots.BackupFolder",
+			func() tasks.Task {
+				return &backupFolderTask{storage: storage}
+			},
+		)
 		if err != nil {
 			return err
 		}

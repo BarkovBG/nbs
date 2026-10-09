@@ -38,9 +38,21 @@ func (t *scheduleBackupSnapshotTasks) Run(
 		return err
 	}
 	for _, folder := range folders {
-		key := fmt.Sprintf("backup_snapshot_folder_%v_%v", folder.FolderID, folder.Generation)
-		_, err := t.scheduler.ScheduleTask(headers.SetIncomingIdempotencyKey(ctx, key),
-			"snapshots.BackupFolder", "", &protos.BackupFolderRequest{FolderId: folder.FolderID, Generation: folder.Generation})
+		idempotencyKey := fmt.Sprintf(
+			"backup_snapshot_folder_%v_%v",
+			folder.FolderID,
+			folder.Generation,
+		)
+
+		_, err := t.scheduler.ScheduleTask(
+			headers.SetIncomingIdempotencyKey(ctx, idempotencyKey),
+			"snapshots.BackupFolder",
+			"",
+			&protos.BackupFolderRequest{
+				FolderId:   folder.FolderID,
+				Generation: folder.Generation,
+			},
+		)
 		if err != nil {
 			return err
 		}
