@@ -520,7 +520,10 @@ func newSnapshotBackupTestStorage(t *testing.T) (context.Context, *storageYDB) {
 	return ctx, storage
 }
 
-func newEnqueueSnapshotBackupTestStorage(t *testing.T) (context.Context, *storageYDB) {
+func newEnqueueSnapshotBackupTestStorage(
+	t *testing.T,
+) (context.Context, *storageYDB) {
+
 	t.Helper()
 	ctx, storage := newSnapshotBackupTestStorage(t)
 
@@ -765,7 +768,13 @@ func TestSnapshotsDeletionStopsBackup(t *testing.T) {
 	require.Empty(t, ids)
 }
 
-func completeSnapshotBackupForTest(t *testing.T, ctx context.Context, storage Storage, id string) {
+func completeSnapshotBackupForTest(
+	t *testing.T,
+	ctx context.Context,
+	storage Storage,
+	id string,
+) {
+
 	t.Helper()
 	require.NoError(t, storage.SnapshotBackupCompleted(ctx, id))
 }

@@ -543,17 +543,28 @@ func (s *storageYDB) snapshotCreated(
 		return err
 	}
 
-	// A selected folder also queues new ready snapshots in this same transaction.
+	// A selected folder also queues new ready snapshots in this transaction.
 	if s.backupEnabled {
 		_, err = tx.Execute(ctx, fmt.Sprintf(`
-   --!syntax_v1
-   pragma TablePathPrefix = "%v";
-   declare $snapshot_id as Utf8;
-   declare $folder_id as Utf8;
-   upsert into backup_queue (snapshot_id, backup_id)
-   select $snapshot_id as snapshot_id, generation as backup_id
-   from backup_folders where folder_id = $folder_id and enabled;
-  `, s.snapshotsPath), persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)), persistence.ValueParam("$folder_id", persistence.UTF8Value(state.folderID)))
+			--!syntax_v1
+			pragma TablePathPrefix = "%v";
+			declare $snapshot_id as Utf8;
+			declare $folder_id as Utf8;
+
+			upsert into backup_queue (snapshot_id, backup_id)
+			select $snapshot_id as snapshot_id, generation as backup_id
+			from backup_folders
+			where folder_id = $folder_id and enabled
+		`, s.snapshotsPath),
+			persistence.ValueParam(
+				"$snapshot_id",
+				persistence.UTF8Value(snapshotID),
+			),
+			persistence.ValueParam(
+				"$folder_id",
+				persistence.UTF8Value(state.folderID),
+			),
+		)
 		if err != nil {
 			return err
 		}
@@ -1032,16 +1043,25 @@ func (s *storageYDB) listSnapshotsToBackup(
 	return backups, res.Err()
 }
 
-func (s *storageYDB) finishSnapshotBackup(
-	ctx context.Context, session *persistence.Session, snapshotID, backupID string,
+func (s *storageYDB) removeSnapshotFromBackupQueue(
+	ctx context.Context,
+	session *persistence.Session,
+	snapshotID string,
+	backupID string,
 ) error {
+
 	_, err := session.ExecuteRW(ctx, fmt.Sprintf(`
-  --!syntax_v1
-  pragma TablePathPrefix = "%v";
-  declare $snapshot_id as Utf8;
-  declare $backup_id as Utf8;
-  delete from backup_queue where snapshot_id = $snapshot_id and backup_id = $backup_id;
- `, s.snapshotsPath), persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)), persistence.ValueParam("$backup_id", persistence.UTF8Value(backupID)))
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $snapshot_id as Utf8;
+		declare $backup_id as Utf8;
+
+		delete from backup_queue
+		where snapshot_id = $snapshot_id and backup_id = $backup_id
+	`, s.snapshotsPath),
+		persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)),
+		persistence.ValueParam("$backup_id", persistence.UTF8Value(backupID)),
+	)
 	return err
 }
 
@@ -1229,7 +1249,7 @@ func (s *storageYDB) RemoveSnapshotFromBackupQueue(
 	return s.db.Execute(
 		ctx,
 		func(ctx context.Context, session *persistence.Session) error {
-			return s.finishSnapshotBackup(
+			return s.removeSnapshotFromBackupQueue(
 				ctx,
 				session,
 				snapshotID,

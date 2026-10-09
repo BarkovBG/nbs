@@ -413,8 +413,18 @@ func TestBackupSnapshotDataTaskBacksUpInheritedChunksAfterCreatorDeletion(t *tes
 	require.ElementsMatch(
 		t,
 		[]snapshot_storage.BackupChunkQueueEntry{
-			{SnapshotID: "snap3", ChunkID: chunk0, StoredInS3: true, EncryptedDEK: follower.encryptedDEK},
-			{SnapshotID: "snap3", ChunkID: chunk1, StoredInS3: true, EncryptedDEK: follower.encryptedDEK},
+			{
+				SnapshotID:   "snap3",
+				ChunkID:      chunk0,
+				StoredInS3:   true,
+				EncryptedDEK: follower.encryptedDEK,
+			},
+			{
+				SnapshotID:   "snap3",
+				ChunkID:      chunk1,
+				StoredInS3:   true,
+				EncryptedDEK: follower.encryptedDEK,
+			},
 		},
 		queue,
 	)
@@ -429,7 +439,11 @@ func TestBackupSnapshotDataTaskBacksUpInheritedChunksAfterCreatorDeletion(t *tes
 		blob, err := storage.ReadChunkBlob(ctx, id, true)
 		require.NoError(t, err)
 		require.Equal(t, blob.Data, object.Data)
-		require.Equal(t, *chunks.NewS3Object(blob).Metadata["Checksum"], *object.Metadata["Checksum"])
+		require.Equal(
+			t,
+			*chunks.NewS3Object(blob).Metadata["Checksum"],
+			*object.Metadata["Checksum"],
+		)
 	}
 
 	err = task.Run(ctx, execCtx)
@@ -906,7 +920,11 @@ func TestBackupSnapshotDataTaskHandlesRepeatedChunkIDs(t *testing.T) {
 				require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 			}
 			require.NoError(t, err)
-			require.Equal(t, []string{chunkID, chunkID, ""}, readBackupChunkMap(t, ctx, follower, "copy").ChunkIds)
+			require.Equal(
+				t,
+				[]string{chunkID, chunkID, ""},
+				readBackupChunkMap(t, ctx, follower, "copy").ChunkIds,
+			)
 		})
 	}
 }
@@ -944,7 +962,8 @@ func TestBackupSnapshotDataTaskWaitsForChunkRetriedByAnotherWorker(t *testing.T)
 	_, err := follower.getObject(ctx, backup.ChunkMapKey("snapshot"))
 	require.Error(t, err)
 
-	require.True(t, errors.Is(newBackupChunksTask(storage, follower).Run(ctx, workerCtx), errors.NewInterruptExecutionError()))
+	err = newBackupChunksTask(storage, follower).Run(ctx, workerCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 	require.NoError(t, task.Run(ctx, execCtx))
 	require.Equal(t, []string{chunkID}, readBackupChunkMap(t, ctx, follower, "snapshot").ChunkIds)
 }
@@ -962,7 +981,9 @@ func (s unreadableChunkStorage) ReadChunkBlob(
 ) (chunks.ChunkBlob, error) {
 
 	if chunkID == s.chunkID {
-		return chunks.ChunkBlob{}, errors.NewNonRetriableErrorf("chunk already in the follower must not be read")
+		return chunks.ChunkBlob{}, errors.NewNonRetriableErrorf(
+			"chunk already in the follower must not be read",
+		)
 	}
 	return s.Storage.ReadChunkBlob(ctx, chunkID, storedInS3)
 }
@@ -1030,7 +1051,15 @@ func createSnapshotFromChunks(
 	require.NoError(t, err)
 
 	count := uint32(len(chunkIDs) + 1)
-	err = storage.SnapshotCreated(ctx, snapshotID, uint64(count)*4096, uint64(count)*4096, count, nil)
+	size := uint64(count) * 4096
+	err = storage.SnapshotCreated(
+		ctx,
+		snapshotID,
+		size,
+		size, // storageSize
+		count,
+		nil, // encryption
+	)
 	require.NoError(t, err)
 	return own
 }

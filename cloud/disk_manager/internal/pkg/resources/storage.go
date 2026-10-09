@@ -248,14 +248,15 @@ type Storage interface {
 		limit int,
 	) ([]SnapshotBackupRequest, error)
 
-	// Queue cleanup is not proof of a completed copy; SnapshotBackupCompleted
-	// records success. It marks only a ready snapshot.
+	// Removes the queue row of this attempt only. Does not mark the snapshot
+	// as backed up.
 	RemoveSnapshotFromBackupQueue(
 		ctx context.Context,
 		snapshotID string,
 		backupID string,
 	) error
 
+	// Marks a ready snapshot as backed up. A deleting snapshot is not marked.
 	SnapshotBackupCompleted(ctx context.Context, snapshotID string) error
 
 	// Returns filesystem if action has been accepted by storage and nil otherwise.
