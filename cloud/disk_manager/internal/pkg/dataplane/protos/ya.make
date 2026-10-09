@@ -16,7 +16,6 @@ SRCS(
     delete_snapshot_task.proto
     migrate_snapshot_task.proto
     migrate_snapshot_database_task.proto
-    get_snapshot_backup_dependencies_task.proto
     release_snapshot_backup_task.proto
     replicate_disk_task.proto
     transfer_from_disk_to_disk_task.proto

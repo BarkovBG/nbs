@@ -72,7 +72,6 @@ type SnapshotMeta struct {
 	Encryption        *types.EncryptionDesc `json:"encryption"`
 	Ready             bool                  `json:"ready"`
 	BackupTaskID      string                `json:"backup_task_id"`
-	BackupPlanID      string                `json:"backup_plan_id"`
 	BackupCompleted   bool                  `json:"backup_completed"`
 }
 
@@ -120,11 +119,6 @@ type PlacementGroupMeta struct {
 	CreatedAt               time.Time               `json:"created_at"`
 	CreatedBy               string                  `json:"created_by"`
 	DeleteTaskID            string                  `json:"delete_task_id"`
-}
-
-type SnapshotBackupRequest struct {
-	SnapshotID string
-	BackupID   string
 }
 
 type Storage interface {
@@ -229,38 +223,14 @@ type Storage interface {
 		creatingBefore time.Time,
 	) ([]string, error)
 
-	ClaimSnapshotBackupFolder(ctx context.Context, folderID, generation, taskID string) (bool, error)
-	ReleaseSnapshotBackupFolder(ctx context.Context, folderID, taskID string) error
-	SetSnapshotBackupFolder(ctx context.Context, folderID, generation string, enabled bool) error
-	ListSnapshotBackupFolders(ctx context.Context) ([]SnapshotBackupFolder, error)
-	ListSnapshotBackupCandidates(ctx context.Context, folderID, afterID string, limit int) ([]string, error)
-	ReserveSnapshotBackup(ctx context.Context, snapshotID, ownerID, coordinatorID string, neededByDependents bool) (*SnapshotMeta, error)
-	HoldSnapshotBackupPlan(ctx context.Context, snapshotID, ownerID, coordinatorID string) (*SnapshotMeta, error)
-	FinishSnapshotBackupPlan(ctx context.Context, folderID, ownerID string) error
+	ReserveSnapshotBackup(ctx context.Context, snapshotID, ownerID string) (*SnapshotMeta, error)
 	ReleaseSnapshotBackup(ctx context.Context, snapshotID, ownerID string, completed bool) error
 
-	EnqueueSnapshotBackup(
-		ctx context.Context,
-		snapshotID string,
-		backupID string,
-	) error
+	ListSnapshotsToBackup(ctx context.Context, limit int) ([]string, error)
 
-	ListSnapshotsToBackup(
-		ctx context.Context,
-		limit int,
-	) ([]SnapshotBackupRequest, error)
+	SnapshotBackupScheduled(ctx context.Context, snapshotID string) error
 
-	SnapshotBackupScheduled(
-		ctx context.Context,
-		snapshotID string,
-		backupID string,
-	) error
-
-	SnapshotBackupCancelled(
-		ctx context.Context,
-		snapshotID string,
-		backupID string,
-	) error
+	SnapshotBackupCancelled(ctx context.Context, snapshotID string) error
 
 	// Returns filesystem if action has been accepted by storage and nil otherwise.
 	CreateFilesystem(ctx context.Context, filesystem FilesystemMeta) (*FilesystemMeta, error)

@@ -10,10 +10,6 @@ import "cloud/disk_manager/internal/pkg/dataplane/protos/backup_snapshot_data_ta
 
 message BackupSnapshotRequest {
     string SnapshotId = 1;
-    string BackupId = 2;
-    bytes EncryptedDek = 3;
-    string CoordinatorId = 4;
-    reserved 5;
 }
 
 message BackupSnapshotTaskState {
@@ -21,29 +17,6 @@ message BackupSnapshotTaskState {
     bytes EncryptedDek = 2;
     dataplane.BackupSnapshotDataRequest DataplaneRequest = 3;
     bool Finished = 4;
-    reserved 5 to 9;
-    repeated string CompletedSnapshotIds = 10;
-    reserved 11;
-    bool GraphPrepared = 12;
-    repeated SnapshotBackupNode Nodes = 13;
-    uint32 DiscoveryIndex = 14;
-    string ReaderSnapshotId = 15;
-    string ReaderTaskId = 16;
-    repeated string CopyOrder = 17;
-    uint32 CopyIndex = 18;
-    string FolderId = 19;
 }
 
-message BackupSnapshotResponse {
-    bool Completed = 1;
-    repeated string CompletedSnapshotIds = 2;
-}
-
-// Dependency edges and hold intents are saved before external actions.
-message SnapshotBackupNode {
-    string SnapshotId = 1;
-    repeated string Dependencies = 2;
-    bool Discovered = 3;
-    bool Excluded = 4;
-    bool Completed = 5;
-}
+message BackupSnapshotResponse { bool Completed = 1; }

@@ -47,12 +47,6 @@ func getSnapshotIDFromChunkID(chunkID string) string {
 	return after[:index]
 }
 
-// GetSnapshotIDFromChunkID returns the original creator, including for
-// entries shallow copied into another snapshot. Empty means an unknown format.
-func GetSnapshotIDFromChunkID(chunkID string) string {
-	return getSnapshotIDFromChunkID(chunkID)
-}
-
 // Zero chunks and the chunks shallow copied from another snapshot (the
 // snapshot only references them) are not created by the snapshot.
 func IsChunkCreatedBySnapshot(chunkID string, snapshotID string) bool {
