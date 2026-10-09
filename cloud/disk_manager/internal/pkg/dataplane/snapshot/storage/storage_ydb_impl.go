@@ -1622,18 +1622,16 @@ func (s *storageYDB) findBackupChunkIDsTx(
 		pragma TablePathPrefix = "%v";
 		declare $snapshot_id as Utf8;
 		declare $chunk_ids as List<Utf8>;
-        declare $failed as Int64;
 
 		select chunk_id
 		from backup_chunks
-		where snapshot_id = $snapshot_id and chunk_id in $chunk_ids and status != $failed
+		where snapshot_id = $snapshot_id and chunk_id in $chunk_ids
 	`, s.tablesPath),
 		persistence.ValueParam(
 			"$snapshot_id",
 			persistence.UTF8Value(snapshotID),
 		),
 		persistence.ValueParam("$chunk_ids", persistence.ListValue(values...)),
-		persistence.ValueParam("$failed", persistence.Int64Value(int64(backupChunkStatusFailed))),
 	)
 	if err != nil {
 		return chunkIDs, err
@@ -1662,44 +1660,18 @@ func (s *storageYDB) findBackupChunkIDsTx(
 	return chunkIDs, nil
 }
 
-func (s *storageYDB) enqueueBackupChunks(ctx context.Context, session *persistence.Session, snapshotID string, entries []BackupChunkQueueEntry) error {
-	return s.enqueueBackupChunksForTask(ctx, session, snapshotID, "", entries)
-}
-
-func (s *storageYDB) enqueueBackupChunksForTask(ctx context.Context, session *persistence.Session, snapshotID, taskID string, entries []BackupChunkQueueEntry) error {
+func (s *storageYDB) enqueueBackupChunks(
+	ctx context.Context,
+	session *persistence.Session,
+	snapshotID string,
+	entries []BackupChunkQueueEntry,
+) error {
 
 	tx, err := session.BeginRWTransaction(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-
-	if taskID != "" {
-		held, err := tx.Execute(ctx, fmt.Sprintf(`
-            --!syntax_v1
-            pragma TablePathPrefix = "%v";
-            declare $id as Utf8;
-            declare $task_id as Utf8;
-            select task_id from backup_snapshot_refs
-            where snapshot_id = $id and task_id = $task_id;
-        `, s.tablesPath), persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)), persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)))
-		if err != nil {
-			return err
-		}
-		defer held.Close()
-		if !held.NextResultSet(ctx) || !held.NextRow() {
-			if held.Err() != nil {
-				return held.Err()
-			}
-			return task_errors.NewNonRetriableErrorf("snapshot %v is not held by task %v", snapshotID, taskID)
-		}
-	}
-
-	for _, entry := range entries {
-		if entry.SnapshotID != snapshotID {
-			return task_errors.NewNonRetriableErrorf("backup queue entry belongs to another snapshot")
-		}
-	}
 
 	// Chunks that are found are either queued or backed up already.
 	found, err := s.findBackupChunkIDsTx(ctx, tx, snapshotID, entries)
@@ -1802,55 +1774,6 @@ func (s *storageYDB) getQueuedChunksToBackup(
 
 	return entries, nil
 }
-
-func (s *storageYDB) GetBackedUpChunkCount(
-	ctx context.Context,
-	snapshotID string,
-) (count uint64, err error) {
-
-	defer s.metrics.StatOperation("GetBackedUpChunkCount")(&err)
-
-	res, err := s.db.ExecuteRO(ctx, fmt.Sprintf(`
-		--!syntax_v1
-		pragma TablePathPrefix = "%v";
-		declare $snapshot_id as Utf8;
-		declare $status as Int64;
-
-		select count(*)
-		from backup_chunks
-		where snapshot_id = $snapshot_id and status = $status
-	`, s.tablesPath),
-		persistence.ValueParam(
-			"$snapshot_id",
-			persistence.UTF8Value(snapshotID),
-		),
-		persistence.ValueParam(
-			"$status",
-			persistence.Int64Value(int64(backupChunkStatusCompleted)),
-		),
-	)
-	if err != nil {
-		return 0, err
-	}
-	defer res.Close()
-
-	if !res.NextResultSet(ctx) || !res.NextRow() {
-		return 0, res.Err()
-	}
-
-	err = res.Scan(&count)
-	if err != nil {
-		return 0, err
-	}
-
-	err = res.Err()
-	if err != nil {
-		return 0, err
-	}
-
-	return count, nil
-}
-
 func (s *storageYDB) ChunksBackupCompleted(
 	ctx context.Context,
 	entries []BackupChunkQueueEntry,
@@ -1885,25 +1808,24 @@ func (s *storageYDB) ChunksBackupCompleted(
 	return err
 }
 
-func (s *storageYDB) ClearCompletedBackupChunks(
+func (s *storageYDB) ClearBackupChunks(
 	ctx context.Context,
 	snapshotID string,
 	limit int,
 ) (cleared int, err error) {
 
-	defer s.metrics.StatOperation("ClearCompletedBackupChunks")(&err)
+	defer s.metrics.StatOperation("ClearBackupChunks")(&err)
 
 	res, err := s.db.ExecuteRW(ctx, fmt.Sprintf(`
 		--!syntax_v1
 		pragma TablePathPrefix = "%v";
 		declare $snapshot_id as Utf8;
-		declare $status as Int64;
 		declare $limit as Uint64;
 
 		$keys = (
 			select snapshot_id, chunk_id
 			from backup_chunks
-			where snapshot_id = $snapshot_id and status = $status
+			where snapshot_id = $snapshot_id
 			limit $limit
 		);
 
@@ -1911,14 +1833,13 @@ func (s *storageYDB) ClearCompletedBackupChunks(
 
 		delete from backup_chunks
 		on select * from $keys;
+
+		delete from backup_chunk_queue
+		on select * from $keys;
 	`, s.tablesPath),
 		persistence.ValueParam(
 			"$snapshot_id",
 			persistence.UTF8Value(snapshotID),
-		),
-		persistence.ValueParam(
-			"$status",
-			persistence.Int64Value(int64(backupChunkStatusCompleted)),
 		),
 		persistence.ValueParam("$limit", persistence.Uint64Value(uint64(limit))),
 	)
@@ -1982,168 +1903,6 @@ func (s *storageYDB) GetBackupChunkQueueLength(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-func (s *storageYDB) ClaimBackupChunks(
-	ctx context.Context,
-	taskID string,
-	entries []BackupChunkQueueEntry,
-) (claimed []BackupChunkQueueEntry, err error) {
-
-	defer s.metrics.StatOperation("ClaimBackupChunks")(&err)
-
-	if len(entries) == 0 {
-		return nil, nil
-	}
-	if len(taskID) == 0 {
-		return nil, task_errors.NewNonRetriableErrorf("empty backup worker task ID")
-	}
-
-	// Reading the queue and registering the worker must serialize with drain.
-	// In particular, a worker cannot start IO using an old queue listing.
-	// $keys is this worker's bounded batch, not another persistent table.
-	// Re-read it and register IO in one RW transaction: cancellation may have
-	// removed entries after GetQueuedChunksToBackup returned them.
-	res, err := s.db.ExecuteRW(ctx, fmt.Sprintf(`
-		--!syntax_v1
-		pragma TablePathPrefix = "%v";
-		declare $task_id as Utf8;
-		declare $keys as List<%v>;
-
-		$entries = (
-			select q.snapshot_id as snapshot_id, q.chunk_id as chunk_id,
-				q.stored_in_s3 as stored_in_s3, q.encrypted_dek as encrypted_dek
-			from backup_chunk_queue as q
-			inner join AS_TABLE($keys) as k
-			on q.snapshot_id = k.snapshot_id and q.chunk_id = k.chunk_id
-		);
-
-		upsert into backup_chunk_inflight
-		select distinct snapshot_id, $task_id as task_id from $entries;
-
-		select * from $entries;
-	`, s.tablesPath, backupChunkKeyStructTypeString()),
-		persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)),
-		persistence.ValueParam("$keys", backupChunkKeyListValue(entries)),
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Close()
-
-	for res.NextResultSet(ctx) {
-		for res.NextRow() {
-			var entry BackupChunkQueueEntry
-			err = res.ScanNamed(
-				persistence.OptionalWithDefault("snapshot_id", &entry.SnapshotID),
-				persistence.OptionalWithDefault("chunk_id", &entry.ChunkID),
-				persistence.OptionalWithDefault("stored_in_s3", &entry.StoredInS3),
-				persistence.OptionalWithDefault("encrypted_dek", &entry.EncryptedDEK),
-			)
-			if err != nil {
-				return nil, err
-			}
-			claimed = append(claimed, entry)
-		}
-	}
-	return claimed, res.Err()
-}
-
-func (s *storageYDB) ReleaseBackupChunkClaims(
-	ctx context.Context,
-	taskID string,
-) (err error) {
-
-	defer s.metrics.StatOperation("ReleaseBackupChunkClaims")(&err)
-
-	_, err = s.db.ExecuteRW(ctx, fmt.Sprintf(`
-		--!syntax_v1
-		pragma TablePathPrefix = "%v";
-		declare $task_id as Utf8;
-
-		delete from backup_chunk_inflight where task_id = $task_id;
-	`, s.tablesPath),
-		persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)),
-	)
-	return err
-}
-
-func (s *storageYDB) DrainSnapshotBackup(
-	ctx context.Context,
-	snapshotID string,
-	taskID string,
-	limit int,
-) (err error) {
-
-	defer s.metrics.StatOperation("DrainSnapshotBackup")(&err)
-
-	if limit <= 0 {
-		return task_errors.NewNonRetriableErrorf("invalid backup drain limit %v", limit)
-	}
-
-	// An old task's cancellation must not remove a newer attempt's queue.
-	// Commit queue removal even when workers are still active, so no new
-	// worker can claim this snapshot while cancellation waits for them.
-	res, err := s.db.ExecuteRW(ctx, fmt.Sprintf(`
-		--!syntax_v1
-		pragma TablePathPrefix = "%v";
-		declare $snapshot_id as Utf8;
-		declare $task_id as Utf8;
-		declare $limit as Uint64;
-
-		$held = (
-			select snapshot_id from backup_snapshot_refs
-			where snapshot_id = $snapshot_id and task_id = $task_id
-		);
-		$active = (
-			select snapshot_id from backup_chunk_inflight
-			where snapshot_id in $held
-		);
-
-		$pending = (
-			select snapshot_id, chunk_id from backup_chunk_queue
-			where snapshot_id in $held limit $limit
-		);
-		$chunks = (
-			select snapshot_id, chunk_id from backup_chunks
-			where snapshot_id in $held and snapshot_id not in $active
-			limit $limit
-		);
-		delete from backup_chunk_queue on select * from $pending;
-		delete from backup_chunks on select * from $chunks;
-		select count(*) from $active;
-		select count(*) from $pending;
-		select count(*) from $chunks;
-	`, s.tablesPath),
-		persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)),
-		persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)),
-		persistence.ValueParam("$limit", persistence.Uint64Value(uint64(limit))),
-	)
-	if err != nil {
-		return err
-	}
-	defer res.Close()
-
-	var active, pending, cleared uint64
-	for _, count := range []*uint64{&active, &pending, &cleared} {
-		if !res.NextResultSet(ctx) || !res.NextRow() {
-			if res.Err() != nil {
-				return res.Err()
-			}
-			return task_errors.NewRetriableErrorf("missing backup drain result")
-		}
-		err = res.Scan(count)
-		if err != nil {
-			return err
-		}
-	}
-	if res.Err() != nil {
-		return res.Err()
-	}
-	if active != 0 || pending == uint64(limit) || cleared == uint64(limit) {
-		return task_errors.NewInterruptExecutionError()
-	}
-	return nil
-}
-
 func (s *storageYDB) CheckBackupChunksCompleted(
 	ctx context.Context,
 	snapshotID string,
@@ -2151,96 +1910,36 @@ func (s *storageYDB) CheckBackupChunksCompleted(
 
 	defer s.metrics.StatOperation("CheckBackupChunksCompleted")(&err)
 
-	// Read failure and pending status together: checking them separately can
-	// miss a failure committed between the two reads and publish an incomplete map.
 	res, err := s.db.ExecuteRO(ctx, fmt.Sprintf(`
 		--!syntax_v1
 		pragma TablePathPrefix = "%v";
 		declare $snapshot_id as Utf8;
-		declare $completed as Int64;
+		declare $queued as Int64;
 
-		select chunk_id, status from backup_chunks
-		where snapshot_id = $snapshot_id and status != $completed
-		order by status desc limit 1;
+		select chunk_id
+		from backup_chunks
+		where snapshot_id = $snapshot_id and status = $queued
+		limit 1
 	`, s.tablesPath),
-		persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)),
-		persistence.ValueParam("$completed", persistence.Int64Value(int64(backupChunkStatusCompleted))),
+		persistence.ValueParam(
+			"$snapshot_id",
+			persistence.UTF8Value(snapshotID),
+		),
+		persistence.ValueParam(
+			"$queued",
+			persistence.Int64Value(int64(backupChunkStatusQueued)),
+		),
 	)
 	if err != nil {
 		return err
 	}
 	defer res.Close()
-	if !res.NextResultSet(ctx) || !res.NextRow() {
-		return res.Err()
-	}
-	var chunkID string
-	var status int64
-	err = res.ScanNamed(
-		persistence.OptionalWithDefault("chunk_id", &chunkID),
-		persistence.OptionalWithDefault("status", &status),
-	)
-	if err != nil {
-		return err
-	}
-	if res.Err() != nil {
-		return res.Err()
-	}
-	if status == int64(backupChunkStatusFailed) {
-		return task_errors.NewNonRetriableErrorf("failed to back up chunk %v of snapshot %v", chunkID, snapshotID)
-	}
-	return task_errors.NewInterruptExecutionError()
-}
 
-func (s *storageYDB) ChunkBackupFailed(
-	ctx context.Context,
-	entry BackupChunkQueueEntry,
-) (err error) {
-
-	defer s.metrics.StatOperation("ChunkBackupFailed")(&err)
-
-	_, err = s.db.ExecuteRW(ctx, fmt.Sprintf(`
-		--!syntax_v1
-		pragma TablePathPrefix = "%v";
-		declare $snapshot_id as Utf8;
-		declare $chunk_id as Utf8;
-		declare $failed as Int64;
-		declare $completed as Int64;
-
-		update backup_chunks set status = $failed
-		where snapshot_id = $snapshot_id and chunk_id = $chunk_id and status != $completed;
-		delete from backup_chunk_queue
-		where snapshot_id = $snapshot_id and chunk_id = $chunk_id;
-	`, s.tablesPath),
-		persistence.ValueParam("$snapshot_id", persistence.UTF8Value(entry.SnapshotID)),
-		persistence.ValueParam("$chunk_id", persistence.UTF8Value(entry.ChunkID)),
-		persistence.ValueParam("$failed", persistence.Int64Value(int64(backupChunkStatusFailed))),
-		persistence.ValueParam("$completed", persistence.Int64Value(int64(backupChunkStatusCompleted))),
-	)
-	return err
-}
-
-func (s *storageYDB) CheckSnapshotHeldForBackup(ctx context.Context, snapshotID, taskID string) (err error) {
-	defer s.metrics.StatOperation("CheckSnapshotHeldForBackup")(&err)
-	res, err := s.db.ExecuteRO(ctx, fmt.Sprintf(`
-		--!syntax_v1
-		pragma TablePathPrefix = "%v";
-		declare $snapshot_id as Utf8;
-		declare $task_id as Utf8;
-
-		select task_id from backup_snapshot_refs
-		where snapshot_id = $snapshot_id and task_id = $task_id
-	`, s.tablesPath), persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)), persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)))
-	if err != nil {
-		return err
-	}
-	defer res.Close()
 	if res.NextResultSet(ctx) && res.NextRow() {
-		return nil
+		return task_errors.NewInterruptExecutionError()
 	}
-	if err := res.Err(); err != nil {
-		return err
-	}
-	return task_errors.NewNonRetriableErrorf("snapshot %v is not held by task %v", snapshotID, taskID)
+
+	return res.Err()
 }
 
 // GetSnapshotIDFromChunkID returns the creator encoded in a chunk ID.

@@ -159,10 +159,7 @@ type Storage interface {
 		taskID string,
 	) error
 
-	CheckSnapshotHeldForBackup(ctx context.Context, snapshotID, taskID string) error
-
-	// ReleaseSnapshotForBackup removes only this task's reference, after its
-	// work and all registered workers have stopped using the snapshot.
+	// ReleaseSnapshotForBackup removes only this task's reference.
 	ReleaseSnapshotForBackup(
 		ctx context.Context,
 		snapshotID string,
@@ -181,8 +178,6 @@ type Storage interface {
 
 	ListSnapshots(ctx context.Context) (tasks_common.StringSet, error)
 
-	EnqueueBackupChunksForTask(ctx context.Context, snapshotID, taskID string, entries []BackupChunkQueueEntry) error
-
 	EnqueueBackupChunks(
 		ctx context.Context,
 		snapshotID string,
@@ -194,38 +189,17 @@ type Storage interface {
 		limit int,
 	) ([]BackupChunkQueueEntry, error)
 
-	// Claim only entries still in the queue and register their worker before IO.
-	ClaimBackupChunks(
-		ctx context.Context,
-		taskID string,
-		entries []BackupChunkQueueEntry,
-	) ([]BackupChunkQueueEntry, error)
-	ReleaseBackupChunkClaims(ctx context.Context, taskID string) error
-
-	// Remove pending work and wait for claimed workers before releasing the hold.
-	DrainSnapshotBackup(
-		ctx context.Context,
-		snapshotID string,
-		taskID string,
-		limit int,
-	) error
-
+	// Returns InterruptExecutionError while a chunk of the snapshot is queued.
 	CheckBackupChunksCompleted(ctx context.Context, snapshotID string) error
-	ChunkBackupFailed(ctx context.Context, entry BackupChunkQueueEntry) error
-
-	GetBackedUpChunkCount(
-		ctx context.Context,
-		snapshotID string,
-	) (uint64, error)
 
 	ChunksBackupCompleted(
 		ctx context.Context,
 		entries []BackupChunkQueueEntry,
 	) error
 
-	// Returns the number of cleared entries: limit, or fewer if there are no
-	// more completed entries of the snapshot.
-	ClearCompletedBackupChunks(
+	// Removes queued and completed entries of the snapshot. Returns the number
+	// of cleared entries: limit, or fewer if no entries are left.
+	ClearBackupChunks(
 		ctx context.Context,
 		snapshotID string,
 		limit int,

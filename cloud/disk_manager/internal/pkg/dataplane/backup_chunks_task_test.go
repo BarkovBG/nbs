@@ -8,7 +8,6 @@ import (
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/protos"
 	snapshot_storage "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/chunks"
-	storage_mocks "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/mocks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/test"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/monitoring/metrics"
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
@@ -166,59 +165,20 @@ func TestBackupChunksTaskGoesOnPastMissingChunk(t *testing.T) {
 
 	err = task.Run(ctx, execCtx)
 	require.Error(t, err)
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	require.False(t, errors.Is(err, errors.NewInterruptExecutionError()))
 
 	_, err = follower.getObject(ctx, backup.ChunkKey(chunkID))
 	require.NoError(t, err)
 
+	// The missing chunk stays queued for the next worker attempt.
 	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
 	require.NoError(t, err)
-	require.Empty(t, queue)
+	require.Equal(
+		t,
+		[]snapshot_storage.BackupChunkQueueEntry{missing},
+		queue,
+	)
 	err = storage.CheckBackupChunksCompleted(ctx, "snap1")
-	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 	require.NoError(t, storage.CheckBackupChunksCompleted(ctx, "snap2"))
-
-}
-
-func TestBackupChunksTaskRecoversClaimsAfterRestart(t *testing.T) {
-	ctx := test.NewContext()
-	storage, closeFunc := newStorage(t, ctx)
-	defer closeFunc()
-	follower := newTestFollower(t, ctx)
-	chunkID := createSnapshotWithChunk(t, ctx, storage, "snap1")
-	require.NoError(t, storage.HoldSnapshotForBackup(ctx, "snap1", "backup"))
-	entries := []snapshot_storage.BackupChunkQueueEntry{{
-		SnapshotID: "snap1", ChunkID: chunkID, StoredInS3: true,
-	}}
-	require.NoError(t, storage.EnqueueBackupChunks(ctx, "snap1", entries))
-	claimed, err := storage.ClaimBackupChunks(ctx, "worker", entries)
-	require.NoError(t, err)
-	require.Equal(t, entries, claimed)
-	err = storage.DrainSnapshotBackup(ctx, "snap1", "backup", 10)
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
-
-	// Simulate a worker restart after it registered its batch. Cancellation
-	// removed the queue, so the resumed worker must only release its claims.
-	task := newBackupChunksTask(storage, follower)
-	execCtx := mocks.NewExecutionContextMock()
-	execCtx.On("GetTaskID").Return("worker")
-	err = task.Run(ctx, execCtx)
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
-	require.NoError(t, storage.DrainSnapshotBackup(ctx, "snap1", "backup", 10))
-	_, err = follower.getObject(ctx, backup.ChunkKey(chunkID))
-	require.Error(t, err)
-}
-
-func TestBackupChunksTaskCancellationRetriesClaimCleanupFailure(t *testing.T) {
-	ctx := test.NewContext()
-	storage := storage_mocks.NewStorageMock()
-	storage.On("ReleaseBackupChunkClaims", ctx, "worker").Return(
-		errors.NewNonRetriableErrorf("storage failure"),
-	).Once()
-	execCtx := mocks.NewExecutionContextMock()
-	execCtx.On("GetTaskID").Return("worker")
-	err := newBackupChunksTask(storage, testFollower{}).Cancel(ctx, execCtx)
-	require.True(t, errors.Is(err, errors.NewEmptyRetriableError()))
-	require.False(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
-	storage.AssertExpectations(t)
 }

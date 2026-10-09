@@ -16,6 +16,8 @@ import (
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// The source is held by the caller's dataplane.LockSnapshotForBackup task for
+// the whole copy, so this task takes no reference of its own.
 type backupSnapshotDataTask struct {
 	storage   storage.Storage
 	backupS3  *backup.S3
@@ -44,17 +46,8 @@ func (t *backupSnapshotDataTask) Run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	if t.state.Finished {
-		return retrySnapshotBackupError(t.finish(ctx, execCtx))
-	}
-
-	err := t.holdSource(ctx, execCtx)
-	if err != nil {
-		return err
-	}
-
-	// Once accepted, only success or explicit cancellation releases data.
-	return retrySnapshotBackupError(t.backupHeldSource(ctx, execCtx))
+	// Only success or explicit cancellation ends an accepted copy.
+	return retrySnapshotBackupError(t.run(ctx, execCtx))
 }
 
 func (t *backupSnapshotDataTask) Cancel(
@@ -62,7 +55,7 @@ func (t *backupSnapshotDataTask) Cancel(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	return retrySnapshotBackupError(t.finish(ctx, execCtx))
+	return retrySnapshotBackupError(t.clearChunks(ctx))
 }
 
 func (t *backupSnapshotDataTask) GetMetadata(
@@ -78,24 +71,20 @@ func (t *backupSnapshotDataTask) GetResponse() proto.Message {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-func (t *backupSnapshotDataTask) holdSource(
+func (t *backupSnapshotDataTask) run(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	return t.storage.HoldSnapshotForBackup(
-		ctx,
-		t.request.SnapshotId,
-		execCtx.GetTaskID(),
-	)
-}
+	if t.state.Finished {
+		return t.clearChunks(ctx)
+	}
 
-func (t *backupSnapshotDataTask) backupHeldSource(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-) error {
-
-	if err := t.backupS3.CheckEncryptedDEK(t.request.EncryptedDek); err != nil {
+	// A DEK that cannot be opened fails the chunk copier on every
+	// chunk and leaves those queue rows unfinished, so this task
+	// interrupts forever. Reject it before anything is enqueued.
+	err := t.backupS3.CheckEncryptedDEK(t.request.EncryptedDek)
+	if err != nil {
 		return err
 	}
 
@@ -109,10 +98,12 @@ func (t *backupSnapshotDataTask) backupHeldSource(
 	if err != nil {
 		return err
 	}
+
 	err = t.backupChunkMap(ctx, execCtx, meta)
 	if err != nil {
 		return err
 	}
+
 	if len(t.request.MetaKey) != 0 {
 		err = t.backupS3.PutObject(
 			ctx,
@@ -125,31 +116,35 @@ func (t *backupSnapshotDataTask) backupHeldSource(
 		}
 	}
 
-	// Persist success before release so a restarted task only cleans up.
+	// Persist success before cleanup so a restarted task only cleans up.
 	t.state.Finished = true
 	err = execCtx.SaveState(ctx)
 	if err != nil {
 		return err
 	}
-	return t.finish(ctx, execCtx)
+
+	return t.clearChunks(ctx)
 }
 
-func (t *backupSnapshotDataTask) finish(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-) error {
+// Removes the queued and completed chunk entries of the snapshot: the copy is
+// complete, or cancelled and must be copied again by its next attempt.
+func (t *backupSnapshotDataTask) clearChunks(ctx context.Context) error {
+	for {
+		cleared, err := t.storage.ClearBackupChunks(
+			ctx,
+			t.request.SnapshotId,
+			t.batchSize,
+		)
+		if err != nil {
+			return err
+		}
 
-	taskID := execCtx.GetTaskID()
-	err := t.storage.DrainSnapshotBackup(
-		ctx,
-		t.request.SnapshotId,
-		taskID,
-		t.batchSize,
-	)
-	if err != nil {
-		return err
+		// The storage clears fewer than batchSize entries only when no
+		// entries are left.
+		if cleared < t.batchSize {
+			return nil
+		}
 	}
-	return t.storage.ReleaseSnapshotForBackup(ctx, t.request.SnapshotId, taskID)
 }
 
 func validateChunkMapEntry(
@@ -178,10 +173,9 @@ func (t *backupSnapshotDataTask) enqueueBatch(
 ) error {
 
 	if len(batch) != 0 {
-		err := t.storage.EnqueueBackupChunksForTask(
+		err := t.storage.EnqueueBackupChunks(
 			ctx,
 			t.request.SnapshotId,
-			execCtx.GetTaskID(),
 			batch,
 		)
 		if err != nil {
@@ -255,6 +249,21 @@ func (t *backupSnapshotDataTask) enqueueChunks(
 	return t.enqueueBatch(ctx, execCtx, batch, t.state.ChunkCount)
 }
 
+func (t *backupSnapshotDataTask) creatorCompleted(chunkID string) bool {
+	creator := storage.GetSnapshotIDFromChunkID(chunkID)
+	if creator == "" || creator == t.request.SnapshotId {
+		return false
+	}
+
+	for _, id := range t.request.CompletedSnapshotIds {
+		if creator == id {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (t *backupSnapshotDataTask) waitForChunksBackupCompleted(
 	ctx context.Context,
 	snapshotID string,
@@ -262,11 +271,17 @@ func (t *backupSnapshotDataTask) waitForChunksBackupCompleted(
 
 	err := t.storage.CheckBackupChunksCompleted(ctx, snapshotID)
 	if errors.Is(err, errors.NewInterruptExecutionError()) {
-		logging.Debug(ctx, "Backup of snapshot with id %v is waiting for its chunks to finish backing up", snapshotID)
+		logging.Debug(
+			ctx,
+			"Backup of snapshot with id %v is waiting for its chunks to finish backing up",
+			snapshotID,
+		)
 	}
+
 	return err
 }
 
+// The full map is published only after every queued chunk has completed.
 func (t *backupSnapshotDataTask) backupChunkMap(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
@@ -276,23 +291,43 @@ func (t *backupSnapshotDataTask) backupChunkMap(
 	if t.state.ChunkMapBackedUp {
 		return nil
 	}
-	if err := t.waitForChunksBackupCompleted(ctx, meta.ID); err != nil {
-		if errors.Is(err, errors.NewEmptyNonRetriableError()) {
-			t.state.MilestoneChunkIndex = 0
-			if saveErr := execCtx.SaveState(ctx); saveErr != nil {
-				return saveErr
-			}
-		}
-		return err
-	}
-	chunkMap, err := t.buildChunkMap(ctx, execCtx, meta)
+
+	err := t.waitForChunksBackupCompleted(ctx, meta.ID)
 	if err != nil {
 		return err
 	}
+
+	chunkMap := &protos.BackupChunkMap{
+		ChunkIds: make([]string, meta.ChunkCount),
+	}
+
+	readCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	entries, entriesErrors := t.storage.ReadChunkMap(
+		readCtx,
+		meta.ID,
+		0, // milestoneChunkIndex
+	)
+	for entry := range entries {
+		err := validateChunkMapEntry(entry, meta.ID, meta.ChunkCount)
+		if err != nil {
+			return err
+		}
+
+		chunkMap.ChunkIds[entry.ChunkIndex] = entry.ChunkID
+	}
+
+	err = <-entriesErrors
+	if err != nil {
+		return err
+	}
+
 	data, err := proto.Marshal(chunkMap)
 	if err != nil {
 		return errors.NewNonRetriableError(err)
 	}
+
 	err = t.backupS3.PutObject(
 		ctx,
 		backup.ChunkMapKey(meta.ID),
@@ -302,55 +337,23 @@ func (t *backupSnapshotDataTask) backupChunkMap(
 	if err != nil {
 		return err
 	}
+
 	t.state.ChunkMapBackedUp = true
 	return execCtx.SaveState(ctx)
 }
 
 func retrySnapshotBackupError(err error) error {
-	if err == nil || errors.Is(err, errors.NewInterruptExecutionError()) || errors.Is(err, errors.NewWrongGenerationError()) || errors.Is(err, context.Canceled) {
+	if err == nil ||
+		errors.Is(err, errors.NewInterruptExecutionError()) ||
+		errors.Is(err, errors.NewWrongGenerationError()) ||
+		errors.Is(err, context.Canceled) {
+
 		return err
 	}
+
 	// A typed non-retriable cause would still trigger runner cancellation.
-	return errors.NewRetriableErrorWithIgnoreRetryLimitf("snapshot backup waits for recovery: %v", err)
-}
-
-// The source stays held until all queued chunks have completed and the full
-// map is published. Dependency ordering never changes the source map.
-func (t *backupSnapshotDataTask) buildChunkMap(
-	ctx context.Context, execCtx tasks.ExecutionContext, meta storage.SnapshotMeta,
-) (*protos.BackupChunkMap, error) {
-	taskID := execCtx.GetTaskID()
-	if err := t.storage.CheckSnapshotHeldForBackup(ctx, meta.ID, taskID); err != nil {
-		return nil, err
-	}
-	chunkMap := &protos.BackupChunkMap{ChunkIds: make([]string, meta.ChunkCount)}
-	readCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	entries, readErrors := t.storage.ReadChunkMap(readCtx, meta.ID, 0)
-	for entry := range entries {
-		if err := validateChunkMapEntry(entry, meta.ID, meta.ChunkCount); err != nil {
-			return nil, err
-		}
-		chunkMap.ChunkIds[entry.ChunkIndex] = entry.ChunkID
-	}
-	if err := <-readErrors; err != nil {
-		return nil, err
-	}
-	if err := t.storage.CheckSnapshotHeldForBackup(ctx, meta.ID, taskID); err != nil {
-		return nil, err
-	}
-	return chunkMap, nil
-}
-
-func (t *backupSnapshotDataTask) creatorCompleted(chunkID string) bool {
-	creator := storage.GetSnapshotIDFromChunkID(chunkID)
-	if creator == "" || creator == t.request.SnapshotId {
-		return false
-	}
-	for _, id := range t.request.CompletedSnapshotIds {
-		if creator == id {
-			return true
-		}
-	}
-	return false
+	return errors.NewRetriableErrorWithIgnoreRetryLimitf(
+		"snapshot backup waits for recovery: %v",
+		err,
+	)
 }
