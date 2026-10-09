@@ -121,7 +121,7 @@ func (s *storageYDB) ListSnapshotBackupFolders(ctx context.Context) ([]SnapshotB
 	res, err := s.db.ExecuteRO(ctx, fmt.Sprintf(`
   --!syntax_v1
   pragma TablePathPrefix = "%v";
-  select folder_id, generation from backup_folders where COALESCE(enabled, false);
+  select folder_id, generation from backup_folders where enabled;
  `, s.snapshotsPath))
 	if err != nil {
 		return nil, err

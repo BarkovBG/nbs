@@ -552,7 +552,7 @@ func (s *storageYDB) snapshotCreated(
    declare $folder_id as Utf8;
    upsert into backup_queue (snapshot_id, backup_id)
    select $snapshot_id as snapshot_id, generation as backup_id
-   from backup_folders where folder_id = $folder_id and COALESCE(enabled, false);
+   from backup_folders where folder_id = $folder_id and enabled;
   `, s.snapshotsPath), persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)), persistence.ValueParam("$folder_id", persistence.UTF8Value(state.folderID)))
 		if err != nil {
 			return err
