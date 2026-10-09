@@ -12,6 +12,8 @@ import (
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
 )
 
+////////////////////////////////////////////////////////////////////////////////
+
 type lockSnapshotForBackupTask struct {
 	storage storage.Storage
 	request *protos.LockSnapshotForBackupRequest
@@ -24,21 +26,56 @@ func (t *lockSnapshotForBackupTask) Save() ([]byte, error) {
 
 func (t *lockSnapshotForBackupTask) Load(request, state []byte) error {
 	t.request = &protos.LockSnapshotForBackupRequest{}
-	if err := proto.Unmarshal(request, t.request); err != nil {
+	err := proto.Unmarshal(request, t.request)
+	if err != nil {
 		return err
 	}
+
 	t.state = &protos.LockSnapshotForBackupState{}
 	return proto.Unmarshal(state, t.state)
 }
 
-func (t *lockSnapshotForBackupTask) Run(ctx context.Context, execCtx tasks.ExecutionContext) error {
+func (t *lockSnapshotForBackupTask) Run(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
+
 	if t.request.SnapshotId == "" {
 		return errors.NewNonRetriableErrorf("snapshot backup lock requires a snapshot ID")
 	}
 	return retrySnapshotBackupError(t.run(ctx, execCtx))
 }
 
-func (t *lockSnapshotForBackupTask) run(ctx context.Context, execCtx tasks.ExecutionContext) error {
+func (t *lockSnapshotForBackupTask) Cancel(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
+
+	return retrySnapshotBackupError(t.storage.ReleaseSnapshotForBackup(
+		ctx,
+		t.request.SnapshotId,
+		execCtx.GetTaskID(),
+	))
+}
+
+func (t *lockSnapshotForBackupTask) GetMetadata(
+	ctx context.Context,
+) (proto.Message, error) {
+
+	return t.state, nil
+}
+
+func (t *lockSnapshotForBackupTask) GetResponse() proto.Message {
+	return &empty.Empty{}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+func (t *lockSnapshotForBackupTask) run(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
+
 	// Release may arrive before the first execution or after a restart.
 	if execCtx.HasEvent(ctx, int64(protos.SnapshotBackupLockEvent_RELEASE)) {
 		return t.storage.ReleaseSnapshotForBackup(ctx, t.request.SnapshotId, execCtx.GetTaskID())
@@ -82,7 +119,11 @@ func (t *lockSnapshotForBackupTask) run(ctx context.Context, execCtx tasks.Execu
 	return nil
 }
 
-func (t *lockSnapshotForBackupTask) readDependencies(ctx context.Context, meta *storage.SnapshotMeta) ([]string, error) {
+func (t *lockSnapshotForBackupTask) readDependencies(
+	ctx context.Context,
+	meta *storage.SnapshotMeta,
+) ([]string, error) {
+
 	readCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	entries, readErrors := t.storage.ReadChunkMap(readCtx, meta.ID, 0)
@@ -111,16 +152,4 @@ func (t *lockSnapshotForBackupTask) readDependencies(ctx context.Context, meta *
 	}
 	sort.Strings(result)
 	return result, nil
-}
-
-func (t *lockSnapshotForBackupTask) Cancel(ctx context.Context, execCtx tasks.ExecutionContext) error {
-	return retrySnapshotBackupError(t.storage.ReleaseSnapshotForBackup(ctx, t.request.SnapshotId, execCtx.GetTaskID()))
-}
-
-func (t *lockSnapshotForBackupTask) GetMetadata(context.Context) (proto.Message, error) {
-	return t.state, nil
-}
-
-func (t *lockSnapshotForBackupTask) GetResponse() proto.Message {
-	return &empty.Empty{}
 }
