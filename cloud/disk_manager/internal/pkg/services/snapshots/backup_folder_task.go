@@ -17,8 +17,8 @@ const backupFolderPageSize = 100
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// The folder task only fills the shared queue. It owns no source locks or
-// copy children; the single-ID graph task performs all protection and copying.
+// The folder task only fills the shared queue. It owns no locks or copy
+// children; snapshots.BackupSnapshot locks and copies each queued snapshot.
 type backupFolderTask struct {
 	storage resources.Storage
 	request *protos.BackupFolderRequest
