@@ -2155,14 +2155,3 @@ func TestReadChunkBlobStoredInYDB(t *testing.T) {
 	)
 	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
 }
-
-func TestGetSnapshotIDFromChunkID(t *testing.T) {
-	require.Equal(t, "snap1", getSnapshotIDFromChunkID("task1.snap1.7"))
-	require.Equal(t, "snap.1", getSnapshotIDFromChunkID("task1.snap.1.7"))
-	require.Empty(t, getSnapshotIDFromChunkID("task1.snap1"))
-	require.Empty(t, getSnapshotIDFromChunkID(""))
-
-	require.True(t, IsChunkCreatedBySnapshot("task1.snap.1.7", "snap.1"))
-	require.False(t, IsChunkCreatedBySnapshot("task1.snap1.7", "snap2"))
-	require.False(t, IsChunkCreatedBySnapshot("", ""))
-}

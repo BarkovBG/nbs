@@ -868,6 +868,97 @@ func (s *storageYDB) listSnapshots(
 	)
 }
 
+func (s *storageYDB) listSnapshotsToBackup(
+	ctx context.Context,
+	session *persistence.Session,
+	limit int,
+) ([]SnapshotBackupRequest, error) {
+
+	res, err := session.ExecuteRO(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $limit as Uint64;
+
+		select snapshot_id, backup_id
+		from backup_queue
+		limit $limit
+	`, s.snapshotsPath),
+		persistence.ValueParam("$limit", persistence.Uint64Value(uint64(limit))),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Close()
+
+	var backups []SnapshotBackupRequest
+	for res.NextResultSet(ctx) {
+		for res.NextRow() {
+			var backup SnapshotBackupRequest
+			err = res.ScanNamed(
+				persistence.OptionalWithDefault(
+					"snapshot_id",
+					&backup.SnapshotID,
+				),
+				persistence.OptionalWithDefault("backup_id", &backup.BackupID),
+			)
+			if err != nil {
+				return nil, err
+			}
+			backups = append(backups, backup)
+		}
+	}
+	return backups, res.Err()
+}
+
+func (s *storageYDB) removeSnapshotFromBackupQueue(
+	ctx context.Context,
+	session *persistence.Session,
+	snapshotID string,
+	backupID string,
+) error {
+
+	_, err := session.ExecuteRW(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $snapshot_id as Utf8;
+		declare $backup_id as Utf8;
+
+		delete from backup_queue
+		where snapshot_id = $snapshot_id and backup_id = $backup_id
+	`, s.snapshotsPath),
+		persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)),
+		persistence.ValueParam("$backup_id", persistence.UTF8Value(backupID)),
+	)
+	return err
+}
+
+func (s *storageYDB) snapshotBackupCompleted(
+	ctx context.Context,
+	session *persistence.Session,
+	snapshotID string,
+) error {
+
+	// A deleting snapshot is not marked: its copy may have found the
+	// snapshot already deleted and copied nothing.
+	_, err := session.ExecuteRW(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $id as Utf8;
+		declare $ready as Int64;
+
+		update snapshots
+		set backup_completed = true
+		where id = $id and status = $ready
+	`, s.snapshotsPath),
+		persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)),
+		persistence.ValueParam(
+			"$ready",
+			persistence.Int64Value(int64(snapshotStatusReady)),
+		),
+	)
+	return err
+}
+
 func (s *storageYDB) enqueueSnapshotBackup(
 	ctx context.Context,
 	session *persistence.Session,
@@ -969,97 +1060,6 @@ func (s *storageYDB) enqueueSnapshotBackup(
 		return err
 	}
 	return tx.Commit(ctx)
-}
-
-func (s *storageYDB) snapshotBackupCompleted(
-	ctx context.Context,
-	session *persistence.Session,
-	snapshotID string,
-) error {
-
-	// A deleting snapshot is not marked: its copy may have found the
-	// snapshot already deleted and copied nothing.
-	_, err := session.ExecuteRW(ctx, fmt.Sprintf(`
-		--!syntax_v1
-		pragma TablePathPrefix = "%v";
-		declare $id as Utf8;
-		declare $ready as Int64;
-
-		update snapshots
-		set backup_completed = true
-		where id = $id and status = $ready
-	`, s.snapshotsPath),
-		persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)),
-		persistence.ValueParam(
-			"$ready",
-			persistence.Int64Value(int64(snapshotStatusReady)),
-		),
-	)
-	return err
-}
-
-func (s *storageYDB) listSnapshotsToBackup(
-	ctx context.Context,
-	session *persistence.Session,
-	limit int,
-) ([]SnapshotBackupRequest, error) {
-
-	res, err := session.ExecuteRO(ctx, fmt.Sprintf(`
-		--!syntax_v1
-		pragma TablePathPrefix = "%v";
-		declare $limit as Uint64;
-
-		select snapshot_id, backup_id
-		from backup_queue
-		limit $limit
-	`, s.snapshotsPath),
-		persistence.ValueParam("$limit", persistence.Uint64Value(uint64(limit))),
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Close()
-
-	var backups []SnapshotBackupRequest
-	for res.NextResultSet(ctx) {
-		for res.NextRow() {
-			var backup SnapshotBackupRequest
-			err = res.ScanNamed(
-				persistence.OptionalWithDefault(
-					"snapshot_id",
-					&backup.SnapshotID,
-				),
-				persistence.OptionalWithDefault("backup_id", &backup.BackupID),
-			)
-			if err != nil {
-				return nil, err
-			}
-			backups = append(backups, backup)
-		}
-	}
-	return backups, res.Err()
-}
-
-func (s *storageYDB) removeSnapshotFromBackupQueue(
-	ctx context.Context,
-	session *persistence.Session,
-	snapshotID string,
-	backupID string,
-) error {
-
-	_, err := session.ExecuteRW(ctx, fmt.Sprintf(`
-		--!syntax_v1
-		pragma TablePathPrefix = "%v";
-		declare $snapshot_id as Utf8;
-		declare $backup_id as Utf8;
-
-		delete from backup_queue
-		where snapshot_id = $snapshot_id and backup_id = $backup_id
-	`, s.snapshotsPath),
-		persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)),
-		persistence.ValueParam("$backup_id", persistence.UTF8Value(backupID)),
-	)
-	return err
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1192,33 +1192,6 @@ func (s *storageYDB) ListSnapshots(
 	return ids, err
 }
 
-func (s *storageYDB) EnqueueSnapshotBackup(
-	ctx context.Context,
-	snapshotID string,
-	backupID string,
-) error {
-
-	return s.db.Execute(
-		ctx,
-		func(ctx context.Context, session *persistence.Session) error {
-			return s.enqueueSnapshotBackup(ctx, session, snapshotID, backupID)
-		},
-	)
-}
-
-func (s *storageYDB) SnapshotBackupCompleted(
-	ctx context.Context,
-	snapshotID string,
-) error {
-
-	return s.db.Execute(
-		ctx,
-		func(ctx context.Context, session *persistence.Session) error {
-			return s.snapshotBackupCompleted(ctx, session, snapshotID)
-		},
-	)
-}
-
 func (s *storageYDB) ListSnapshotsToBackup(
 	ctx context.Context,
 	limit int,
@@ -1252,6 +1225,33 @@ func (s *storageYDB) RemoveSnapshotFromBackupQueue(
 				snapshotID,
 				backupID,
 			)
+		},
+	)
+}
+
+func (s *storageYDB) SnapshotBackupCompleted(
+	ctx context.Context,
+	snapshotID string,
+) error {
+
+	return s.db.Execute(
+		ctx,
+		func(ctx context.Context, session *persistence.Session) error {
+			return s.snapshotBackupCompleted(ctx, session, snapshotID)
+		},
+	)
+}
+
+func (s *storageYDB) EnqueueSnapshotBackup(
+	ctx context.Context,
+	snapshotID string,
+	backupID string,
+) error {
+
+	return s.db.Execute(
+		ctx,
+		func(ctx context.Context, session *persistence.Session) error {
+			return s.enqueueSnapshotBackup(ctx, session, snapshotID, backupID)
 		},
 	)
 }

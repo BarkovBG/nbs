@@ -14,13 +14,11 @@ import (
 	"github.com/ydb-platform/nbs/cloud/tasks"
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
 	"github.com/ydb-platform/nbs/cloud/tasks/headers"
+	"github.com/ydb-platform/nbs/cloud/tasks/persistence"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// Backs up one snapshot. dataplane.BackupSnapshotData holds the snapshot for
-// the whole copy and copies every chunk of its map that is not in the follower
-// yet, so chunks shared with other snapshots are copied once.
 type backupSnapshotTask struct {
 	scheduler tasks.Scheduler
 	storage   resources.Storage
@@ -49,103 +47,23 @@ func (t *backupSnapshotTask) Run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	return retrySnapshotBackupError(t.run(ctx, execCtx))
-}
+	snapshotID := t.request.SnapshotId
 
-func (t *backupSnapshotTask) Cancel(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-) error {
-
-	return retrySnapshotBackupError(t.cancel(ctx, execCtx))
-}
-
-func (t *backupSnapshotTask) GetMetadata(
-	ctx context.Context,
-) (proto.Message, error) {
-
-	return &empty.Empty{}, nil
-}
-
-func (t *backupSnapshotTask) GetResponse() proto.Message {
-	return &empty.Empty{}
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
-func (t *backupSnapshotTask) run(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-) error {
-
-	// A saved copy ID accepts the copy. The copy holds the snapshot, so it
-	// finishes even if the snapshot is being deleted.
-	if len(t.state.DataplaneTaskID) == 0 {
-		meta, err := t.storage.GetSnapshotMeta(ctx, t.request.SnapshotId)
-		if err != nil {
-			return err
-		}
-
-		// Nothing to copy: the snapshot is gone or already backed up.
-		if meta == nil || !meta.Ready || meta.BackupCompleted {
-			return t.removeFromQueue(ctx)
-		}
-
-		err = t.scheduleCopy(ctx, execCtx, meta)
-		if err != nil {
-			return err
-		}
-	}
-
-	_, err := t.scheduler.WaitTask(ctx, execCtx, t.state.DataplaneTaskID)
+	meta, err := t.storage.GetSnapshotMeta(ctx, snapshotID)
 	if err != nil {
 		return err
 	}
 
-	// Marks only a ready snapshot: if deletion won before the copy took its
-	// hold, the snapshot is already deleting and the copy copied nothing.
-	err = t.storage.SnapshotBackupCompleted(ctx, t.request.SnapshotId)
-	if err != nil {
-		return err
+	// Nothing to copy: the snapshot is gone or already backed up.
+	if meta == nil || !meta.Ready || meta.BackupCompleted {
+		return t.removeFromQueue(ctx)
 	}
-
-	return t.removeFromQueue(ctx)
-}
-
-func (t *backupSnapshotTask) cancel(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-) error {
-
-	// The copy clears its chunks and releases the snapshot in its own Cancel.
-	// A copy scheduled without a saved ID runs to the end and releases the
-	// snapshot itself.
-	if len(t.state.DataplaneTaskID) != 0 {
-		_, err := t.scheduler.CancelTask(ctx, t.state.DataplaneTaskID)
-		if err != nil {
-			return err
-		}
-	}
-
-	return t.removeFromQueue(ctx)
-}
-
-func (t *backupSnapshotTask) removeFromQueue(ctx context.Context) error {
-	return t.storage.RemoveSnapshotFromBackupQueue(
-		ctx,
-		t.request.SnapshotId,
-		t.request.BackupId,
-	)
-}
-
-func (t *backupSnapshotTask) scheduleCopy(
-	ctx context.Context,
-	execCtx tasks.ExecutionContext,
-	meta *resources.SnapshotMeta,
-) error {
 
 	if meta.Disk == nil {
-		return errors.NewNonRetriableErrorf("snapshot %v has no disk", meta.ID)
+		return errors.NewNonRetriableErrorf(
+			"snapshot %v has no disk",
+			snapshotID,
+		)
 	}
 
 	snapshotMeta, err := backup.NewSnapshotMeta(*meta)
@@ -173,18 +91,29 @@ func (t *backupSnapshotTask) scheduleCopy(
 		}
 	}
 
+	err = t.backupS3.PutObject(
+		ctx,
+		backup.SnapshotMetaKey(meta.Disk.DiskId, snapshotID),
+		t.state.EncryptedDek,
+		persistence.S3Object{Data: data},
+	)
+	if err != nil {
+		return err
+	}
+
+	idempotencyKey := fmt.Sprintf(
+		"%v_%v_backup",
+		execCtx.GetTaskID(),
+		snapshotID,
+	)
+
 	taskID, err := t.scheduler.ScheduleTask(
-		headers.SetIncomingIdempotencyKey(
-			ctx,
-			fmt.Sprintf("%v_backup", execCtx.GetTaskID()),
-		),
+		headers.SetIncomingIdempotencyKey(ctx, idempotencyKey),
 		"dataplane.BackupSnapshotData",
 		"",
 		&dataplane_protos.BackupSnapshotDataRequest{
-			SnapshotId:   meta.ID,
+			SnapshotId:   snapshotID,
 			EncryptedDek: t.state.EncryptedDek,
-			MetaKey:      backup.SnapshotMetaKey(meta.Disk.DiskId, meta.ID),
-			Meta:         data,
 		},
 	)
 	if err != nil {
@@ -192,20 +121,62 @@ func (t *backupSnapshotTask) scheduleCopy(
 	}
 
 	t.state.DataplaneTaskID = taskID
-	return execCtx.SaveState(ctx)
-}
 
-func retrySnapshotBackupError(err error) error {
-	if err == nil ||
-		errors.Is(err, errors.NewInterruptExecutionError()) ||
-		errors.Is(err, errors.NewWrongGenerationError()) ||
-		errors.Is(err, context.Canceled) {
-
+	err = execCtx.SaveState(ctx)
+	if err != nil {
 		return err
 	}
 
-	return errors.NewRetriableErrorWithIgnoreRetryLimitf(
-		"snapshot backup waits for recovery: %v",
-		err,
+	_, err = t.scheduler.WaitTask(ctx, execCtx, taskID)
+	if err != nil {
+		return err
+	}
+
+	// Marks only a ready snapshot: if deletion won before the copy took its
+	// hold, the snapshot is already deleting and the copy copied nothing.
+	err = t.storage.SnapshotBackupCompleted(ctx, snapshotID)
+	if err != nil {
+		return err
+	}
+
+	return t.removeFromQueue(ctx)
+}
+
+func (t *backupSnapshotTask) Cancel(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
+
+	// TODO(https://github.com/ydb-platform/nbs/issues/7237):
+	// roll back the objects already written to the follower bucket.
+	// The copy clears its chunks and releases the snapshot in its own Cancel.
+	if len(t.state.DataplaneTaskID) != 0 {
+		_, err := t.scheduler.CancelTask(ctx, t.state.DataplaneTaskID)
+		if err != nil {
+			return err
+		}
+	}
+
+	return t.removeFromQueue(ctx)
+}
+
+func (t *backupSnapshotTask) GetMetadata(
+	ctx context.Context,
+) (proto.Message, error) {
+
+	return &empty.Empty{}, nil
+}
+
+func (t *backupSnapshotTask) GetResponse() proto.Message {
+	return &empty.Empty{}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+func (t *backupSnapshotTask) removeFromQueue(ctx context.Context) error {
+	return t.storage.RemoveSnapshotFromBackupQueue(
+		ctx,
+		t.request.SnapshotId,
+		t.request.BackupId,
 	)
 }
