@@ -1,7 +1,6 @@
 GO_LIBRARY()
 
 SRCS(
-    backup_snapshot_graph.go
     backup_snapshot_task.go
     clear_deleted_snapshots_task.go
     create_snapshot_from_disk_task.go
