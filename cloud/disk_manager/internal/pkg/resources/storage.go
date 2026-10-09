@@ -249,7 +249,7 @@ type Storage interface {
 	) ([]SnapshotBackupRequest, error)
 
 	// Queue cleanup is not proof of a completed copy; SnapshotBackupCompleted
-	// records success.
+	// records success. It marks only a ready snapshot.
 	RemoveSnapshotFromBackupQueue(
 		ctx context.Context,
 		snapshotID string,

@@ -18,10 +18,4 @@ message BackupSnapshotDataTaskState {
     uint32 ChunkCount = 2;
     bool Finished = 3;
     bool ChunkMapBackedUp = 4;
-    bool Skipped = 5;
-}
-
-message BackupSnapshotDataResponse {
-    // Deletion of the snapshot won: nothing was copied.
-    bool Skipped = 1;
 }

@@ -770,6 +770,17 @@ func completeSnapshotBackupForTest(t *testing.T, ctx context.Context, storage St
 	require.NoError(t, storage.SnapshotBackupCompleted(ctx, id))
 }
 
+func TestSnapshotBackupCompletedMarksOnlyReadySnapshot(t *testing.T) {
+	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
+	_, err := storage.DeleteSnapshot(ctx, "snapshot", "delete", time.Now())
+	require.NoError(t, err)
+
+	require.NoError(t, storage.SnapshotBackupCompleted(ctx, "snapshot"))
+	meta, err := storage.GetSnapshotMeta(ctx, "snapshot")
+	require.NoError(t, err)
+	require.False(t, meta.BackupCompleted)
+}
+
 func TestSnapshotBackupQueueRemovalDoesNotMarkSnapshotCompleted(t *testing.T) {
 	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
 	require.NoError(t, storage.EnqueueSnapshotBackup(ctx, "snapshot", "attempt"))

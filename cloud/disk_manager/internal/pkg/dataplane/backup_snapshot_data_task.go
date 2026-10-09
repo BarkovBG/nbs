@@ -66,7 +66,7 @@ func (t *backupSnapshotDataTask) GetMetadata(
 }
 
 func (t *backupSnapshotDataTask) GetResponse() proto.Message {
-	return &protos.BackupSnapshotDataResponse{Skipped: t.state.Skipped}
+	return &empty.Empty{}
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -91,9 +91,10 @@ func (t *backupSnapshotDataTask) run(
 		return err
 	}
 
+	// Deletion started first: there is nothing to copy. The snapshot is not
+	// marked as backed up because it is not ready.
 	if !held {
-		t.state.Skipped = true
-		return execCtx.SaveState(ctx)
+		return nil
 	}
 
 	// A DEK that cannot be opened fails the chunk copier on every

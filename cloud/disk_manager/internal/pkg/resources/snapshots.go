@@ -969,16 +969,23 @@ func (s *storageYDB) snapshotBackupCompleted(
 	snapshotID string,
 ) error {
 
+	// A deleting snapshot is not marked: its copy may have found the
+	// snapshot already deleted and copied nothing.
 	_, err := session.ExecuteRW(ctx, fmt.Sprintf(`
 		--!syntax_v1
 		pragma TablePathPrefix = "%v";
 		declare $id as Utf8;
+		declare $ready as Int64;
 
 		update snapshots
 		set backup_completed = true
-		where id = $id
+		where id = $id and status = $ready
 	`, s.snapshotsPath),
 		persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)),
+		persistence.ValueParam(
+			"$ready",
+			persistence.Int64Value(int64(snapshotStatusReady)),
+		),
 	)
 	return err
 }
