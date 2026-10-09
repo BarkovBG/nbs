@@ -122,6 +122,9 @@ func (t *backupSnapshotTask) run(ctx context.Context, execCtx tasks.ExecutionCon
 		if err := execCtx.SaveState(ctx); err != nil {
 			return err
 		}
+		if err := t.releaseSnapshotLock(ctx, execCtx, node); err != nil {
+			return err
+		}
 		if err := t.storage.ReleaseSnapshotBackup(ctx, node.SnapshotId, t.ownerID(execCtx), node.Completed); err != nil {
 			return err
 		}
@@ -169,20 +172,6 @@ func (t *backupSnapshotTask) Cancel(ctx context.Context, execCtx tasks.Execution
 }
 
 func (t *backupSnapshotTask) cancel(ctx context.Context, execCtx tasks.ExecutionContext) error {
-	// Reader intent is saved before scheduling, just like the exact copy request.
-	if t.state.ReaderSnapshotId != "" && t.state.ReaderTaskId == "" {
-		if err := t.scheduleDependencyReader(ctx, execCtx); err != nil {
-			return err
-		}
-	}
-	if t.state.ReaderTaskId != "" {
-		if _, err := t.scheduler.CancelTask(ctx, t.state.ReaderTaskId); err != nil {
-			return err
-		}
-		if err := t.scheduler.WaitTaskEnded(ctx, t.state.ReaderTaskId); err != nil {
-			return err
-		}
-	}
 	if t.state.DataplaneTaskID == "" && t.state.DataplaneRequest != nil {
 		if err := t.scheduleDataplaneTask(ctx, execCtx); err != nil {
 			return err
@@ -211,6 +200,28 @@ func (t *backupSnapshotTask) cancel(ctx context.Context, execCtx tasks.Execution
 			return err
 		}
 	}
+	for _, node := range t.state.Nodes {
+		if !node.LockRequested {
+			continue
+		}
+		// Recover a child whose ScheduleTask succeeded before saving its ID.
+		if node.LockTaskId == "" {
+			if err := t.scheduleSnapshotLock(ctx, execCtx, node); err != nil {
+				return err
+			}
+		}
+		if _, err := t.scheduler.CancelTask(ctx, node.LockTaskId); err != nil {
+			return err
+		}
+		if err := t.scheduler.WaitTaskEnded(ctx, node.LockTaskId); err != nil {
+			return err
+		}
+		node.LockRequested = false
+		node.LockTaskId = ""
+		if err := execCtx.SaveState(ctx); err != nil {
+			return err
+		}
+	}
 	return t.releasePlan(ctx, execCtx)
 }
 
@@ -218,6 +229,9 @@ func (t *backupSnapshotTask) releasePlan(ctx context.Context, execCtx tasks.Exec
 	// Includes nodes whose Hold succeeded immediately before a failed SaveState:
 	// every node's intent was durable before acquisition, even if not discovered.
 	for _, node := range t.state.Nodes {
+		if err := t.releaseSnapshotLock(ctx, execCtx, node); err != nil {
+			return err
+		}
 		if err := t.storage.ReleaseSnapshotBackup(ctx, node.SnapshotId, t.ownerID(execCtx), node.Completed); err != nil {
 			return err
 		}

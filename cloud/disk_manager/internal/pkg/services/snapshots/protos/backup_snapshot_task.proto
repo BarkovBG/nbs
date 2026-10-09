@@ -23,12 +23,10 @@ message BackupSnapshotTaskState {
 
     repeated SnapshotBackupNode Nodes = 13;
     bool GraphPrepared = 12;
-    string ReaderSnapshotId = 15;
-    string ReaderTaskId = 16;
     uint32 CopyIndex = 18;
 
-    // Removed duplicate DEK, completion list and derived traversal/order.
-    reserved 2, 10, 14, 17;
+    // Removed duplicate DEK, completion list, derived traversal/order and reader.
+    reserved 2, 10, 14, 15, 16, 17;
 }
 
 message BackupSnapshotResponse {
@@ -43,4 +41,6 @@ message SnapshotBackupNode {
     bool Discovered = 3;
     bool Excluded = 4;
     bool Completed = 5;
+    bool LockRequested = 6;
+    string LockTaskId = 7;
 }

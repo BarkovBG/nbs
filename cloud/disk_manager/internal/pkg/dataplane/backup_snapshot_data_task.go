@@ -153,6 +153,10 @@ func (t *backupSnapshotDataTask) finish(
 	if err != nil {
 		return err
 	}
+	// The graph lock task owns release of a CP-owned hold.
+	if t.request.OwnerId != "" {
+		return nil
+	}
 	return t.storage.ReleaseSnapshotForBackup(ctx, t.request.SnapshotId, taskID)
 }
 

@@ -64,17 +64,19 @@ func newBackupGraphFixture(t *testing.T, root string, ids ...string) *backupGrap
 			meta.BackupCompleted = meta.BackupCompleted || a.Bool(3)
 		}
 	}).Return(nil)
+	f.scheduler.On("SendEvent", mock.Anything, mock.Anything, int64(dataplane_protos.SnapshotBackupLockEvent_RELEASE)).Return(nil).Maybe()
+	f.scheduler.On("WaitTaskEnded", mock.Anything, mock.MatchedBy(func(id string) bool { return len(id) > 5 && id[:5] == "lock-" })).Return(nil).Maybe()
 	f.storage.On("FinishSnapshotBackupPlan", mock.Anything, "task").Return(nil)
 	f.storage.On("ClaimSnapshotBackupPlan", mock.Anything, "task").Return(nil)
 	f.storage.On("RemoveSnapshotFromBackupQueue", mock.Anything, root, "attempt").Return(nil)
 	return f
 }
 
-func (f *backupGraphFixture) reader(id string, deps ...string) {
-	f.scheduler.On("ScheduleTask", mock.Anything, "dataplane.GetSnapshotBackupDependencies", "", mock.MatchedBy(func(r *dataplane_protos.GetSnapshotBackupDependenciesRequest) bool {
-		return r.SnapshotId == id
-	})).Return("reader-"+id, nil)
-	f.scheduler.On("WaitTask", mock.Anything, f.execCtx, "reader-"+id).Return(&dataplane_protos.GetSnapshotBackupDependenciesResponse{SnapshotIds: deps}, nil)
+func (f *backupGraphFixture) lock(id string, deps ...string) {
+	f.scheduler.On("ScheduleTask", mock.Anything, "dataplane.LockSnapshotForBackup", "", mock.MatchedBy(func(r *dataplane_protos.LockSnapshotForBackupRequest) bool {
+		return r.SnapshotId == id && r.OwnerId == "task"
+	})).Return("lock-"+id, nil)
+	f.scheduler.On("GetTaskMetadata", mock.Anything, "lock-"+id).Return(&dataplane_protos.LockSnapshotForBackupState{SnapshotIds: deps, Ready: true, Locked: true}, nil)
 }
 
 func (f *backupGraphFixture) copy(t *testing.T, id string, dependent bool) {
@@ -83,12 +85,14 @@ func (f *backupGraphFixture) copy(t *testing.T, id string, dependent bool) {
 		f.metas[a.String(1)].BackupTaskID = "task"
 	}).Return(f.metas[id], nil).Once()
 	f.scheduler.On("ScheduleTask", mock.Anything, "dataplane.BackupSnapshotData", "", mock.MatchedBy(func(r *dataplane_protos.BackupSnapshotDataRequest) bool {
-		return r.SnapshotId == id
+		return r.SnapshotId == id && r.OwnerId == "task"
 	})).Run(func(a mock.Arguments) {
 		require.True(t, f.task.state.GraphPrepared)
 		for _, node := range f.task.state.Nodes {
 			if !node.Excluded && !node.Completed {
 				require.Equal(t, "task", f.metas[node.SnapshotId].BackupPlanID)
+				require.True(t, node.LockRequested)
+				require.NotEmpty(t, node.LockTaskId)
 			}
 		}
 		f.copies = append(f.copies, id)
@@ -101,12 +105,12 @@ func (f *backupGraphFixture) finishCopy(id string) {
 
 func TestBackupSnapshotTaskHoldsEntireGraphBeforeCopyingAndResumesPreparation(t *testing.T) {
 	f := newBackupGraphFixture(t, "C", "A", "B", "C")
-	f.reader("C", "A", "B")
+	f.lock("C", "A", "B")
 	// Pause during dependency discovery: no data copy is allowed yet.
-	f.scheduler.On("ScheduleTask", mock.Anything, "dataplane.GetSnapshotBackupDependencies", "", mock.MatchedBy(func(r *dataplane_protos.GetSnapshotBackupDependenciesRequest) bool { return r.SnapshotId == "A" })).Return("reader-A", nil).Once()
-	f.scheduler.On("WaitTask", mock.Anything, f.execCtx, "reader-A").Return(nil, errors.NewInterruptExecutionError()).Once()
-	f.scheduler.On("WaitTask", mock.Anything, f.execCtx, "reader-A").Return(&dataplane_protos.GetSnapshotBackupDependenciesResponse{}, nil).Once()
-	f.reader("B", "A")
+	f.scheduler.On("ScheduleTask", mock.Anything, "dataplane.LockSnapshotForBackup", "", mock.MatchedBy(func(r *dataplane_protos.LockSnapshotForBackupRequest) bool { return r.SnapshotId == "A" })).Return("lock-A", nil).Once()
+	f.scheduler.On("GetTaskMetadata", mock.Anything, "lock-A").Return(&dataplane_protos.LockSnapshotForBackupState{}, nil).Once()
+	f.scheduler.On("GetTaskMetadata", mock.Anything, "lock-A").Return(&dataplane_protos.LockSnapshotForBackupState{Ready: true, Locked: true}, nil).Once()
+	f.lock("B", "A")
 	for _, id := range []string{"A", "B", "C"} {
 		f.copy(t, id, id != "C")
 		f.finishCopy(id)
@@ -124,6 +128,9 @@ func TestBackupSnapshotTaskHoldsEntireGraphBeforeCopyingAndResumesPreparation(t 
 	f.task = resumed
 	require.NoError(t, resumed.Run(f.ctx, f.execCtx))
 	require.Equal(t, []string{"A", "B", "C"}, f.copies)
+	for _, id := range []string{"A", "B", "C"} {
+		f.scheduler.AssertCalled(t, "SendEvent", mock.Anything, "lock-"+id, int64(dataplane_protos.SnapshotBackupLockEvent_RELEASE))
+	}
 	require.Equal(t, []string{"A", "B", "C"}, resumed.GetResponse().(*protos.BackupSnapshotResponse).CompletedSnapshotIds)
 	f.scheduler.AssertExpectations(t)
 }
@@ -131,7 +138,7 @@ func TestBackupSnapshotTaskHoldsEntireGraphBeforeCopyingAndResumesPreparation(t 
 func TestBackupSnapshotTaskRepresentsMissingCreatorAndCopiesThroughDescendant(t *testing.T) {
 	f := newBackupGraphFixture(t, "C", "C")
 	f.storage.On("GetSnapshotMeta", mock.Anything, "A").Return((*resources.SnapshotMeta)(nil), nil)
-	f.reader("C", "A")
+	f.lock("C", "A")
 	f.copy(t, "C", false)
 	f.finishCopy("C")
 	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
@@ -150,6 +157,8 @@ func preparedBackupGraph(f *backupGraphFixture, nodes ...*protos.SnapshotBackupN
 	f.task.state.GraphPrepared = true
 	for _, node := range nodes {
 		node.Discovered = true
+		node.LockRequested = true
+		node.LockTaskId = "lock-" + node.SnapshotId
 		f.metas[node.SnapshotId].BackupPlanID = "task"
 	}
 	var err error
@@ -243,18 +252,19 @@ func TestBackupSnapshotTaskRestoresAcceptedExactRequestAndDEK(t *testing.T) {
 	}
 }
 
-func TestBackupSnapshotTaskCancellationRecoversReaderBeforeReleasingGraph(t *testing.T) {
+func TestBackupSnapshotTaskCancellationRecoversLockBeforeReleasingGraph(t *testing.T) {
 	f := newBackupGraphFixture(t, "C", "C")
-	f.task.state.Nodes = []*protos.SnapshotBackupNode{{SnapshotId: "C"}}
-	f.task.state.ReaderSnapshotId = "C"
+	f.task.state.Nodes = []*protos.SnapshotBackupNode{{SnapshotId: "C", LockRequested: true}}
 	f.metas["C"].BackupPlanID = "task"
-	f.scheduler.On("ScheduleTask", mock.Anything, "dataplane.GetSnapshotBackupDependencies", "", mock.Anything).Return("reader", nil).Once()
-	f.scheduler.On("CancelTask", mock.Anything, "reader").Return("", nil)
-	f.scheduler.On("WaitTaskEnded", mock.Anything, "reader").Return(errors.NewInterruptExecutionError()).Once()
-	f.scheduler.On("WaitTaskEnded", mock.Anything, "reader").Return(nil).Once()
+	f.scheduler.On("ScheduleTask", mock.Anything, "dataplane.LockSnapshotForBackup", "", mock.Anything).Return("lock", nil).Once()
+	f.scheduler.On("CancelTask", mock.Anything, "lock").Return("", nil)
+	f.scheduler.On("WaitTaskEnded", mock.Anything, "lock").Return(errors.NewInterruptExecutionError()).Once()
+	f.scheduler.On("WaitTaskEnded", mock.Anything, "lock").Return(nil).Once()
 	require.True(t, errors.Is(f.task.Cancel(f.ctx, f.execCtx), errors.NewInterruptExecutionError()))
 	require.Equal(t, "task", f.metas["C"].BackupPlanID)
 	f.storage.AssertNotCalled(t, "ReleaseSnapshotBackup", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	f.scheduler.AssertNotCalled(t, "CancelTask", mock.Anything, "lock-A")
+	f.scheduler.AssertNotCalled(t, "CancelTask", mock.Anything, "lock-C")
 	require.NoError(t, f.task.Cancel(f.ctx, f.execCtx))
 	require.Empty(t, f.metas["C"].BackupPlanID)
 	f.scheduler.AssertExpectations(t)
@@ -268,6 +278,8 @@ func TestBackupSnapshotTaskCancellationWaitsForCopyAndDrainBeforeReleasingGraph(
 	f.scheduler.On("CancelTask", mock.Anything, "copy-A").Return("", nil)
 	f.scheduler.On("WaitTaskEnded", mock.Anything, "copy-A").Return(errors.NewInterruptExecutionError()).Once()
 	f.scheduler.On("WaitTaskEnded", mock.Anything, "copy-A").Return(nil).Once()
+	f.scheduler.On("CancelTask", mock.Anything, "lock-A").Return("", nil)
+	f.scheduler.On("CancelTask", mock.Anything, "lock-C").Return("", nil)
 	f.scheduler.On("ScheduleTask", mock.Anything, "dataplane.ReleaseSnapshotBackup", "", mock.MatchedBy(func(r *dataplane_protos.ReleaseSnapshotBackupRequest) bool {
 		return r.SnapshotId == "A" && r.OwnerId == "task"
 	})).Return("drain", nil).Once()
@@ -299,7 +311,7 @@ func TestBackupSnapshotTaskCancellationRecoversHoldAfterFailedStateSave(t *testi
 		durableState, err = f.task.Save()
 		require.NoError(t, err)
 	}).Return(nil).Twice()
-	// Holding succeeded, but the reader intent has not reached storage.
+	// CP holding succeeded, but the DP lock intent has not reached storage.
 	f.execCtx.On("SaveState", mock.Anything).Return(errors.NewRetriableErrorf("save failed")).Once()
 	require.Error(t, f.task.Run(f.ctx, f.execCtx))
 	require.Equal(t, "task", f.metas["C"].BackupPlanID)
@@ -307,7 +319,7 @@ func TestBackupSnapshotTaskCancellationRecoversHoldAfterFailedStateSave(t *testi
 	require.NoError(t, err)
 	resumed := &backupSnapshotTask{storage: f.storage, scheduler: f.scheduler}
 	require.NoError(t, resumed.Load(request, durableState))
-	require.Empty(t, resumed.state.ReaderSnapshotId)
+	require.Empty(t, resumed.node("C").LockTaskId)
 	require.NoError(t, resumed.Cancel(f.ctx, f.execCtx))
 	require.Empty(t, f.metas["C"].BackupPlanID)
 	f.scheduler.AssertNotCalled(t, "ScheduleTask", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
@@ -407,4 +419,31 @@ func TestBackupSnapshotTaskResumesCopyCursorFromSavedGraph(t *testing.T) {
 	require.Equal(t, []string{"B", "C"}, f.copies)
 	require.Equal(t, []string{"A", "B", "C"}, f.task.completedSnapshotIDs())
 	f.scheduler.AssertExpectations(t)
+}
+
+func TestBackupSnapshotTaskDoesNotCopySourceRejectedByDataplaneLock(t *testing.T) {
+	f := newBackupGraphFixture(t, "C", "C")
+	f.scheduler.On("ScheduleTask", mock.Anything, "dataplane.LockSnapshotForBackup", "", mock.Anything).Return("lock-C", nil)
+	f.scheduler.On("GetTaskMetadata", mock.Anything, "lock-C").Return(&dataplane_protos.LockSnapshotForBackupState{Ready: true}, nil)
+	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
+	require.True(t, f.task.node("C").Excluded)
+	require.False(t, f.task.GetResponse().(*protos.BackupSnapshotResponse).Completed)
+	f.storage.AssertNotCalled(t, "ReserveSnapshotBackup", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	f.scheduler.AssertNotCalled(t, "ScheduleTask", mock.Anything, "dataplane.BackupSnapshotData", mock.Anything, mock.Anything)
+}
+
+func TestBackupSnapshotTaskWaitsForLockReleaseBeforeReleasingCPSource(t *testing.T) {
+	f := newBackupGraphFixture(t, "C", "C")
+	preparedBackupGraph(f, &protos.SnapshotBackupNode{SnapshotId: "C"})
+	// Override the fixture's successful wait: the event alone is not release.
+	f.scheduler.ExpectedCalls = nil
+	f.scheduler.On("SendEvent", mock.Anything, "lock-C", int64(dataplane_protos.SnapshotBackupLockEvent_RELEASE)).Return(nil)
+	f.scheduler.On("WaitTaskEnded", mock.Anything, "lock-C").Return(errors.NewInterruptExecutionError()).Once()
+	f.scheduler.On("WaitTaskEnded", mock.Anything, "lock-C").Return(nil).Once()
+	f.metas["C"].Ready = false
+	require.True(t, errors.Is(f.task.Run(f.ctx, f.execCtx), errors.NewInterruptExecutionError()))
+	require.Equal(t, "task", f.metas["C"].BackupPlanID)
+	f.storage.AssertNotCalled(t, "ReleaseSnapshotBackup", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
+	require.Empty(t, f.metas["C"].BackupPlanID)
 }
