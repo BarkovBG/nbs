@@ -12,6 +12,8 @@ import (
 	"github.com/ydb-platform/nbs/cloud/tasks/headers"
 )
 
+////////////////////////////////////////////////////////////////////////////////
+
 func (t *backupSnapshotTask) node(id string) *protos.SnapshotBackupNode {
 	for _, node := range t.state.Nodes {
 		if node.SnapshotId == id {
@@ -44,7 +46,11 @@ func (t *backupSnapshotTask) nextUndiscoveredNode() *protos.SnapshotBackupNode {
 // Discovers every node before any copy starts; a prepared graph returns at
 // once. Every node is durable before its lock is requested, so releasePlan
 // can release a lock whose node was never discovered.
-func (t *backupSnapshotTask) prepareGraph(ctx context.Context, execCtx tasks.ExecutionContext) error {
+func (t *backupSnapshotTask) prepareGraph(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
+
 	if len(t.state.Nodes) == 0 {
 		t.state.Nodes = []*protos.SnapshotBackupNode{{SnapshotId: t.request.SnapshotId}}
 	}
@@ -66,7 +72,12 @@ func (t *backupSnapshotTask) prepareGraph(ctx context.Context, execCtx tasks.Exe
 
 // Lock the source in the dataplane and record the creators of its chunks as
 // its dependencies. A missing, deleting or rejected source is excluded.
-func (t *backupSnapshotTask) discoverNode(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode) error {
+func (t *backupSnapshotTask) discoverNode(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+	node *protos.SnapshotBackupNode,
+) error {
+
 	meta, err := t.storage.GetSnapshotMeta(ctx, node.SnapshotId)
 	if err != nil {
 		return err
@@ -107,7 +118,12 @@ func (t *backupSnapshotTask) discoverNode(ctx context.Context, execCtx tasks.Exe
 
 // Metadata of the dataplane lock task: Ready once admission is decided, Locked
 // while the source is held, SnapshotIds for the creators of its chunks.
-func (t *backupSnapshotTask) snapshotLock(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode) (*dataplane_protos.LockSnapshotForBackupState, error) {
+func (t *backupSnapshotTask) snapshotLock(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+	node *protos.SnapshotBackupNode,
+) (*dataplane_protos.LockSnapshotForBackupState, error) {
+
 	if node.LockTaskId == "" {
 		if err := t.scheduleSnapshotLock(ctx, execCtx, node); err != nil {
 			return nil, err
@@ -126,7 +142,12 @@ func (t *backupSnapshotTask) snapshotLock(ctx context.Context, execCtx tasks.Exe
 
 // The intent is durable before ScheduleTask, so a child whose ID was not saved
 // is recovered through the same idempotency key.
-func (t *backupSnapshotTask) scheduleSnapshotLock(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode) error {
+func (t *backupSnapshotTask) scheduleSnapshotLock(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+	node *protos.SnapshotBackupNode,
+) error {
+
 	node.LockRequested = true
 	if err := execCtx.SaveState(ctx); err != nil {
 		return err
@@ -143,13 +164,23 @@ func (t *backupSnapshotTask) scheduleSnapshotLock(ctx context.Context, execCtx t
 	return execCtx.SaveState(ctx)
 }
 
-func (t *backupSnapshotTask) releaseSnapshotLock(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode) error {
+func (t *backupSnapshotTask) releaseSnapshotLock(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+	node *protos.SnapshotBackupNode,
+) error {
+
 	return t.endSnapshotLock(ctx, execCtx, node, func(id string) error {
 		return t.scheduler.SendEvent(ctx, id, int64(dataplane_protos.SnapshotBackupLockEvent_RELEASE))
 	})
 }
 
-func (t *backupSnapshotTask) cancelSnapshotLock(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode) error {
+func (t *backupSnapshotTask) cancelSnapshotLock(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+	node *protos.SnapshotBackupNode,
+) error {
+
 	return t.endSnapshotLock(ctx, execCtx, node, func(id string) error {
 		_, err := t.scheduler.CancelTask(ctx, id)
 		return err
@@ -157,7 +188,13 @@ func (t *backupSnapshotTask) cancelSnapshotLock(ctx context.Context, execCtx tas
 }
 
 // The dataplane reference of a lock task is gone only once the task has ended.
-func (t *backupSnapshotTask) endSnapshotLock(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode, end func(id string) error) error {
+func (t *backupSnapshotTask) endSnapshotLock(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+	node *protos.SnapshotBackupNode,
+	end func(id string) error,
+) error {
+
 	if !node.LockRequested {
 		return nil
 	}
@@ -180,7 +217,11 @@ func (t *backupSnapshotTask) endSnapshotLock(ctx context.Context, execCtx tasks.
 // Returns the metadata of the nodes that still have to be copied. Live
 // snapshots and the accepted copy are roots; a deleting ancestor stays needed
 // while a root uses it, and a deleting leaf is dropped and unlocked.
-func (t *backupSnapshotTask) pruneGraph(ctx context.Context, execCtx tasks.ExecutionContext) (map[string]*resources.SnapshotMeta, error) {
+func (t *backupSnapshotTask) pruneGraph(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) (map[string]*resources.SnapshotMeta, error) {
+
 	metas := make(map[string]*resources.SnapshotMeta)
 	roots := make([]string, 0)
 	for _, node := range t.state.Nodes {
@@ -236,7 +277,10 @@ func (t *backupSnapshotTask) pruneGraph(ctx context.Context, execCtx tasks.Execu
 
 // An exact saved request identifies an already accepted copy. Deletion never
 // prunes that copy, including after a restart.
-func (t *backupSnapshotTask) copyAccepted(node *protos.SnapshotBackupNode) bool {
+func (t *backupSnapshotTask) copyAccepted(
+	node *protos.SnapshotBackupNode,
+) bool {
+
 	return t.state.DataplaneRequest != nil && t.state.DataplaneRequest.SnapshotId == node.SnapshotId
 }
 

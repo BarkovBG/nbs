@@ -26,37 +26,59 @@ type backupSnapshotTask struct {
 	state     *protos.BackupSnapshotTaskState
 }
 
-func (t *backupSnapshotTask) Save() ([]byte, error) { return proto.Marshal(t.state) }
+func (t *backupSnapshotTask) Save() ([]byte, error) {
+	return proto.Marshal(t.state)
+}
 
 func (t *backupSnapshotTask) Load(request, state []byte) error {
 	t.request = &protos.BackupSnapshotRequest{}
-	if err := proto.Unmarshal(request, t.request); err != nil {
+	err := proto.Unmarshal(request, t.request)
+	if err != nil {
 		return err
 	}
+
 	t.state = &protos.BackupSnapshotTaskState{}
 	return proto.Unmarshal(state, t.state)
 }
 
-func (t *backupSnapshotTask) scheduleDataplaneTask(ctx context.Context, execCtx tasks.ExecutionContext) error {
-	if err := execCtx.SaveState(ctx); err != nil {
-		return err
-	}
-	id, err := t.scheduler.ScheduleTask(
-		headers.SetIncomingIdempotencyKey(ctx, fmt.Sprintf("%v_%v_backup", execCtx.GetTaskID(), t.state.DataplaneRequest.SnapshotId)),
-		"dataplane.BackupSnapshotData", "", t.state.DataplaneRequest,
-	)
-	if err != nil {
-		return err
-	}
-	t.state.DataplaneTaskID = id
-	return execCtx.SaveState(ctx)
-}
+func (t *backupSnapshotTask) Run(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
 
-func (t *backupSnapshotTask) Run(ctx context.Context, execCtx tasks.ExecutionContext) error {
 	return retrySnapshotBackupError(t.run(ctx, execCtx))
 }
 
-func (t *backupSnapshotTask) run(ctx context.Context, execCtx tasks.ExecutionContext) error {
+func (t *backupSnapshotTask) Cancel(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
+
+	return retrySnapshotBackupError(t.cancel(ctx, execCtx))
+}
+
+func (t *backupSnapshotTask) GetMetadata(
+	ctx context.Context,
+) (proto.Message, error) {
+
+	return &empty.Empty{}, nil
+}
+
+func (t *backupSnapshotTask) GetResponse() proto.Message {
+	root := t.node(t.request.SnapshotId)
+	return &protos.BackupSnapshotResponse{
+		Completed:            root != nil && root.Completed,
+		CompletedSnapshotIds: t.completedSnapshotIDs(),
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+func (t *backupSnapshotTask) run(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
+
 	if err := t.prepareGraph(ctx, execCtx); err != nil {
 		return err
 	}
@@ -94,7 +116,13 @@ func nodeDone(node *protos.SnapshotBackupNode) bool {
 
 // Saving the exact request accepts the copy: from then on it is finished
 // even if the source gets deleted meanwhile.
-func (t *backupSnapshotTask) copyNode(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode, meta *resources.SnapshotMeta) error {
+func (t *backupSnapshotTask) copyNode(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+	node *protos.SnapshotBackupNode,
+	meta *resources.SnapshotMeta,
+) error {
+
 	if !t.copyAccepted(node) {
 		if err := t.prepareCopy(ctx, execCtx, meta); err != nil {
 			return err
@@ -115,17 +143,12 @@ func (t *backupSnapshotTask) copyNode(ctx context.Context, execCtx tasks.Executi
 	return execCtx.SaveState(ctx)
 }
 
-// Record completion and unlock the node.
-func (t *backupSnapshotTask) releaseNode(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode) error {
-	if node.Completed {
-		if err := t.storage.SnapshotBackupCompleted(ctx, node.SnapshotId); err != nil {
-			return err
-		}
-	}
-	return t.releaseSnapshotLock(ctx, execCtx, node)
-}
+func (t *backupSnapshotTask) prepareCopy(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+	meta *resources.SnapshotMeta,
+) error {
 
-func (t *backupSnapshotTask) prepareCopy(ctx context.Context, execCtx tasks.ExecutionContext, meta *resources.SnapshotMeta) error {
 	if meta.Disk == nil {
 		return errors.NewNonRetriableErrorf("snapshot %v has no disk", meta.ID)
 	}
@@ -150,13 +173,62 @@ func (t *backupSnapshotTask) prepareCopy(ctx context.Context, execCtx tasks.Exec
 	return execCtx.SaveState(ctx)
 }
 
-func (t *backupSnapshotTask) Cancel(ctx context.Context, execCtx tasks.ExecutionContext) error {
-	return retrySnapshotBackupError(t.cancel(ctx, execCtx))
+func (t *backupSnapshotTask) scheduleDataplaneTask(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
+
+	if err := execCtx.SaveState(ctx); err != nil {
+		return err
+	}
+	id, err := t.scheduler.ScheduleTask(
+		headers.SetIncomingIdempotencyKey(ctx, fmt.Sprintf("%v_%v_backup", execCtx.GetTaskID(), t.state.DataplaneRequest.SnapshotId)),
+		"dataplane.BackupSnapshotData", "", t.state.DataplaneRequest,
+	)
+	if err != nil {
+		return err
+	}
+	t.state.DataplaneTaskID = id
+	return execCtx.SaveState(ctx)
+}
+
+// Record completion and unlock the node.
+func (t *backupSnapshotTask) releaseNode(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+	node *protos.SnapshotBackupNode,
+) error {
+
+	if node.Completed {
+		if err := t.storage.SnapshotBackupCompleted(ctx, node.SnapshotId); err != nil {
+			return err
+		}
+	}
+	return t.releaseSnapshotLock(ctx, execCtx, node)
+}
+
+// Includes locks requested immediately before a failed SaveState: every
+// node's intent was durable before its lock task was scheduled.
+func (t *backupSnapshotTask) releasePlan(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
+
+	for _, node := range t.state.Nodes {
+		if err := t.releaseSnapshotLock(ctx, execCtx, node); err != nil {
+			return err
+		}
+	}
+	return t.storage.RemoveSnapshotFromBackupQueue(ctx, t.request.SnapshotId, t.request.BackupId)
 }
 
 // Stop the copy and wait for its queue cleanup before the lock tasks are
 // cancelled.
-func (t *backupSnapshotTask) cancel(ctx context.Context, execCtx tasks.ExecutionContext) error {
+func (t *backupSnapshotTask) cancel(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
+
 	if t.state.DataplaneTaskID == "" && t.state.DataplaneRequest != nil {
 		if err := t.scheduleDataplaneTask(ctx, execCtx); err != nil {
 			return err
@@ -176,29 +248,6 @@ func (t *backupSnapshotTask) cancel(ctx context.Context, execCtx tasks.Execution
 		}
 	}
 	return t.releasePlan(ctx, execCtx)
-}
-
-// Includes locks requested immediately before a failed SaveState: every
-// node's intent was durable before its lock task was scheduled.
-func (t *backupSnapshotTask) releasePlan(ctx context.Context, execCtx tasks.ExecutionContext) error {
-	for _, node := range t.state.Nodes {
-		if err := t.releaseSnapshotLock(ctx, execCtx, node); err != nil {
-			return err
-		}
-	}
-	return t.storage.RemoveSnapshotFromBackupQueue(ctx, t.request.SnapshotId, t.request.BackupId)
-}
-
-func (t *backupSnapshotTask) GetMetadata(ctx context.Context) (proto.Message, error) {
-	return &empty.Empty{}, nil
-}
-
-func (t *backupSnapshotTask) GetResponse() proto.Message {
-	root := t.node(t.request.SnapshotId)
-	return &protos.BackupSnapshotResponse{
-		Completed:            root != nil && root.Completed,
-		CompletedSnapshotIds: t.completedSnapshotIDs(),
-	}
 }
 
 func retrySnapshotBackupError(err error) error {
