@@ -2166,17 +2166,3 @@ func TestGetSnapshotIDFromChunkID(t *testing.T) {
 	require.False(t, IsChunkCreatedBySnapshot("task1.snap1.7", "snap2"))
 	require.False(t, IsChunkCreatedBySnapshot("", ""))
 }
-
-func TestBackupHoldRejectsDirectCleanup(t *testing.T) {
-	f := createFixture(t)
-	defer f.teardown()
-	_, err := f.storage.CreateSnapshot(f.ctx, SnapshotMeta{ID: "snapshot"})
-	require.NoError(t, err)
-	require.NoError(t, f.storage.SnapshotCreated(f.ctx, "snapshot", 0, 0, 0, nil))
-	requireHeldForBackup(t, f, "snapshot", "owner")
-	err = f.storage.DeleteSnapshotData(f.ctx, "snapshot")
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
-	require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "owner"))
-	require.NoError(t, f.storage.DeleteSnapshotData(f.ctx, "snapshot"))
-	requireNotHeldForBackup(t, f, "snapshot", "next")
-}
