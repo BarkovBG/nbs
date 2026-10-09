@@ -1,19 +1,20 @@
 syntax = "proto3";
+
 package dataplane;
+
 option go_package = "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/protos";
+
+////////////////////////////////////////////////////////////////////////////////
 
 message LockSnapshotForBackupRequest {
     string SnapshotId = 1;
 }
 
-// CP reads metadata while the task is waiting for RELEASE. Ready without Locked
-// means the source was missing or deletion won admission; no copy may start.
+// Read by CP through task metadata. Ready without Locked means the snapshot
+// was missing or deletion won the lock.
 message LockSnapshotForBackupState {
+    // Snapshots that created chunks of the locked one.
     repeated string SnapshotIds = 1;
     bool Ready = 2;
     bool Locked = 3;
-}
-
-enum SnapshotBackupLockEvent {
-    RELEASE = 0;
 }

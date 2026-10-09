@@ -14,12 +14,11 @@ import (
 	"github.com/ydb-platform/nbs/cloud/tasks/mocks"
 )
 
-func TestSnapshotBackupLockKeepsChunkCreatorsUntilReleaseAfterRestart(t *testing.T) {
+func TestSnapshotBackupLockKeepsChunkCreatorsUntilCancelledAfterRestart(t *testing.T) {
 	ctx := test.NewContext()
 	s := storage_mocks.NewStorageMock()
 	execCtx := mocks.NewExecutionContextMock()
 	execCtx.On("GetTaskID").Return("lock-task")
-	execCtx.On("HasEvent", ctx, int64(protos.SnapshotBackupLockEvent_RELEASE)).Return(false)
 	execCtx.On("SaveState", mock.Anything).Return(nil)
 	s.On("GetSnapshotMeta", ctx, "C").Return(&storage.SnapshotMeta{ID: "C", Ready: true, ChunkCount: 5}, nil).Once()
 	// Only C is held. Its existing chunk references protect A's/B's blobs.
@@ -48,11 +47,8 @@ func TestSnapshotBackupLockKeepsChunkCreatorsUntilReleaseAfterRestart(t *testing
 	resumed := &lockSnapshotForBackupTask{storage: s}
 	require.NoError(t, resumed.Load(request, state))
 	require.True(t, errors.Is(resumed.Run(ctx, execCtx), errors.NewInterruptExecutionError()))
-	execCtx.ExpectedCalls = nil
-	execCtx.On("GetTaskID").Return("lock-task")
-	execCtx.On("HasEvent", ctx, int64(protos.SnapshotBackupLockEvent_RELEASE)).Return(true)
 	s.On("ReleaseSnapshotForBackup", ctx, "C", "lock-task").Return(nil).Once()
-	require.NoError(t, resumed.Run(ctx, execCtx))
+	require.NoError(t, resumed.Cancel(ctx, execCtx))
 	s.AssertExpectations(t)
 }
 
@@ -61,7 +57,6 @@ func TestSnapshotBackupLockRejectsDeletionThatWonAdmission(t *testing.T) {
 	s := storage_mocks.NewStorageMock()
 	execCtx := mocks.NewExecutionContextMock()
 	execCtx.On("GetTaskID").Return("lock-task")
-	execCtx.On("HasEvent", ctx, int64(protos.SnapshotBackupLockEvent_RELEASE)).Return(false)
 	execCtx.On("SaveState", mock.Anything).Return(nil)
 	s.On("GetSnapshotMeta", ctx, "C").Return(&storage.SnapshotMeta{ID: "C", Ready: true}, nil).Once()
 	s.On("HoldSnapshotForBackup", ctx, "C", "lock-task").Return(errors.NewNonRetriableErrorf("deleting")).Once()
@@ -74,26 +69,24 @@ func TestSnapshotBackupLockRejectsDeletionThatWonAdmission(t *testing.T) {
 	s.AssertExpectations(t)
 }
 
-func TestSnapshotBackupLockRetriesFailedReleaseAndCancellation(t *testing.T) {
+func TestSnapshotBackupLockRetriesFailedRelease(t *testing.T) {
 	ctx := test.NewContext()
 	s := storage_mocks.NewStorageMock()
 	execCtx := mocks.NewExecutionContextMock()
 	execCtx.On("GetTaskID").Return("lock-task")
-	execCtx.On("HasEvent", ctx, int64(protos.SnapshotBackupLockEvent_RELEASE)).Return(true)
 	s.On("ReleaseSnapshotForBackup", ctx, "C", "lock-task").Return(errors.NewNonRetriableErrorf("db unavailable")).Once()
 	s.On("ReleaseSnapshotForBackup", ctx, "C", "lock-task").Return(nil).Once()
-	task := &lockSnapshotForBackupTask{storage: s, request: &protos.LockSnapshotForBackupRequest{SnapshotId: "C"}, state: &protos.LockSnapshotForBackupState{}}
-	require.True(t, errors.Is(task.Run(ctx, execCtx), errors.NewEmptyRetriableError()))
+	task := &lockSnapshotForBackupTask{storage: s, request: &protos.LockSnapshotForBackupRequest{SnapshotId: "C"}, state: &protos.LockSnapshotForBackupState{Ready: true, Locked: true}}
+	require.True(t, errors.Is(task.Cancel(ctx, execCtx), errors.NewEmptyRetriableError()))
 	require.NoError(t, task.Cancel(ctx, execCtx))
-	s.AssertNotCalled(t, "HoldSnapshotForBackup", mock.Anything, mock.Anything, mock.Anything)
 	s.AssertExpectations(t)
 }
+
 func TestSnapshotBackupLockDoesNotExposeDependenciesBeforeSuccessfulStateSave(t *testing.T) {
 	ctx := test.NewContext()
 	s := storage_mocks.NewStorageMock()
 	execCtx := mocks.NewExecutionContextMock()
 	execCtx.On("GetTaskID").Return("lock-task")
-	execCtx.On("HasEvent", ctx, int64(protos.SnapshotBackupLockEvent_RELEASE)).Return(false)
 	execCtx.On("SaveState", mock.Anything).Return(errors.NewRetriableErrorf("save failed")).Once()
 	execCtx.On("SaveState", mock.Anything).Return(nil).Once()
 	s.On("GetSnapshotMeta", ctx, "C").Return(&storage.SnapshotMeta{ID: "C", Ready: true}, nil).Once()

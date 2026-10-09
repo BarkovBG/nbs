@@ -14,6 +14,8 @@ import (
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// Holds a dataplane reference to the snapshot until the task is cancelled and
+// exposes the creators of its chunks through metadata.
 type lockSnapshotForBackupTask struct {
 	storage storage.Storage
 	request *protos.LockSnapshotForBackupRequest
@@ -76,10 +78,6 @@ func (t *lockSnapshotForBackupTask) run(
 	execCtx tasks.ExecutionContext,
 ) error {
 
-	// Release may arrive before the first execution or after a restart.
-	if execCtx.HasEvent(ctx, int64(protos.SnapshotBackupLockEvent_RELEASE)) {
-		return t.storage.ReleaseSnapshotForBackup(ctx, t.request.SnapshotId, execCtx.GetTaskID())
-	}
 	if !t.state.Ready {
 		meta, err := t.storage.GetSnapshotMeta(ctx, t.request.SnapshotId)
 		if err != nil {
@@ -113,7 +111,7 @@ func (t *lockSnapshotForBackupTask) run(
 		return err
 	}
 	if t.state.Locked {
-		// Metadata exposes the dependency list while the source stays locked.
+		// The lock is held until the task is cancelled.
 		return errors.NewInterruptExecutionError()
 	}
 	return nil

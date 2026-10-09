@@ -28,13 +28,13 @@ message BackupSnapshotResponse {
     repeated string CompletedSnapshotIds = 2;
 }
 
-// Dependency edges and lock intents are saved before external actions.
 message SnapshotBackupNode {
     string SnapshotId = 1;
+    // Snapshots that created chunks of this one.
     repeated string Dependencies = 2;
     bool Discovered = 3;
     bool Excluded = 4;
     bool Completed = 5;
-    bool LockRequested = 6;
-    string LockTaskId = 7;
+    // The lock task may exist and has to be cancelled.
+    bool Locked = 6;
 }
