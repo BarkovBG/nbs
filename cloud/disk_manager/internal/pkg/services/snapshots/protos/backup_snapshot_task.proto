@@ -13,6 +13,7 @@ message BackupSnapshotRequest {
     string BackupId = 2;
     bytes EncryptedDek = 3;
     string CoordinatorId = 4;
+    repeated string AncestorIds = 5;
 }
 
 message BackupSnapshotTaskState {
@@ -20,6 +21,16 @@ message BackupSnapshotTaskState {
     bytes EncryptedDek = 2;
     dataplane.BackupSnapshotDataRequest DataplaneRequest = 3;
     bool Finished = 4;
+    string DependencyReaderTaskId = 5;
+    bool DependenciesRead = 6;
+    repeated string DependencyIds = 7;
+    uint32 DependencyIndex = 8;
+    string DependencyTaskId = 9;
+    repeated string CompletedSnapshotIds = 10;
+    bool AlreadyBackedUp = 11;
 }
 
-message BackupSnapshotResponse { bool Completed = 1; }
+message BackupSnapshotResponse {
+    bool Completed = 1;
+    repeated string CompletedSnapshotIds = 2;
+}
