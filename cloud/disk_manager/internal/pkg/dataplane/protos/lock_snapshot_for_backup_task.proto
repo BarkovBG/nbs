@@ -4,7 +4,6 @@ option go_package = "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg
 
 message LockSnapshotForBackupRequest {
     string SnapshotId = 1;
-    reserved 2; // Former shared owner; every task holds its own reference.
 }
 
 // CP reads metadata while the task is waiting for RELEASE. Ready without Locked

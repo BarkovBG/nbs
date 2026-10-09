@@ -57,20 +57,18 @@ func (t *backupSnapshotTask) Run(ctx context.Context, execCtx tasks.ExecutionCon
 }
 
 func (t *backupSnapshotTask) run(ctx context.Context, execCtx tasks.ExecutionContext) error {
-	if t.state.Finished {
-		return t.releasePlan(ctx, execCtx)
-	}
-	if !t.state.GraphPrepared {
-		if err := t.prepareGraph(ctx, execCtx); err != nil {
-			return err
-		}
+	if err := t.prepareGraph(ctx, execCtx); err != nil {
+		return err
 	}
 	order, err := snapshotBackupOrder(t.state.Nodes)
 	if err != nil {
 		return err
 	}
-	for t.state.CopyIndex < uint32(len(order)) {
-		node := t.node(order[t.state.CopyIndex])
+	for _, id := range order {
+		node := t.node(id)
+		if nodeDone(node) {
+			continue
+		}
 		metas, err := t.pruneGraph(ctx, execCtx)
 		if err != nil {
 			return err
@@ -84,11 +82,14 @@ func (t *backupSnapshotTask) run(ctx context.Context, execCtx tasks.ExecutionCon
 			return err
 		}
 	}
-	t.state.Finished = true
-	if err := execCtx.SaveState(ctx); err != nil {
-		return err
-	}
 	return t.releasePlan(ctx, execCtx)
+}
+
+// A node is done once it is copied or excluded and its lock is released.
+// Completion is saved before the release, so a restart repeats only the
+// release of the current node.
+func nodeDone(node *protos.SnapshotBackupNode) bool {
+	return (node.Completed || node.Excluded) && !node.LockRequested
 }
 
 // Saving the exact request accepts the copy: from then on it is finished
@@ -108,24 +109,20 @@ func (t *backupSnapshotTask) copyNode(ctx context.Context, execCtx tasks.Executi
 		return err
 	}
 	node.Completed = true
+	t.state.DataplaneRequest = nil
+	t.state.DataplaneTaskID = ""
 	// Persist completion before releasing the source lock.
 	return execCtx.SaveState(ctx)
 }
 
-// Record completion, unlock the node and move the cursor past it.
+// Record completion and unlock the node.
 func (t *backupSnapshotTask) releaseNode(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode) error {
 	if node.Completed {
 		if err := t.storage.SnapshotBackupCompleted(ctx, node.SnapshotId); err != nil {
 			return err
 		}
 	}
-	if err := t.releaseSnapshotLock(ctx, execCtx, node); err != nil {
-		return err
-	}
-	t.state.DataplaneRequest = nil
-	t.state.DataplaneTaskID = ""
-	t.state.CopyIndex++
-	return execCtx.SaveState(ctx)
+	return t.releaseSnapshotLock(ctx, execCtx, node)
 }
 
 func (t *backupSnapshotTask) prepareCopy(ctx context.Context, execCtx tasks.ExecutionContext, meta *resources.SnapshotMeta) error {
@@ -140,7 +137,7 @@ func (t *backupSnapshotTask) prepareCopy(ctx context.Context, execCtx tasks.Exec
 	if err != nil {
 		return errors.NewNonRetriableError(err)
 	}
-	encryptedDEK, err := t.backupS3.EnsureEncryptedDEK(t.request.EncryptedDek)
+	encryptedDEK, err := t.backupS3.EnsureEncryptedDEK(nil)
 	if err != nil {
 		return err
 	}

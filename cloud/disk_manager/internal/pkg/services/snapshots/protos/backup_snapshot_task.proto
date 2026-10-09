@@ -11,22 +11,16 @@ import "cloud/disk_manager/internal/pkg/dataplane/protos/backup_snapshot_data_ta
 message BackupSnapshotRequest {
     string SnapshotId = 1;
     string BackupId = 2;
-    bytes EncryptedDek = 3;
 }
 
-// CP coordinates the graph; dataplane.BackupSnapshotData copies one source.
 message BackupSnapshotTaskState {
-    // Exact request and child ID survive an interrupted ScheduleTask/SaveState.
+    // The copy in progress: the saved request accepts it, the child ID
+    // survives an interrupted ScheduleTask.
     string DataplaneTaskID = 1;
-    dataplane.BackupSnapshotDataRequest DataplaneRequest = 3;
-    bool Finished = 4;
+    dataplane.BackupSnapshotDataRequest DataplaneRequest = 2;
 
-    repeated SnapshotBackupNode Nodes = 13;
-    bool GraphPrepared = 12;
-    uint32 CopyIndex = 18;
-
-    // Removed duplicate DEK, completion list, derived traversal/order and reader.
-    reserved 2, 10, 14, 15, 16, 17;
+    // Discovery, copy progress and completion are derived from the nodes.
+    repeated SnapshotBackupNode Nodes = 3;
 }
 
 message BackupSnapshotResponse {
@@ -34,7 +28,7 @@ message BackupSnapshotResponse {
     repeated string CompletedSnapshotIds = 2;
 }
 
-// Dependency edges and hold intents are saved before external actions.
+// Dependency edges and lock intents are saved before external actions.
 message SnapshotBackupNode {
     string SnapshotId = 1;
     repeated string Dependencies = 2;

@@ -41,13 +41,18 @@ func (t *backupSnapshotTask) nextUndiscoveredNode() *protos.SnapshotBackupNode {
 	return nil
 }
 
-// Every node is durable before its lock is requested, so releasePlan can
-// release a lock whose node was never discovered.
+// Discovers every node before any copy starts; a prepared graph returns at
+// once. Every node is durable before its lock is requested, so releasePlan
+// can release a lock whose node was never discovered.
 func (t *backupSnapshotTask) prepareGraph(ctx context.Context, execCtx tasks.ExecutionContext) error {
 	if len(t.state.Nodes) == 0 {
 		t.state.Nodes = []*protos.SnapshotBackupNode{{SnapshotId: t.request.SnapshotId}}
 	}
-	for node := t.nextUndiscoveredNode(); node != nil; node = t.nextUndiscoveredNode() {
+	node := t.nextUndiscoveredNode()
+	if node == nil {
+		return nil
+	}
+	for ; node != nil; node = t.nextUndiscoveredNode() {
 		if err := execCtx.SaveState(ctx); err != nil {
 			return err
 		}
@@ -55,10 +60,6 @@ func (t *backupSnapshotTask) prepareGraph(ctx context.Context, execCtx tasks.Exe
 			return err
 		}
 	}
-	if _, err := snapshotBackupOrder(t.state.Nodes); err != nil {
-		return err
-	}
-	t.state.GraphPrepared = true
 	// No copy may start until the full dependency closure is durable.
 	return execCtx.SaveState(ctx)
 }
@@ -239,8 +240,8 @@ func (t *backupSnapshotTask) copyAccepted(node *protos.SnapshotBackupNode) bool 
 	return t.state.DataplaneRequest != nil && t.state.DataplaneRequest.SnapshotId == node.SnapshotId
 }
 
-// Order depends only on saved edges, so completing/pruning nodes cannot shift
-// CopyIndex after a restart.
+// Order depends only on saved edges, so completing or pruning nodes does not
+// change it after a restart.
 func snapshotBackupOrder(nodes []*protos.SnapshotBackupNode) ([]string, error) {
 	byID := make(map[string]*protos.SnapshotBackupNode)
 	for _, node := range nodes {

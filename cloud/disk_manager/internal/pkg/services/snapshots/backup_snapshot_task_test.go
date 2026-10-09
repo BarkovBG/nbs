@@ -76,7 +76,7 @@ func (f *backupGraphFixture) copy(t *testing.T, id string) {
 	f.scheduler.On("ScheduleTask", mock.Anything, "dataplane.BackupSnapshotData", "", mock.MatchedBy(func(r *dataplane_protos.BackupSnapshotDataRequest) bool {
 		return r.SnapshotId == id
 	})).Run(func(a mock.Arguments) {
-		require.True(t, f.task.state.GraphPrepared)
+		require.Nil(t, f.task.nextUndiscoveredNode())
 		for _, node := range f.task.state.Nodes {
 			if !node.Excluded && !node.Completed {
 				require.True(t, node.LockRequested)
@@ -147,7 +147,6 @@ func TestBackupSnapshotTaskRepresentsMissingCreatorAndCopiesThroughDescendant(t 
 
 func preparedBackupGraph(f *backupGraphFixture, nodes ...*protos.SnapshotBackupNode) {
 	f.task.state.Nodes = nodes
-	f.task.state.GraphPrepared = true
 	for _, node := range nodes {
 		node.Discovered = true
 		node.LockRequested = true
@@ -347,7 +346,7 @@ func TestBackupSnapshotTaskSavesNewMetadataAndEncryptedDEKBeforeScheduling(t *te
 	f.scheduler.AssertExpectations(t)
 }
 
-func TestSnapshotBackupDerivedOrderDoesNotMoveCursorAfterCompletionOrPruning(t *testing.T) {
+func TestSnapshotBackupOrderDoesNotChangeAfterCompletionOrPruning(t *testing.T) {
 	nodes := []*protos.SnapshotBackupNode{
 		{SnapshotId: "C", Dependencies: []string{"B"}},
 		{SnapshotId: "B", Dependencies: []string{"A"}},
@@ -370,7 +369,9 @@ func TestBackupSnapshotTaskResumesCopyCursorFromSavedGraph(t *testing.T) {
 		&protos.SnapshotBackupNode{SnapshotId: "B", Dependencies: []string{"A"}},
 		&protos.SnapshotBackupNode{SnapshotId: "A", Completed: true},
 	)
-	f.task.state.CopyIndex = 1
+	// A is copied and unlocked; the restart resumes with B.
+	f.task.node("A").LockRequested = false
+	f.task.node("A").LockTaskId = ""
 	f.metas["A"].BackupCompleted = true
 	f.copy(t, "B")
 	f.finishCopy("B")
@@ -411,4 +412,22 @@ func TestBackupSnapshotTaskWaitsForLockReleaseBeforeFinishing(t *testing.T) {
 	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
 	f.storage.AssertCalled(t, "RemoveSnapshotFromBackupQueue", mock.Anything, "C", "attempt")
 	f.scheduler.AssertExpectations(t)
+}
+
+func TestBackupSnapshotTaskRepeatsReleaseOfCompletedNodeAfterRestart(t *testing.T) {
+	f := newBackupGraphFixture(t, "C", "A", "C")
+	preparedBackupGraph(f,
+		&protos.SnapshotBackupNode{SnapshotId: "C", Dependencies: []string{"A"}},
+		&protos.SnapshotBackupNode{SnapshotId: "A", Completed: true},
+	)
+	// A's completion was saved, but its lock was not released before restart.
+	f.copy(t, "C")
+	f.finishCopy("C")
+	require.NoError(t, f.task.Run(f.ctx, f.execCtx))
+	require.Equal(t, []string{"C"}, f.copies)
+	f.released(t, "A")
+	require.True(t, f.metas["A"].BackupCompleted)
+	f.scheduler.AssertNotCalled(t, "ScheduleTask", mock.Anything, "dataplane.BackupSnapshotData", "", mock.MatchedBy(func(r *dataplane_protos.BackupSnapshotDataRequest) bool {
+		return r.SnapshotId == "A"
+	}))
 }
