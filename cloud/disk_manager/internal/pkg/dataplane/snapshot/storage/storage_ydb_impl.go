@@ -1690,25 +1690,15 @@ func (s *storageYDB) enqueueBackupChunks(
 	_, err = tx.Execute(ctx, fmt.Sprintf(`
 		--!syntax_v1
 		pragma TablePathPrefix = "%v";
-		declare $chunks as List<%v>;
 		declare $entries as List<%v>;
-
-		upsert into backup_chunks
-		select *
-		from AS_TABLE($chunks);
 
 		upsert into backup_chunk_queue
 		select *
 		from AS_TABLE($entries)
 	`,
 		s.tablesPath,
-		backupChunkStructTypeString(),
 		backupChunkQueueEntryStructTypeString(),
 	),
-		persistence.ValueParam(
-			"$chunks",
-			backupChunkListValue(toEnqueue, backupChunkStatusQueued),
-		),
 		persistence.ValueParam(
 			"$entries",
 			backupChunkQueueEntryListValue(toEnqueue),
@@ -1777,17 +1767,12 @@ func (s *storageYDB) ChunksBackupCompleted(
 
 	defer s.metrics.StatOperation("ChunksBackupCompleted")(&err)
 
-	// Only existing chunks are updated: a chunk that is not found has already
-	// been backed up and cleared by the backup of its snapshot. The object is
-	// in the follower either way, so later copies skip the chunk.
+	// The object is in the follower now, so later copies of any snapshot skip
+	// the chunk.
 	_, err = s.db.ExecuteRW(ctx, fmt.Sprintf(`
 		--!syntax_v1
 		pragma TablePathPrefix = "%v";
-		declare $chunks as List<%v>;
 		declare $keys as List<%v>;
-
-		update backup_chunks
-		on select * from AS_TABLE($chunks);
 
 		delete from backup_chunk_queue
 		on select * from AS_TABLE($keys);
@@ -1796,13 +1781,8 @@ func (s *storageYDB) ChunksBackupCompleted(
 		select distinct chunk_id from AS_TABLE($keys);
 	`,
 		s.tablesPath,
-		backupChunkStructTypeString(),
 		backupChunkKeyStructTypeString(),
 	),
-		persistence.ValueParam(
-			"$chunks",
-			backupChunkListValue(entries, backupChunkStatusCompleted),
-		),
 		persistence.ValueParam("$keys", backupChunkKeyListValue(entries)),
 	)
 	return err
@@ -1824,15 +1804,12 @@ func (s *storageYDB) ClearBackupChunks(
 
 		$keys = (
 			select snapshot_id, chunk_id
-			from backup_chunks
+			from backup_chunk_queue
 			where snapshot_id = $snapshot_id
 			limit $limit
 		);
 
 		select count(*) from $keys;
-
-		delete from backup_chunks
-		on select * from $keys;
 
 		delete from backup_chunk_queue
 		on select * from $keys;
@@ -1910,24 +1887,20 @@ func (s *storageYDB) CheckBackupChunksCompleted(
 
 	defer s.metrics.StatOperation("CheckBackupChunksCompleted")(&err)
 
+	// A worker removes a chunk from the queue once it is in the follower.
 	res, err := s.db.ExecuteRO(ctx, fmt.Sprintf(`
 		--!syntax_v1
 		pragma TablePathPrefix = "%v";
 		declare $snapshot_id as Utf8;
-		declare $queued as Int64;
 
 		select chunk_id
-		from backup_chunks
-		where snapshot_id = $snapshot_id and status = $queued
+		from backup_chunk_queue
+		where snapshot_id = $snapshot_id
 		limit 1
 	`, s.tablesPath),
 		persistence.ValueParam(
 			"$snapshot_id",
 			persistence.UTF8Value(snapshotID),
-		),
-		persistence.ValueParam(
-			"$queued",
-			persistence.Int64Value(int64(backupChunkStatusQueued)),
 		),
 	)
 	if err != nil {

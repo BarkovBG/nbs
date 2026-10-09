@@ -2054,8 +2054,8 @@ func TestClearBackupChunks(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 1, length)
 
-	// Queued and completed entries of the snapshot are cleared together.
-	for _, expected := range []int{1, 1, 1, 0} {
+	// Only the chunk still queued is cleared; the copied ones left the queue.
+	for _, expected := range []int{1, 0} {
 		cleared, err := f.storage.ClearBackupChunks(
 			f.ctx,
 			"snap1",
@@ -2084,7 +2084,7 @@ func TestClearBackupChunks(t *testing.T) {
 		10, // limit
 	)
 	require.NoError(t, err)
-	require.Equal(t, 1, cleared)
+	require.Zero(t, cleared)
 }
 
 func TestReadChunkBlob(t *testing.T) {
