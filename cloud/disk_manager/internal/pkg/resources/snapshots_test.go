@@ -517,12 +517,18 @@ func newSnapshotBackupTestStorage(t *testing.T) (context.Context, *storageYDB) {
 	err = storage.SnapshotCreated(ctx, "snapshot", "cp", time.Now(), 0, 0)
 	require.NoError(t, err)
 	storage.backupEnabled = true
+	return ctx, storage
+}
+
+func newEnqueueSnapshotBackupTestStorage(t *testing.T) (context.Context, *storageYDB) {
+	t.Helper()
+	ctx, storage := newSnapshotBackupTestStorage(t)
 	require.NoError(t, storage.SetSnapshotBackupFolder(ctx, "folder", "generation", true))
 	return ctx, storage
 }
 
 func TestEnqueueSnapshotBackupRequiresEnabledFolder(t *testing.T) {
-	ctx, storage := newSnapshotBackupTestStorage(t)
+	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
 	require.NoError(t, storage.SetSnapshotBackupFolder(ctx, "folder", "generation", false))
 	err := storage.EnqueueSnapshotBackup(ctx, "snapshot", "manual")
 	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
@@ -532,7 +538,7 @@ func TestEnqueueSnapshotBackupRequiresEnabledFolder(t *testing.T) {
 }
 
 func TestEnqueueSnapshotBackupIsIdempotent(t *testing.T) {
-	ctx, storage := newSnapshotBackupTestStorage(t)
+	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
 
 	meta, err := storage.GetSnapshotMeta(ctx, "snapshot")
 	require.NoError(t, err)
@@ -575,7 +581,7 @@ func TestEnqueueSnapshotBackupIsIdempotent(t *testing.T) {
 }
 
 func TestEnqueueSnapshotBackupAfterCancellation(t *testing.T) {
-	ctx, storage := newSnapshotBackupTestStorage(t)
+	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
 
 	err := storage.EnqueueSnapshotBackup(ctx, "snapshot", "first")
 	require.NoError(t, err)
@@ -615,7 +621,7 @@ func TestEnqueueSnapshotBackupAfterCancellation(t *testing.T) {
 }
 
 func TestEnqueueSnapshotBackupRejectsUnavailableSnapshot(t *testing.T) {
-	ctx, storage := newSnapshotBackupTestStorage(t)
+	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
 
 	_, err := storage.CreateSnapshot(ctx, SnapshotMeta{
 		ID:            "creating",
@@ -647,7 +653,7 @@ func TestEnqueueSnapshotBackupRejectsUnavailableSnapshot(t *testing.T) {
 }
 
 func TestEnqueueSnapshotBackupConcurrentRequests(t *testing.T) {
-	ctx, storage := newSnapshotBackupTestStorage(t)
+	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
 	start := make(chan struct{})
 	results := make(chan error, 2)
 	for _, id := range []string{"first", "second"} {
@@ -670,7 +676,7 @@ func TestEnqueueSnapshotBackupConcurrentRequests(t *testing.T) {
 }
 
 func TestEnqueueSnapshotBackupRacesWithCompletion(t *testing.T) {
-	ctx, storage := newSnapshotBackupTestStorage(t)
+	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
 	err := storage.EnqueueSnapshotBackup(ctx, "snapshot", "first")
 	require.NoError(t, err)
 
@@ -695,7 +701,7 @@ func TestEnqueueSnapshotBackupRacesWithCompletion(t *testing.T) {
 }
 
 func TestEnqueueSnapshotBackupRacesWithDeletion(t *testing.T) {
-	ctx, storage := newSnapshotBackupTestStorage(t)
+	ctx, storage := newEnqueueSnapshotBackupTestStorage(t)
 	start := make(chan struct{})
 	enqueued := make(chan error, 1)
 	deleted := make(chan error, 1)
