@@ -4,11 +4,13 @@ import (
 	"context"
 	"testing"
 
+	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources"
 	resources_mocks "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources/mocks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/snapshots/protos"
+	"github.com/ydb-platform/nbs/cloud/tasks/errors"
 	"github.com/ydb-platform/nbs/cloud/tasks/headers"
 	"github.com/ydb-platform/nbs/cloud/tasks/logging"
 	tasks_mocks "github.com/ydb-platform/nbs/cloud/tasks/mocks"
@@ -31,8 +33,7 @@ func TestScheduleBackupSnapshotTasks(t *testing.T) {
 		nil,
 	)
 
-	for _, snapshotID := range []string{"snap1", "snap2"} {
-		id := snapshotID
+	expectScheduled := func(id string) {
 		scheduler.On(
 			"ScheduleTask",
 			mock.MatchedBy(func(ctx context.Context) bool {
@@ -60,7 +61,20 @@ func TestScheduleBackupSnapshotTasks(t *testing.T) {
 		limit:     2,
 	}
 
+	// Graphs run one at a time: the second request waits for the first.
+	expectScheduled("snap1")
+	scheduler.On("WaitTask", mock.Anything, execCtx, "snap1_task").Return(
+		nil,
+		errors.NewInterruptExecutionError(),
+	).Once()
 	err := task.Run(ctx, execCtx)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	mock.AssertExpectationsForObjects(t, storage, scheduler)
+
+	expectScheduled("snap2")
+	scheduler.On("WaitTask", mock.Anything, execCtx, "snap1_task").Return(&empty.Empty{}, nil).Once()
+	scheduler.On("WaitTask", mock.Anything, execCtx, "snap2_task").Return(&empty.Empty{}, nil).Once()
+	err = task.Run(ctx, execCtx)
 	require.NoError(t, err)
 	mock.AssertExpectationsForObjects(t, storage, scheduler)
 }

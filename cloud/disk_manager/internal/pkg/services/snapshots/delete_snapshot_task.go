@@ -62,11 +62,6 @@ func (t *deleteSnapshotTask) deleteSnapshot(
 		return nil
 	}
 
-	// Both graph preparation and an accepted copy protect the source before DP installs its hold.
-	if snapshotMeta.BackupTaskID != "" || snapshotMeta.BackupPlanID != "" {
-		return errors.NewInterruptExecutionError()
-	}
-
 	// Hack for NBS-2225.
 	if snapshotMeta.DeleteTaskID != selfTaskID {
 		return t.scheduler.WaitTaskEnded(ctx, snapshotMeta.DeleteTaskID)

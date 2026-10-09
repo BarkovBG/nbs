@@ -5,6 +5,7 @@ import (
 	"sort"
 
 	dataplane_protos "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/protos"
+	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/snapshots/protos"
 	"github.com/ydb-platform/nbs/cloud/tasks"
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
@@ -40,8 +41,8 @@ func (t *backupSnapshotTask) nextUndiscoveredNode() *protos.SnapshotBackupNode {
 	return nil
 }
 
-// Every node is durable before its holds are acquired, so releasePlan can
-// release a hold whose node was never discovered.
+// Every node is durable before its lock is requested, so releasePlan can
+// release a lock whose node was never discovered.
 func (t *backupSnapshotTask) prepareGraph(ctx context.Context, execCtx tasks.ExecutionContext) error {
 	if len(t.state.Nodes) == 0 {
 		t.state.Nodes = []*protos.SnapshotBackupNode{{SnapshotId: t.request.SnapshotId}}
@@ -62,8 +63,8 @@ func (t *backupSnapshotTask) prepareGraph(ctx context.Context, execCtx tasks.Exe
 	return execCtx.SaveState(ctx)
 }
 
-// Hold the source in CP and DP and record the creators of its chunks as its
-// dependencies. A missing, deleting or rejected source is excluded from copying.
+// Lock the source in the dataplane and record the creators of its chunks as
+// its dependencies. A missing, deleting or rejected source is excluded.
 func (t *backupSnapshotTask) discoverNode(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode) error {
 	meta, err := t.storage.GetSnapshotMeta(ctx, node.SnapshotId)
 	if err != nil {
@@ -72,19 +73,15 @@ func (t *backupSnapshotTask) discoverNode(ctx context.Context, execCtx tasks.Exe
 	switch {
 	case meta == nil:
 		// A removed creator is represented by its edge;
-		// surviving chunks are copied through the held descendant.
+		// surviving chunks are copied through the locked descendant.
 		node.Excluded = true
 	case meta.BackupCompleted:
 		node.Completed = true
+	case !meta.Ready:
+		// Deletion before the lock excludes the source; pruneGraph keeps a
+		// deleting ancestor only while a live descendant needs it.
+		node.Excluded = true
 	default:
-		meta, err = t.storage.HoldSnapshotBackupPlan(ctx, node.SnapshotId, execCtx.GetTaskID())
-		if err != nil {
-			return err
-		}
-		if meta == nil {
-			node.Excluded = true
-			break
-		}
 		lock, err := t.snapshotLock(ctx, execCtx, node)
 		if err != nil {
 			return err
@@ -158,7 +155,7 @@ func (t *backupSnapshotTask) cancelSnapshotLock(ctx context.Context, execCtx tas
 	})
 }
 
-// The DP reference of a lock task is gone only once the task has ended.
+// The dataplane reference of a lock task is gone only once the task has ended.
 func (t *backupSnapshotTask) endSnapshotLock(ctx context.Context, execCtx tasks.ExecutionContext, node *protos.SnapshotBackupNode, end func(id string) error) error {
 	if !node.LockRequested {
 		return nil
@@ -179,37 +176,36 @@ func (t *backupSnapshotTask) endSnapshotLock(ctx context.Context, execCtx tasks.
 	return execCtx.SaveState(ctx)
 }
 
-// Pending live snapshots are roots themselves. A deleting ancestor stays needed
-// while any remaining live root uses it; a deleting leaf is dropped. The
-// queue permits only one graph at a time, avoiding conflicting graph holds.
-func (t *backupSnapshotTask) pruneGraph(ctx context.Context, execCtx tasks.ExecutionContext) (map[string]bool, error) {
-	nodes := make(map[string]*protos.SnapshotBackupNode)
+// Returns the metadata of the nodes that still have to be copied. Live
+// snapshots and the accepted copy are roots; a deleting ancestor stays needed
+// while a root uses it, and a deleting leaf is dropped and unlocked.
+func (t *backupSnapshotTask) pruneGraph(ctx context.Context, execCtx tasks.ExecutionContext) (map[string]*resources.SnapshotMeta, error) {
+	metas := make(map[string]*resources.SnapshotMeta)
 	roots := make([]string, 0)
 	for _, node := range t.state.Nodes {
 		if node.Excluded || node.Completed {
 			continue
 		}
-		nodes[node.SnapshotId] = node
 		meta, err := t.storage.GetSnapshotMeta(ctx, node.SnapshotId)
 		if err != nil {
 			return nil, err
 		}
-		if meta == nil || meta.BackupPlanID != execCtx.GetTaskID() {
-			return nil, errors.NewNonRetriableErrorf("lost snapshot backup graph hold for %v", node.SnapshotId)
+		if meta == nil {
+			continue
 		}
-		if meta.Ready || meta.BackupTaskID == execCtx.GetTaskID() {
+		metas[node.SnapshotId] = meta
+		if meta.Ready || t.copyAccepted(node) {
 			roots = append(roots, node.SnapshotId)
 		}
 	}
 	needed := make(map[string]bool)
 	var visit func(string)
 	visit = func(id string) {
-		node := nodes[id]
-		if node == nil || needed[id] {
+		if metas[id] == nil || needed[id] {
 			return
 		}
 		needed[id] = true
-		for _, parent := range node.Dependencies {
+		for _, parent := range t.node(id).Dependencies {
 			visit(parent)
 		}
 	}
@@ -219,38 +215,28 @@ func (t *backupSnapshotTask) pruneGraph(ctx context.Context, execCtx tasks.Execu
 	for _, node := range t.state.Nodes {
 		if !node.Completed && !node.Excluded && !needed[node.SnapshotId] {
 			node.Excluded = true
+			delete(metas, node.SnapshotId)
 		}
 	}
 	if err := execCtx.SaveState(ctx); err != nil {
 		return nil, err
 	}
-	// Drop holds only after pruning is saved. Ordinary deletion removes the
+	// Unlock only after pruning is saved. Ordinary deletion removes the
 	// snapshot's own chunk references, leaving references of other sources.
 	for _, node := range t.state.Nodes {
 		if node.Excluded {
 			if err := t.releaseSnapshotLock(ctx, execCtx, node); err != nil {
 				return nil, err
 			}
-			if err := t.storage.ReleaseSnapshotBackup(ctx, node.SnapshotId, execCtx.GetTaskID(), false); err != nil {
-				return nil, err
-			}
 		}
 	}
-	return needed, nil
+	return metas, nil
 }
 
-func (t *backupSnapshotTask) hasDependent(id string, needed map[string]bool) bool {
-	for _, node := range t.state.Nodes {
-		if !needed[node.SnapshotId] {
-			continue
-		}
-		for _, parent := range node.Dependencies {
-			if parent == id {
-				return true
-			}
-		}
-	}
-	return false
+// An exact saved request identifies an already accepted copy. Deletion never
+// prunes that copy, including after a restart.
+func (t *backupSnapshotTask) copyAccepted(node *protos.SnapshotBackupNode) bool {
+	return t.state.DataplaneRequest != nil && t.state.DataplaneRequest.SnapshotId == node.SnapshotId
 }
 
 // Order depends only on saved edges, so completing/pruning nodes cannot shift

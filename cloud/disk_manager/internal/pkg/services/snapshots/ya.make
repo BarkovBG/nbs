@@ -14,7 +14,6 @@ SRCS(
 
 GO_TEST_SRCS(
     schedule_backup_snapshot_tasks_test.go
-    delete_snapshot_task_test.go
 )
 
 END()
