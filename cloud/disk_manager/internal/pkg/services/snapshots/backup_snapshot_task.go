@@ -37,10 +37,6 @@ func (t *backupSnapshotTask) Load(request, state []byte) error {
 	return proto.Unmarshal(state, t.state)
 }
 
-func (t *backupSnapshotTask) ownerID(execCtx tasks.ExecutionContext) string {
-	return execCtx.GetTaskID()
-}
-
 func (t *backupSnapshotTask) scheduleDataplaneTask(ctx context.Context, execCtx tasks.ExecutionContext) error {
 	if err := execCtx.SaveState(ctx); err != nil {
 		return err
@@ -67,7 +63,7 @@ func (t *backupSnapshotTask) run(ctx context.Context, execCtx tasks.ExecutionCon
 		}
 		return t.releasePlan(ctx, execCtx)
 	}
-	if err := t.storage.ClaimSnapshotBackupPlan(ctx, t.ownerID(execCtx)); err != nil {
+	if err := t.storage.ClaimSnapshotBackupPlan(ctx, execCtx.GetTaskID()); err != nil {
 		return err
 	}
 	if !t.state.GraphPrepared {
@@ -90,7 +86,7 @@ func (t *backupSnapshotTask) run(ctx context.Context, execCtx tasks.ExecutionCon
 			// Deletion never prunes that copy, including after a restart.
 			if t.state.DataplaneRequest == nil {
 				meta, err := t.storage.ReserveSnapshotBackup(ctx, node.SnapshotId,
-					t.ownerID(execCtx), t.hasDependent(node.SnapshotId, needed))
+					execCtx.GetTaskID(), t.hasDependent(node.SnapshotId, needed))
 				if err != nil {
 					return err
 				}
@@ -125,7 +121,7 @@ func (t *backupSnapshotTask) run(ctx context.Context, execCtx tasks.ExecutionCon
 		if err := t.releaseSnapshotLock(ctx, execCtx, node); err != nil {
 			return err
 		}
-		if err := t.storage.ReleaseSnapshotBackup(ctx, node.SnapshotId, t.ownerID(execCtx), node.Completed); err != nil {
+		if err := t.storage.ReleaseSnapshotBackup(ctx, node.SnapshotId, execCtx.GetTaskID(), node.Completed); err != nil {
 			return err
 		}
 		t.state.DataplaneRequest = nil
@@ -159,7 +155,7 @@ func (t *backupSnapshotTask) prepareCopy(ctx context.Context, execCtx tasks.Exec
 		return err
 	}
 	t.state.DataplaneRequest = &dataplane_protos.BackupSnapshotDataRequest{
-		SnapshotId: meta.ID, OwnerId: t.ownerID(execCtx), EncryptedDek: encryptedDEK,
+		SnapshotId: meta.ID, EncryptedDek: encryptedDEK,
 		CompletedSnapshotIds: t.completedSnapshotIDs(),
 		MetaKey:              backup.SnapshotMetaKey(meta.Disk.DiskId, meta.ID), Meta: data,
 	}
@@ -182,21 +178,6 @@ func (t *backupSnapshotTask) cancel(ctx context.Context, execCtx tasks.Execution
 			return err
 		}
 		if err := t.scheduler.WaitTaskEnded(ctx, t.state.DataplaneTaskID); err != nil {
-			return err
-		}
-	}
-	if t.state.DataplaneRequest != nil {
-		snapshotID := t.state.DataplaneRequest.SnapshotId
-		// Recover a DP hold acquired before saving the child ID. Cleanup drains
-		// chunk workers before any CP graph hold is released.
-		id, err := t.scheduler.ScheduleTask(
-			headers.SetIncomingIdempotencyKey(ctx, t.ownerID(execCtx)+"_release_"+snapshotID),
-			"dataplane.ReleaseSnapshotBackup", "", &dataplane_protos.ReleaseSnapshotBackupRequest{SnapshotId: snapshotID, OwnerId: t.ownerID(execCtx)},
-		)
-		if err != nil {
-			return err
-		}
-		if _, err := t.scheduler.WaitTask(ctx, execCtx, id); err != nil {
 			return err
 		}
 	}
@@ -232,14 +213,14 @@ func (t *backupSnapshotTask) releasePlan(ctx context.Context, execCtx tasks.Exec
 		if err := t.releaseSnapshotLock(ctx, execCtx, node); err != nil {
 			return err
 		}
-		if err := t.storage.ReleaseSnapshotBackup(ctx, node.SnapshotId, t.ownerID(execCtx), node.Completed); err != nil {
+		if err := t.storage.ReleaseSnapshotBackup(ctx, node.SnapshotId, execCtx.GetTaskID(), node.Completed); err != nil {
 			return err
 		}
 	}
 	if err := t.storage.RemoveSnapshotFromBackupQueue(ctx, t.request.SnapshotId, t.request.BackupId); err != nil {
 		return err
 	}
-	return t.storage.FinishSnapshotBackupPlan(ctx, t.ownerID(execCtx))
+	return t.storage.FinishSnapshotBackupPlan(ctx, execCtx.GetTaskID())
 }
 
 func (t *backupSnapshotTask) GetMetadata(ctx context.Context) (proto.Message, error) {

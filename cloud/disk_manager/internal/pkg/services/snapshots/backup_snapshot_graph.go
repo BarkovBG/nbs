@@ -70,7 +70,7 @@ func (t *backupSnapshotTask) prepareGraph(ctx context.Context, execCtx tasks.Exe
 				if err := execCtx.SaveState(ctx); err != nil {
 					return err
 				}
-				meta, err = t.storage.HoldSnapshotBackupPlan(ctx, node.SnapshotId, t.ownerID(execCtx))
+				meta, err = t.storage.HoldSnapshotBackupPlan(ctx, node.SnapshotId, execCtx.GetTaskID())
 				if err != nil {
 					return err
 				}
@@ -133,7 +133,7 @@ func (t *backupSnapshotTask) scheduleSnapshotLock(ctx context.Context, execCtx t
 	id, err := t.scheduler.ScheduleTask(
 		headers.SetIncomingIdempotencyKey(ctx, execCtx.GetTaskID()+"_lock_"+node.SnapshotId),
 		"dataplane.LockSnapshotForBackup", "",
-		&dataplane_protos.LockSnapshotForBackupRequest{SnapshotId: node.SnapshotId, OwnerId: t.ownerID(execCtx)},
+		&dataplane_protos.LockSnapshotForBackupRequest{SnapshotId: node.SnapshotId},
 	)
 	if err != nil {
 		return err
@@ -177,10 +177,10 @@ func (t *backupSnapshotTask) pruneGraph(ctx context.Context, execCtx tasks.Execu
 		if err != nil {
 			return nil, err
 		}
-		if meta == nil || meta.BackupPlanID != t.ownerID(execCtx) {
+		if meta == nil || meta.BackupPlanID != execCtx.GetTaskID() {
 			return nil, errors.NewNonRetriableErrorf("lost snapshot backup graph hold for %v", node.SnapshotId)
 		}
-		if meta.Ready || meta.BackupTaskID == t.ownerID(execCtx) {
+		if meta.Ready || meta.BackupTaskID == execCtx.GetTaskID() {
 			roots = append(roots, node.SnapshotId)
 		}
 	}
@@ -214,7 +214,7 @@ func (t *backupSnapshotTask) pruneGraph(ctx context.Context, execCtx tasks.Execu
 			if err := t.releaseSnapshotLock(ctx, execCtx, node); err != nil {
 				return nil, err
 			}
-			if err := t.storage.ReleaseSnapshotBackup(ctx, node.SnapshotId, t.ownerID(execCtx), false); err != nil {
+			if err := t.storage.ReleaseSnapshotBackup(ctx, node.SnapshotId, execCtx.GetTaskID(), false); err != nil {
 				return nil, err
 			}
 		}

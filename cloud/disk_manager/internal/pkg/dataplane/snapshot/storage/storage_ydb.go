@@ -329,12 +329,12 @@ func (s *storageYDB) GetQueuedChunksToBackup(
 	return entries, err
 }
 
-func (s *storageYDB) EnqueueBackupChunksForOwner(ctx context.Context, snapshotID, ownerID string, entries []BackupChunkQueueEntry) (err error) {
-	defer s.metrics.StatOperation("EnqueueBackupChunksForOwner")(&err)
-	if ownerID == "" {
-		return task_errors.NewNonRetriableErrorf("empty snapshot backup owner")
+func (s *storageYDB) EnqueueBackupChunksForTask(ctx context.Context, snapshotID, taskID string, entries []BackupChunkQueueEntry) (err error) {
+	defer s.metrics.StatOperation("EnqueueBackupChunksForTask")(&err)
+	if taskID == "" {
+		return task_errors.NewNonRetriableErrorf("empty snapshot backup task ID")
 	}
 	return s.db.Execute(ctx, func(ctx context.Context, session *persistence.Session) error {
-		return s.enqueueBackupChunksForOwner(ctx, session, snapshotID, ownerID, entries)
+		return s.enqueueBackupChunksForTask(ctx, session, snapshotID, taskID, entries)
 	})
 }

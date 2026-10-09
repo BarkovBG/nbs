@@ -461,6 +461,27 @@ func (s *storageYDB) deletingSnapshot(
 		return nil, err
 	}
 
+	// Read the reference range in the same serializable transaction that
+	// changes the source status. A concurrent hold must read that status
+	// before inserting its reference, so deletion and admission serialize.
+	held, err := tx.Execute(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $id as Utf8;
+
+		select task_id from backup_snapshot_refs where snapshot_id = $id limit 1
+	`, s.tablesPath), persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)))
+	if err != nil {
+		return nil, err
+	}
+	defer held.Close()
+	if held.NextResultSet(ctx) && held.NextRow() {
+		return nil, task_errors.NewInterruptExecutionError()
+	}
+	if err := held.Err(); err != nil {
+		return nil, err
+	}
+
 	var state snapshotState
 
 	if len(states) != 0 {
@@ -477,10 +498,6 @@ func (s *storageYDB) deletingSnapshot(
 
 			// Should be idempotent.
 			return state.toSnapshotMeta(), err
-		}
-
-		if len(state.backupTaskID) != 0 {
-			return nil, task_errors.NewInterruptExecutionError()
 		}
 
 		if len(state.lockTaskID) != 0 && state.lockTaskID != taskID {
@@ -1545,18 +1562,13 @@ func (s *storageYDB) holdSnapshotForBackup(
 		)
 	}
 
-	owner := states[0].backupTaskID
-	if len(owner) != 0 && owner != taskID {
-		return task_errors.NewInterruptExecutionError()
-	}
-
 	_, err = tx.Execute(ctx, fmt.Sprintf(`
 		--!syntax_v1
 		pragma TablePathPrefix = "%v";
 		declare $id as Utf8;
 		declare $task_id as Utf8;
 
-		update snapshots set backup_task_id = $task_id where id = $id
+		upsert into backup_snapshot_refs (snapshot_id, task_id) values ($id, $task_id)
 	`, s.tablesPath),
 		persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)),
 		persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)),
@@ -1582,8 +1594,8 @@ func (s *storageYDB) ReleaseSnapshotForBackup(
 		declare $id as Utf8;
 		declare $task_id as Utf8;
 
-		update snapshots set backup_task_id = ""
-		where id = $id and backup_task_id = $task_id
+		delete from backup_snapshot_refs
+		where snapshot_id = $id and task_id = $task_id
 	`, s.tablesPath),
 		persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)),
 		persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)),
@@ -1651,10 +1663,10 @@ func (s *storageYDB) findBackupChunkIDsTx(
 }
 
 func (s *storageYDB) enqueueBackupChunks(ctx context.Context, session *persistence.Session, snapshotID string, entries []BackupChunkQueueEntry) error {
-	return s.enqueueBackupChunksForOwner(ctx, session, snapshotID, "", entries)
+	return s.enqueueBackupChunksForTask(ctx, session, snapshotID, "", entries)
 }
 
-func (s *storageYDB) enqueueBackupChunksForOwner(ctx context.Context, session *persistence.Session, snapshotID, ownerID string, entries []BackupChunkQueueEntry) error {
+func (s *storageYDB) enqueueBackupChunksForTask(ctx context.Context, session *persistence.Session, snapshotID, taskID string, entries []BackupChunkQueueEntry) error {
 
 	tx, err := session.BeginRWTransaction(ctx)
 	if err != nil {
@@ -1662,14 +1674,15 @@ func (s *storageYDB) enqueueBackupChunksForOwner(ctx context.Context, session *p
 	}
 	defer tx.Rollback(ctx)
 
-	if ownerID != "" {
+	if taskID != "" {
 		held, err := tx.Execute(ctx, fmt.Sprintf(`
             --!syntax_v1
             pragma TablePathPrefix = "%v";
             declare $id as Utf8;
-            declare $owner as Utf8;
-            select id from snapshots where id = $id and backup_task_id = $owner;
-        `, s.tablesPath), persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)), persistence.ValueParam("$owner", persistence.UTF8Value(ownerID)))
+            declare $task_id as Utf8;
+            select task_id from backup_snapshot_refs
+            where snapshot_id = $id and task_id = $task_id;
+        `, s.tablesPath), persistence.ValueParam("$id", persistence.UTF8Value(snapshotID)), persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)))
 		if err != nil {
 			return err
 		}
@@ -1678,7 +1691,7 @@ func (s *storageYDB) enqueueBackupChunksForOwner(ctx context.Context, session *p
 			if held.Err() != nil {
 				return held.Err()
 			}
-			return task_errors.NewNonRetriableErrorf("snapshot backup hold %v is no longer owned by %v", snapshotID, ownerID)
+			return task_errors.NewNonRetriableErrorf("snapshot %v is not held by task %v", snapshotID, taskID)
 		}
 	}
 
@@ -2076,22 +2089,22 @@ func (s *storageYDB) DrainSnapshotBackup(
 		declare $task_id as Utf8;
 		declare $limit as Uint64;
 
-		$owned = (
-			select id from snapshots
-			where id = $snapshot_id and backup_task_id = $task_id
+		$held = (
+			select snapshot_id from backup_snapshot_refs
+			where snapshot_id = $snapshot_id and task_id = $task_id
 		);
 		$active = (
 			select snapshot_id from backup_chunk_inflight
-			where snapshot_id in $owned
+			where snapshot_id in $held
 		);
 
 		$pending = (
 			select snapshot_id, chunk_id from backup_chunk_queue
-			where snapshot_id in $owned limit $limit
+			where snapshot_id in $held limit $limit
 		);
 		$chunks = (
 			select snapshot_id, chunk_id from backup_chunks
-			where snapshot_id in $owned and snapshot_id not in $active
+			where snapshot_id in $held and snapshot_id not in $active
 			limit $limit
 		);
 		delete from backup_chunk_queue on select * from $pending;
@@ -2206,16 +2219,28 @@ func (s *storageYDB) ChunkBackupFailed(
 	return err
 }
 
-func (s *storageYDB) CheckSnapshotBackupOwner(ctx context.Context, snapshotID, ownerID string) (err error) {
-	defer s.metrics.StatOperation("CheckSnapshotBackupOwner")(&err)
-	state, err := s.getSnapshot(ctx, snapshotID)
+func (s *storageYDB) CheckSnapshotHeldForBackup(ctx context.Context, snapshotID, taskID string) (err error) {
+	defer s.metrics.StatOperation("CheckSnapshotHeldForBackup")(&err)
+	res, err := s.db.ExecuteRO(ctx, fmt.Sprintf(`
+		--!syntax_v1
+		pragma TablePathPrefix = "%v";
+		declare $snapshot_id as Utf8;
+		declare $task_id as Utf8;
+
+		select task_id from backup_snapshot_refs
+		where snapshot_id = $snapshot_id and task_id = $task_id
+	`, s.tablesPath), persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)), persistence.ValueParam("$task_id", persistence.UTF8Value(taskID)))
 	if err != nil {
 		return err
 	}
-	if state == nil || ownerID == "" || state.backupTaskID != ownerID || state.status != snapshotStatusReady {
-		return task_errors.NewNonRetriableErrorf("snapshot %v is not held by backup %v", snapshotID, ownerID)
+	defer res.Close()
+	if res.NextResultSet(ctx) && res.NextRow() {
+		return nil
 	}
-	return nil
+	if err := res.Err(); err != nil {
+		return err
+	}
+	return task_errors.NewNonRetriableErrorf("snapshot %v is not held by task %v", snapshotID, taskID)
 }
 
 // GetSnapshotIDFromChunkID returns the creator encoded in a chunk ID.

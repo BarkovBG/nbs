@@ -193,6 +193,22 @@ func Create(
 	}
 	logging.Info(ctx, "Created backup_chunk_inflight table")
 
+	err = db.CreateOrAlterTable(
+		ctx,
+		config.GetStorageFolder(),
+		"backup_snapshot_refs",
+		persistence.NewCreateTableDescription(
+			persistence.WithColumn("snapshot_id", persistence.Optional(persistence.TypeUTF8)),
+			persistence.WithColumn("task_id", persistence.Optional(persistence.TypeUTF8)),
+			persistence.WithPrimaryKeyColumn("snapshot_id", "task_id"),
+		),
+		dropUnusedColumns,
+	)
+	if err != nil {
+		return err
+	}
+	logging.Info(ctx, "Created backup_snapshot_refs table")
+
 	if s3 != nil && len(config.GetS3Bucket()) != 0 {
 		exists, err := s3.BucketExists(ctx, config.GetS3Bucket())
 		if err != nil {
@@ -283,6 +299,12 @@ func Drop(
 	}
 	logging.Info(ctx, "Dropped backup_chunk_inflight table")
 
+	err = db.DropTable(ctx, config.GetStorageFolder(), "backup_snapshot_refs")
+	if err != nil {
+		return err
+	}
+	logging.Info(ctx, "Dropped backup_snapshot_refs table")
+
 	logging.Info(ctx, "Dropped schema for dataplane snapshot storage")
 
 	return nil
@@ -330,10 +352,6 @@ func snapshotStateTableDescription() persistence.CreateTableDescription {
 		persistence.WithColumn("storage_size", persistence.Optional(persistence.TypeUint64)),
 		persistence.WithColumn("chunk_count", persistence.Optional(persistence.TypeUint32)),
 		persistence.WithColumn("lock_task_id", persistence.Optional(persistence.TypeUTF8)),
-		persistence.WithColumn(
-			"backup_task_id",
-			persistence.Optional(persistence.TypeUTF8),
-		),
 		persistence.WithColumn("encryption_mode", persistence.Optional(persistence.TypeUint32)),
 		persistence.WithColumn("encryption_keyhash", persistence.Optional(persistence.TypeString)),
 		persistence.WithColumn("status", persistence.Optional(persistence.TypeInt64)),

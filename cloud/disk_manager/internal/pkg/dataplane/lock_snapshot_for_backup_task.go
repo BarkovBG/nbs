@@ -32,8 +32,8 @@ func (t *lockSnapshotForBackupTask) Load(request, state []byte) error {
 }
 
 func (t *lockSnapshotForBackupTask) Run(ctx context.Context, execCtx tasks.ExecutionContext) error {
-	if t.request.SnapshotId == "" || t.request.OwnerId == "" {
-		return errors.NewNonRetriableErrorf("snapshot backup lock requires snapshot and owner IDs")
+	if t.request.SnapshotId == "" {
+		return errors.NewNonRetriableErrorf("snapshot backup lock requires a snapshot ID")
 	}
 	return retrySnapshotBackupError(t.run(ctx, execCtx))
 }
@@ -41,7 +41,7 @@ func (t *lockSnapshotForBackupTask) Run(ctx context.Context, execCtx tasks.Execu
 func (t *lockSnapshotForBackupTask) run(ctx context.Context, execCtx tasks.ExecutionContext) error {
 	// Release may arrive before the first execution or after a restart.
 	if execCtx.HasEvent(ctx, int64(protos.SnapshotBackupLockEvent_RELEASE)) {
-		return t.storage.ReleaseSnapshotForBackup(ctx, t.request.SnapshotId, t.request.OwnerId)
+		return t.storage.ReleaseSnapshotForBackup(ctx, t.request.SnapshotId, execCtx.GetTaskID())
 	}
 	if !t.state.Ready {
 		meta, err := t.storage.GetSnapshotMeta(ctx, t.request.SnapshotId)
@@ -49,7 +49,7 @@ func (t *lockSnapshotForBackupTask) run(ctx context.Context, execCtx tasks.Execu
 			return err
 		}
 		if meta != nil && meta.Ready {
-			err = t.storage.HoldSnapshotForBackup(ctx, meta.ID, t.request.OwnerId)
+			err = t.storage.HoldSnapshotForBackup(ctx, meta.ID, execCtx.GetTaskID())
 			if err != nil {
 				// Admission races deletion in the same source-row transaction.
 				// If deletion won, retained descendants copy the inherited chunks.
@@ -114,10 +114,7 @@ func (t *lockSnapshotForBackupTask) readDependencies(ctx context.Context, meta *
 }
 
 func (t *lockSnapshotForBackupTask) Cancel(ctx context.Context, execCtx tasks.ExecutionContext) error {
-	if t.request.OwnerId == "" {
-		return nil
-	}
-	return retrySnapshotBackupError(t.storage.ReleaseSnapshotForBackup(ctx, t.request.SnapshotId, t.request.OwnerId))
+	return retrySnapshotBackupError(t.storage.ReleaseSnapshotForBackup(ctx, t.request.SnapshotId, execCtx.GetTaskID()))
 }
 
 func (t *lockSnapshotForBackupTask) GetMetadata(context.Context) (proto.Message, error) {

@@ -17,7 +17,6 @@ SRCS(
     migrate_snapshot_task.proto
     migrate_snapshot_database_task.proto
     lock_snapshot_for_backup_task.proto
-    release_snapshot_backup_task.proto
     replicate_disk_task.proto
     transfer_from_disk_to_disk_task.proto
     transfer_from_snapshot_to_disk_task.proto

@@ -11,8 +11,7 @@ message BackupSnapshotDataRequest {
     bytes EncryptedDek = 2;
     string MetaKey = 3;
     bytes Meta = 4;
-    // An external graph owner keeps the source locked after this copy ends.
-    string OwnerId = 5;
+    reserved 5; // Former shared owner; the copy uses its own task ID.
     repeated string CompletedSnapshotIds = 6;
 }
 
