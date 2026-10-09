@@ -27,3 +27,17 @@ func TestDeleteSnapshotWaitsForCPReservationBeforeSchedulingDP(t *testing.T) {
 	store.AssertNotCalled(t, "SnapshotDeleted", mock.Anything, mock.Anything, mock.Anything)
 	mock.AssertExpectationsForObjects(t, store, scheduler, execCtx)
 }
+
+func TestDeleteSnapshotWaitsForGraphHoldBeforeSchedulingDP(t *testing.T) {
+	ctx := context.Background()
+	store := resources_mocks.NewStorageMock()
+	scheduler := tasks_mocks.NewSchedulerMock()
+	execCtx := tasks_mocks.NewExecutionContextMock()
+	execCtx.On("GetTaskID").Return("delete")
+	store.On("DeleteSnapshot", ctx, "snapshot", "delete", mock.Anything).Return(&resources.SnapshotMeta{ID: "snapshot", DeleteTaskID: "delete", BackupPlanID: "plan"}, nil).Twice()
+	task := &deleteSnapshotTask{storage: store, scheduler: scheduler, request: &protos.DeleteSnapshotRequest{SnapshotId: "snapshot"}, state: &protos.DeleteSnapshotTaskState{}}
+	require.True(t, errors.Is(task.Run(ctx, execCtx), errors.NewInterruptExecutionError()))
+	require.True(t, errors.Is(task.Cancel(ctx, execCtx), errors.NewInterruptExecutionError()))
+	scheduler.AssertNotCalled(t, "ScheduleTask", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	mock.AssertExpectationsForObjects(t, store, scheduler, execCtx)
+}

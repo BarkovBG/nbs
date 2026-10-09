@@ -292,30 +292,32 @@ func (s *StorageMock) ListSnapshots(
 	return args.Get(0).([]string), args.Error(1)
 }
 
-func (s *StorageMock) ListSnapshotsToBackup(
-	ctx context.Context,
-	limit int,
-) ([]string, error) {
-
-	args := s.Called(ctx, limit)
-	return args.Get(0).([]string), args.Error(1)
-}
-
-func (s *StorageMock) SnapshotBackupScheduled(
+func (s *StorageMock) EnqueueSnapshotBackup(
 	ctx context.Context,
 	snapshotID string,
+	backupID string,
 ) error {
 
-	args := s.Called(ctx, snapshotID)
+	args := s.Called(ctx, snapshotID, backupID)
 	return args.Error(0)
 }
 
-func (s *StorageMock) SnapshotBackupCancelled(
+func (s *StorageMock) ListSnapshotsToBackup(
+	ctx context.Context,
+	limit int,
+) ([]resources.SnapshotBackupRequest, error) {
+
+	args := s.Called(ctx, limit)
+	return args.Get(0).([]resources.SnapshotBackupRequest), args.Error(1)
+}
+
+func (s *StorageMock) RemoveSnapshotFromBackupQueue(
 	ctx context.Context,
 	snapshotID string,
+	backupID string,
 ) error {
 
-	args := s.Called(ctx, snapshotID)
+	args := s.Called(ctx, snapshotID, backupID)
 	return args.Error(0)
 }
 
@@ -602,8 +604,8 @@ func assertStorageMockIsStorage(arg *StorageMock) resources.Storage {
 	return arg
 }
 
-func (s *StorageMock) ReserveSnapshotBackup(ctx context.Context, snapshotID, ownerID string) (*resources.SnapshotMeta, error) {
-	a := s.Called(ctx, snapshotID, ownerID)
+func (s *StorageMock) ReserveSnapshotBackup(ctx context.Context, snapshotID, ownerID string, neededByDependents bool) (*resources.SnapshotMeta, error) {
+	a := s.Called(ctx, snapshotID, ownerID, neededByDependents)
 	if a.Get(0) == nil {
 		return nil, a.Error(1)
 	}
@@ -612,5 +614,21 @@ func (s *StorageMock) ReserveSnapshotBackup(ctx context.Context, snapshotID, own
 
 func (s *StorageMock) ReleaseSnapshotBackup(ctx context.Context, snapshotID, ownerID string, completed bool) error {
 	a := s.Called(ctx, snapshotID, ownerID, completed)
+	return a.Error(0)
+}
+
+func (s *StorageMock) HoldSnapshotBackupPlan(ctx context.Context, snapshotID, ownerID string) (*resources.SnapshotMeta, error) {
+	a := s.Called(ctx, snapshotID, ownerID)
+	if a.Get(0) == nil {
+		return nil, a.Error(1)
+	}
+	return a.Get(0).(*resources.SnapshotMeta), a.Error(1)
+}
+func (s *StorageMock) FinishSnapshotBackupPlan(ctx context.Context, ownerID string) error {
+	return s.Called(ctx, ownerID).Error(0)
+}
+
+func (s *StorageMock) ClaimSnapshotBackupPlan(ctx context.Context, backupTaskID string) error {
+	a := s.Called(ctx, backupTaskID)
 	return a.Error(0)
 }

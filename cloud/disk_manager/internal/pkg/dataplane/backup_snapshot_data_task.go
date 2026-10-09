@@ -228,8 +228,9 @@ func (t *backupSnapshotDataTask) enqueueChunks(
 			return err
 		}
 
-		// Copy every referenced nonzero chunk through the held source.
-		if len(entry.ChunkID) == 0 {
+		// Completed creators already have their entire copy in the follower.
+		// Missing/deleting creators without that confirmation are copied here.
+		if len(entry.ChunkID) == 0 || t.creatorCompleted(entry.ChunkID) {
 			continue
 		}
 
@@ -350,4 +351,17 @@ func (t *backupSnapshotDataTask) buildChunkMap(
 		return nil, err
 	}
 	return chunkMap, nil
+}
+
+func (t *backupSnapshotDataTask) creatorCompleted(chunkID string) bool {
+	creator := storage.GetSnapshotIDFromChunkID(chunkID)
+	if creator == "" || creator == t.request.SnapshotId {
+		return false
+	}
+	for _, id := range t.request.CompletedSnapshotIds {
+		if creator == id {
+			return true
+		}
+	}
+	return false
 }

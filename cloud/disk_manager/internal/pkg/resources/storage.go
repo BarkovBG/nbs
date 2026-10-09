@@ -72,6 +72,7 @@ type SnapshotMeta struct {
 	Encryption        *types.EncryptionDesc `json:"encryption"`
 	Ready             bool                  `json:"ready"`
 	BackupTaskID      string                `json:"backup_task_id"`
+	BackupPlanID      string                `json:"backup_plan_id"`
 	BackupCompleted   bool                  `json:"backup_completed"`
 }
 
@@ -119,6 +120,11 @@ type PlacementGroupMeta struct {
 	CreatedAt               time.Time               `json:"created_at"`
 	CreatedBy               string                  `json:"created_by"`
 	DeleteTaskID            string                  `json:"delete_task_id"`
+}
+
+type SnapshotBackupRequest struct {
+	SnapshotID string
+	BackupID   string
 }
 
 type Storage interface {
@@ -223,14 +229,31 @@ type Storage interface {
 		creatingBefore time.Time,
 	) ([]string, error)
 
-	ReserveSnapshotBackup(ctx context.Context, snapshotID, ownerID string) (*SnapshotMeta, error)
+	ClaimSnapshotBackupPlan(ctx context.Context, backupTaskID string) error
+	ReserveSnapshotBackup(ctx context.Context, snapshotID, backupTaskID string, neededByDependents bool) (*SnapshotMeta, error)
+	HoldSnapshotBackupPlan(ctx context.Context, snapshotID, backupTaskID string) (*SnapshotMeta, error)
+	FinishSnapshotBackupPlan(ctx context.Context, backupTaskID string) error
 	ReleaseSnapshotBackup(ctx context.Context, snapshotID, ownerID string, completed bool) error
 
-	ListSnapshotsToBackup(ctx context.Context, limit int) ([]string, error)
+	EnqueueSnapshotBackup(
+		ctx context.Context,
+		snapshotID string,
+		backupID string,
+	) error
 
-	SnapshotBackupScheduled(ctx context.Context, snapshotID string) error
+	ListSnapshotsToBackup(
+		ctx context.Context,
+		limit int,
+	) ([]SnapshotBackupRequest, error)
 
-	SnapshotBackupCancelled(ctx context.Context, snapshotID string) error
+	// Queue cleanup is not proof of a completed copy. ReleaseSnapshotBackup
+	// records success only for the task that owns the source hold.
+
+	RemoveSnapshotFromBackupQueue(
+		ctx context.Context,
+		snapshotID string,
+		backupID string,
+	) error
 
 	// Returns filesystem if action has been accepted by storage and nil otherwise.
 	CreateFilesystem(ctx context.Context, filesystem FilesystemMeta) (*FilesystemMeta, error)

@@ -12,6 +12,7 @@ message BackupSnapshotDataRequest {
     string MetaKey = 3;
     bytes Meta = 4;
     string OwnerId = 5;
+    repeated string CompletedSnapshotIds = 6;
 }
 
 message BackupSnapshotDataTaskState {

@@ -2217,3 +2217,8 @@ func (s *storageYDB) CheckSnapshotBackupOwner(ctx context.Context, snapshotID, o
 	}
 	return nil
 }
+
+// GetSnapshotIDFromChunkID returns the creator encoded in a chunk ID.
+func GetSnapshotIDFromChunkID(chunkID string) string {
+	return getSnapshotIDFromChunkID(chunkID)
+}
