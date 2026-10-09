@@ -21,3 +21,8 @@ func ChunkKey(chunkID string) string {
 func ChunkMapKey(snapshotID string) string {
 	return fmt.Sprintf("chunk_maps/%v", snapshotID)
 }
+
+// Pending maps let deletion clean up a copy interrupted before publication.
+func PendingChunkMapKey(snapshotID string) string {
+	return fmt.Sprintf("pending_chunk_maps/%v", snapshotID)
+}

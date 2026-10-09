@@ -67,6 +67,7 @@ type snapshotState struct {
 	size              uint64
 	storageSize       uint64
 	backupCompleted   bool
+	backupTaskID      string
 	encryptionMode    uint32
 	encryptionKeyHash []byte
 
@@ -100,6 +101,7 @@ func (s *snapshotState) toSnapshotMeta() *SnapshotMeta {
 		},
 		Ready:           s.status == snapshotStatusReady,
 		BackupCompleted: s.backupCompleted,
+		BackupTaskID:    s.backupTaskID,
 	}
 }
 
@@ -128,6 +130,7 @@ func (s *snapshotState) structValue() persistence.Value {
 			"backup_completed",
 			persistence.BoolValue(s.backupCompleted),
 		),
+		persistence.StructFieldValue("backup_task_id", persistence.UTF8Value(s.backupTaskID)),
 		persistence.StructFieldValue("status", persistence.Int64Value(int64(s.status))),
 	)
 }
@@ -156,6 +159,7 @@ func scanSnapshotState(res persistence.Result) (state snapshotState, err error) 
 			"backup_completed",
 			&state.backupCompleted,
 		),
+		persistence.OptionalWithDefault("backup_task_id", &state.backupTaskID),
 		persistence.OptionalWithDefault("status", &state.status),
 	)
 	return
@@ -203,6 +207,7 @@ func snapshotStateStructTypeString() string {
 		encryption_mode: Uint32,
 		encryption_keyhash: String,
 		backup_completed: Bool,
+        backup_task_id: Utf8,
 		status: Int64>`
 }
 
@@ -231,8 +236,10 @@ func snapshotStateTableDescription() persistence.CreateTableDescription {
 			"backup_completed",
 			persistence.Optional(persistence.TypeBool),
 		),
+		persistence.WithColumn("backup_task_id", persistence.Optional(persistence.TypeUTF8)),
 		persistence.WithColumn("status", persistence.Optional(persistence.TypeInt64)),
 		persistence.WithPrimaryKeyColumn("id"),
+		persistence.WithSecondaryKeyColumn("folder_id"),
 	)
 }
 
@@ -547,11 +554,14 @@ func (s *storageYDB) snapshotCreated(
 			--!syntax_v1
 			pragma TablePathPrefix = "%v";
 			declare $snapshot_id as Utf8;
+            declare $folder_id as Utf8;
 
 			upsert into backup_queue (snapshot_id)
-			values ($snapshot_id)
+            select $snapshot_id as snapshot_id from backup_folders
+            where folder_id = $folder_id and COALESCE(enabled, false)
 		`, s.snapshotsPath),
 			persistence.ValueParam("$snapshot_id", persistence.UTF8Value(snapshotID)),
+			persistence.ValueParam("$folder_id", persistence.UTF8Value(state.folderID)),
 		)
 		if err != nil {
 			return err
@@ -653,7 +663,7 @@ func (s *storageYDB) deleteSnapshot(
 		return nil, err
 	}
 
-	if s.backupEnabled {
+	if s.backupEnabled && state.backupTaskID == "" {
 		_, err = tx.Execute(ctx, fmt.Sprintf(`
 			--!syntax_v1
 			pragma TablePathPrefix = "%v";
@@ -717,6 +727,9 @@ func (s *storageYDB) snapshotDeleted(
 	}
 
 	state := states[0]
+	if state.backupTaskID != "" {
+		return errors.NewInterruptExecutionError()
+	}
 
 	if state.status == snapshotStatusDeleted {
 		// Nothing to do.
@@ -912,6 +925,16 @@ func (s *storageYDB) enqueueSnapshotBackup(
 	if state.backupCompleted {
 		return tx.Commit(ctx)
 	}
+	folder, err := s.getSnapshotBackupFolderTx(ctx, tx, state.folderID)
+	if err != nil {
+		return err
+	}
+	if folder == nil || !folder.enabled {
+		return errors.NewNonRetriableErrorf(
+			"snapshot backup is not enabled for folder %v",
+			state.folderID,
+		)
+	}
 
 	queued, err := tx.Execute(ctx, fmt.Sprintf(`
 		--!syntax_v1
@@ -1018,7 +1041,8 @@ func (s *storageYDB) finishSnapshotBackup(
 
 		$ids = (
 			select snapshot_id as id from backup_queue
-			where snapshot_id = $snapshot_id
+            where snapshot_id = $snapshot_id
+                and snapshot_id in (select id from snapshots where COALESCE(backup_task_id, "") = "")
 				and COALESCE(backup_id, "") = $backup_id
 		);
 
@@ -1317,6 +1341,11 @@ func createSnapshotsYDBTables(
 	}
 	logging.Info(ctx, "Created backup_queue table")
 
+	err = createSnapshotBackupTables(ctx, folder, db, dropUnusedColumns)
+	if err != nil {
+		return err
+	}
+
 	logging.Info(ctx, "Created tables for snapshots")
 
 	return nil
@@ -1354,6 +1383,10 @@ func dropSnapshotsYDBTables(
 	}
 	logging.Info(ctx, "Dropped backup_queue table")
 
+	err = db.DropTable(ctx, folder, "backup_folders")
+	if err != nil {
+		return err
+	}
 	logging.Info(ctx, "Dropped tables for snapshots")
 
 	return nil

@@ -14,8 +14,6 @@ import (
 
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/sync/errgroup"
-
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/common"
 	dataplane_common "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/common"
 	snapshot_config "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/config"
@@ -28,6 +26,7 @@ import (
 	"github.com/ydb-platform/nbs/cloud/tasks/metrics/mocks"
 	"github.com/ydb-platform/nbs/cloud/tasks/persistence"
 	persistence_config "github.com/ydb-platform/nbs/cloud/tasks/persistence/config"
+	"golang.org/x/sync/errgroup"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -682,6 +681,182 @@ func TestSnapshotsLocks(t *testing.T) {
 			_, err = f.storage.DeletingSnapshot(f.ctx, snapshot1.ID, "delete1")
 			require.NoError(t, err)
 		})
+	}
+}
+
+func TestSnapshotBackupHold(t *testing.T) {
+	f := createFixture(t)
+	defer f.teardown()
+
+	_, err := f.storage.CreateSnapshot(f.ctx, SnapshotMeta{
+		ID:           "snapshot",
+		CreateTaskID: "create",
+	})
+	require.NoError(t, err)
+	err = f.storage.SnapshotCreated(f.ctx, "snapshot", 0, 0, 0, nil)
+	require.NoError(t, err)
+
+	locked, err := f.storage.LockSnapshot(f.ctx, "snapshot", "incremental")
+	require.NoError(t, err)
+	require.True(t, locked)
+
+	for i := 0; i != 2; i++ {
+		err = f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "backup")
+		require.NoError(t, err)
+	}
+
+	err = f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "another")
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+
+	err = f.storage.UnlockSnapshot(f.ctx, "snapshot", "incremental")
+	require.NoError(t, err)
+	locked, err = f.storage.LockSnapshot(f.ctx, "snapshot", "incremental2")
+	require.NoError(t, err)
+	require.True(t, locked)
+	err = f.storage.UnlockSnapshot(f.ctx, "snapshot", "incremental2")
+	require.NoError(t, err)
+
+	err = f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "another")
+	require.NoError(t, err)
+	for _, taskID := range []string{"delete", "backup"} {
+		_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", taskID)
+		require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	}
+
+	err = f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "backup")
+	require.NoError(t, err)
+	err = f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "next")
+	require.NoError(t, err)
+	err = f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "backup")
+	require.NoError(t, err)
+	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+
+	for i := 0; i != 2; i++ {
+		err = f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "next")
+		require.NoError(t, err)
+	}
+	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
+	require.NoError(t, err)
+}
+
+func TestSnapshotBackupHoldPreservesInheritedChunks(t *testing.T) {
+	for _, testCase := range testCases() {
+		t.Run(testCase.name, func(t *testing.T) {
+			f := createFixture(t)
+			defer f.teardown()
+
+			chunkID, err := f.storage.WriteChunk(
+				f.ctx, "", "source", makeChunk(0, "abc"), testCase.useS3,
+			)
+			require.NoError(t, err)
+			_, err = f.storage.CreateSnapshot(f.ctx, SnapshotMeta{
+				ID:           "copy",
+				CreateTaskID: "create",
+			})
+			require.NoError(t, err)
+			err = f.storage.ShallowCopySnapshot(f.ctx, "source", "copy", 0, nil)
+			require.NoError(t, err)
+			err = f.storage.SnapshotCreated(f.ctx, "copy", 3, 3, 1, nil)
+			require.NoError(t, err)
+			err = f.storage.HoldSnapshotForBackup(f.ctx, "copy", "backup")
+			require.NoError(t, err)
+
+			_, err = f.storage.DeletingSnapshot(f.ctx, "source", "delete")
+			require.NoError(t, err)
+			err = f.storage.DeleteSnapshotData(f.ctx, "source")
+			require.NoError(t, err)
+			_, err = f.storage.DeletingSnapshot(f.ctx, "copy", "delete")
+			require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+
+			blob, err := f.storage.ReadChunkBlob(f.ctx, chunkID, testCase.useS3)
+			require.NoError(t, err)
+			require.Equal(t, []byte("abc"), blob.Data)
+			err = f.storage.ReleaseSnapshotForBackup(f.ctx, "copy", "backup")
+			require.NoError(t, err)
+			_, err = f.storage.DeletingSnapshot(f.ctx, "copy", "delete")
+			require.NoError(t, err)
+			require.NoError(t, f.storage.DeleteSnapshotData(f.ctx, "copy"))
+			_, err = f.storage.ReadChunkBlob(f.ctx, chunkID, testCase.useS3)
+			require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+		})
+	}
+}
+
+func TestSnapshotBackupHoldRejectsUnavailableSnapshot(t *testing.T) {
+	f := createFixture(t)
+	defer f.teardown()
+
+	err := f.storage.HoldSnapshotForBackup(f.ctx, "missing", "backup")
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+
+	_, err = f.storage.CreateSnapshot(f.ctx, SnapshotMeta{
+		ID:           "snapshot",
+		CreateTaskID: "create",
+	})
+	require.NoError(t, err)
+	err = f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "backup")
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+
+	err = f.storage.SnapshotCreated(f.ctx, "snapshot", 0, 0, 0, nil)
+	require.NoError(t, err)
+	err = f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "")
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
+	require.NoError(t, err)
+	err = f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "backup")
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+}
+
+func TestSnapshotBackupHoldRacesWithDeletion(t *testing.T) {
+	f := createFixture(t)
+	defer f.teardown()
+
+	for i := 0; i != 10; i++ {
+		snapshotID := fmt.Sprintf("snapshot%v", i)
+		_, err := f.storage.CreateSnapshot(f.ctx, SnapshotMeta{
+			ID:           snapshotID,
+			CreateTaskID: "create",
+		})
+		require.NoError(t, err)
+		err = f.storage.SnapshotCreated(f.ctx, snapshotID, 0, 0, 0, nil)
+		require.NoError(t, err)
+
+		start := make(chan struct{})
+		held := make(chan error, 1)
+		deleted := make(chan error, 1)
+		go func() {
+			<-start
+			held <- f.storage.HoldSnapshotForBackup(f.ctx, snapshotID, "backup")
+		}()
+		go func() {
+			<-start
+			_, err := f.storage.DeletingSnapshot(f.ctx, snapshotID, "delete")
+			deleted <- err
+		}()
+		close(start)
+
+		holdErr, deleteErr := <-held, <-deleted
+		if holdErr == nil {
+			require.True(
+				t,
+				errors.Is(deleteErr, errors.NewInterruptExecutionError()),
+			)
+			err = f.storage.ReleaseSnapshotForBackup(
+				f.ctx,
+				snapshotID,
+				"backup",
+			)
+			require.NoError(t, err)
+			_, err = f.storage.DeletingSnapshot(f.ctx, snapshotID, "delete")
+			require.NoError(t, err)
+		} else {
+			require.NoError(t, deleteErr)
+			require.True(
+				t,
+				errors.Is(holdErr, errors.NewEmptyNonRetriableError()),
+			)
+		}
 	}
 }
 
@@ -1945,4 +2120,160 @@ func TestGetSnapshotIDFromChunkID(t *testing.T) {
 	require.True(t, IsChunkCreatedBySnapshot("task1.snap.1.7", "snap.1"))
 	require.False(t, IsChunkCreatedBySnapshot("task1.snap1.7", "snap2"))
 	require.False(t, IsChunkCreatedBySnapshot("", ""))
+}
+
+func TestDrainSnapshotBackupWaitsForAllWorkers(t *testing.T) {
+	f := createFixture(t)
+	defer f.teardown()
+
+	_, err := f.storage.CreateSnapshot(f.ctx, SnapshotMeta{ID: "snapshot"})
+	require.NoError(t, err)
+	require.NoError(t, f.storage.SnapshotCreated(f.ctx, "snapshot", 0, 0, 0, nil))
+	require.NoError(t, f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "backup"))
+	entries := []BackupChunkQueueEntry{{SnapshotID: "snapshot", ChunkID: "chunk"}}
+	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snapshot", entries))
+
+	for _, worker := range []string{"worker1", "worker2"} {
+		claimed, err := f.storage.ClaimBackupChunks(f.ctx, worker, entries)
+		require.NoError(t, err)
+		require.Equal(t, entries, claimed)
+	}
+	// One worker can remove the queue row while another is still writing.
+	require.NoError(t, f.storage.ChunksBackupCompleted(f.ctx, entries))
+	require.NoError(t, f.storage.ReleaseBackupChunkClaims(f.ctx, "worker1"))
+	err = f.storage.DrainSnapshotBackup(f.ctx, "snapshot", "backup", 10)
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+
+	claimed, err := f.storage.ClaimBackupChunks(f.ctx, "late", entries)
+	require.NoError(t, err)
+	require.Empty(t, claimed)
+	require.NoError(t, f.storage.ReleaseBackupChunkClaims(f.ctx, "worker2"))
+	require.NoError(t, f.storage.DrainSnapshotBackup(f.ctx, "snapshot", "backup", 10))
+	require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "backup"))
+	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
+	require.NoError(t, err)
+}
+
+func TestDrainSnapshotBackupRejectsStaleWorkersAndOwners(t *testing.T) {
+	f := createFixture(t)
+	defer f.teardown()
+
+	_, err := f.storage.CreateSnapshot(f.ctx, SnapshotMeta{ID: "snapshot"})
+	require.NoError(t, err)
+	require.NoError(t, f.storage.SnapshotCreated(f.ctx, "snapshot", 0, 0, 0, nil))
+	require.NoError(t, f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "backup"))
+	entries := []BackupChunkQueueEntry{
+		{SnapshotID: "snapshot", ChunkID: "first"},
+		{SnapshotID: "snapshot", ChunkID: "second"},
+	}
+	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snapshot", entries))
+	for i := 0; i < 2; i++ {
+		err = f.storage.DrainSnapshotBackup(f.ctx, "snapshot", "backup", 1)
+		require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	}
+	require.NoError(t, f.storage.DrainSnapshotBackup(f.ctx, "snapshot", "backup", 1))
+	claimed, err := f.storage.ClaimBackupChunks(f.ctx, "late", entries)
+	require.NoError(t, err)
+	require.Empty(t, claimed)
+	require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "backup"))
+
+	require.NoError(t, f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "next"))
+	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snapshot", entries))
+	require.NoError(t, f.storage.DrainSnapshotBackup(f.ctx, "snapshot", "backup", 10))
+	require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "backup"))
+	queue, err := f.storage.GetQueuedChunksToBackup(f.ctx, 10)
+	require.NoError(t, err)
+	require.ElementsMatch(t, entries, queue)
+	_, err = f.storage.DeletingSnapshot(f.ctx, "snapshot", "delete")
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+}
+
+func TestClaimBackupChunksRacesWithDrain(t *testing.T) {
+	f := createFixture(t)
+	defer f.teardown()
+
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("snapshot%v", i)
+		_, err := f.storage.CreateSnapshot(f.ctx, SnapshotMeta{ID: id})
+		require.NoError(t, err)
+		require.NoError(t, f.storage.SnapshotCreated(f.ctx, id, 0, 0, 0, nil))
+		require.NoError(t, f.storage.HoldSnapshotForBackup(f.ctx, id, "backup"))
+		entries := []BackupChunkQueueEntry{{SnapshotID: id, ChunkID: "chunk"}}
+		require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, id, entries))
+
+		start := make(chan struct{})
+		drainResult := make(chan error, 1)
+		type claimResult struct {
+			entries []BackupChunkQueueEntry
+			err     error
+		}
+		claim := make(chan claimResult, 1)
+		go func() {
+			<-start
+			entries, err := f.storage.ClaimBackupChunks(f.ctx, "worker", entries)
+			claim <- claimResult{entries, err}
+		}()
+		go func() {
+			<-start
+			drainResult <- f.storage.DrainSnapshotBackup(f.ctx, id, "backup", 10)
+		}()
+		close(start)
+		result := <-claim
+		require.NoError(t, result.err)
+		err = <-drainResult
+		if len(result.entries) != 0 {
+			require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+		} else {
+			require.NoError(t, err)
+		}
+		require.NoError(t, f.storage.ReleaseBackupChunkClaims(f.ctx, "worker"))
+		require.NoError(t, f.storage.DrainSnapshotBackup(f.ctx, id, "backup", 10))
+		require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, id, "backup"))
+	}
+}
+
+func TestBackupChunkFailureDoesNotOverwriteSuccess(t *testing.T) {
+	f := createFixture(t)
+	defer f.teardown()
+	entry := BackupChunkQueueEntry{SnapshotID: "snapshot", ChunkID: "chunk"}
+	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snapshot", []BackupChunkQueueEntry{entry}))
+	require.NoError(t, f.storage.ChunksBackupCompleted(f.ctx, []BackupChunkQueueEntry{entry}))
+	// A duplicate worker's late failure must preserve recorded success.
+	require.NoError(t, f.storage.ChunkBackupFailed(f.ctx, entry))
+	require.NoError(t, f.storage.CheckBackupChunksCompleted(f.ctx, "snapshot"))
+	failed := BackupChunkQueueEntry{SnapshotID: "snapshot", ChunkID: "failed"}
+	require.NoError(t, f.storage.EnqueueBackupChunks(f.ctx, "snapshot", []BackupChunkQueueEntry{failed}))
+	require.NoError(t, f.storage.ChunkBackupFailed(f.ctx, failed))
+	err := f.storage.CheckBackupChunksCompleted(f.ctx, "snapshot")
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+	queue, err := f.storage.GetQueuedChunksToBackup(f.ctx, 10)
+	require.NoError(t, err)
+	require.Empty(t, queue)
+	// Conversely, a completed duplicate write is sufficient to recover a
+	// failure, as long as the snapshot task has not cancelled the attempt.
+	require.NoError(t, f.storage.ChunksBackupCompleted(f.ctx, []BackupChunkQueueEntry{failed}))
+	require.NoError(t, f.storage.CheckBackupChunksCompleted(f.ctx, "snapshot"))
+}
+
+func TestBackupHoldRejectsDirectCleanupAndLateEnqueue(t *testing.T) {
+	f := createFixture(t)
+	defer f.teardown()
+	_, err := f.storage.CreateSnapshot(f.ctx, SnapshotMeta{ID: "snapshot"})
+	require.NoError(t, err)
+	require.NoError(t, f.storage.SnapshotCreated(f.ctx, "snapshot", 0, 0, 0, nil))
+	require.NoError(t, f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "owner"))
+	require.NoError(t, f.storage.CheckSnapshotBackupOwner(f.ctx, "snapshot", "owner"))
+	err = f.storage.DeleteSnapshotData(f.ctx, "snapshot")
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	require.NoError(t, f.storage.ReleaseSnapshotForBackup(f.ctx, "snapshot", "owner"))
+	err = f.storage.EnqueueBackupChunksForOwner(f.ctx, "snapshot", "owner", []BackupChunkQueueEntry{{SnapshotID: "snapshot", ChunkID: "late"}})
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+	queue, err := f.storage.GetQueuedChunksToBackup(f.ctx, 10)
+	require.NoError(t, err)
+	require.Empty(t, queue)
+	require.NoError(t, f.storage.DeleteSnapshotData(f.ctx, "snapshot"))
+	err = f.storage.HoldSnapshotForBackup(f.ctx, "snapshot", "next")
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
 }

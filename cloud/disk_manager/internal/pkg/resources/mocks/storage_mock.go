@@ -613,3 +613,45 @@ func NewStorageMock() *StorageMock {
 func assertStorageMockIsStorage(arg *StorageMock) resources.Storage {
 	return arg
 }
+
+func (s *StorageMock) ListSnapshotBackupFolders(ctx context.Context) ([]resources.SnapshotBackupFolder, error) {
+	a := s.Called(ctx)
+	if a.Get(0) == nil {
+		return nil, a.Error(1)
+	}
+	return a.Get(0).([]resources.SnapshotBackupFolder), a.Error(1)
+}
+
+func (s *StorageMock) ListSnapshotBackupCandidates(ctx context.Context, folderID, afterID string, limit int) ([]string, error) {
+	a := s.Called(ctx, folderID, afterID, limit)
+	if a.Get(0) == nil {
+		return nil, a.Error(1)
+	}
+	return a.Get(0).([]string), a.Error(1)
+}
+
+func (s *StorageMock) ReserveSnapshotBackup(ctx context.Context, snapshotID, ownerID, coordinatorID string) (*resources.SnapshotMeta, error) {
+	a := s.Called(ctx, snapshotID, ownerID, coordinatorID)
+	if a.Get(0) == nil {
+		return nil, a.Error(1)
+	}
+	return a.Get(0).(*resources.SnapshotMeta), a.Error(1)
+}
+
+func (s *StorageMock) ReleaseSnapshotBackup(ctx context.Context, snapshotID, ownerID string, completed bool) error {
+	a := s.Called(ctx, snapshotID, ownerID, completed)
+	return a.Error(0)
+}
+
+func (s *StorageMock) ClaimSnapshotBackupFolder(ctx context.Context, folderID, generation, taskID string) (bool, error) {
+	a := s.Called(ctx, folderID, generation, taskID)
+	return a.Bool(0), a.Error(1)
+}
+
+func (s *StorageMock) ReleaseSnapshotBackupFolder(ctx context.Context, folderID, taskID string) error {
+	return s.Called(ctx, folderID, taskID).Error(0)
+}
+
+func (s *StorageMock) SetSnapshotBackupFolder(ctx context.Context, folderID, generation string, enabled bool) error {
+	return s.Called(ctx, folderID, generation, enabled).Error(0)
+}

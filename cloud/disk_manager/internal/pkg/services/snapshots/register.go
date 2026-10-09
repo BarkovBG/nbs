@@ -59,6 +59,13 @@ func RegisterForExecution(
 	}
 
 	if backupS3 != nil {
+		err = taskRegistry.RegisterForExecution("snapshots.BackupFolder", func() tasks.Task {
+			return &backupFolderTask{scheduler: taskScheduler, storage: storage}
+		})
+		if err != nil {
+			return err
+		}
+
 		err = taskRegistry.RegisterForExecution("snapshots.BackupSnapshot", func() tasks.Task {
 			return &backupSnapshotTask{
 				scheduler: taskScheduler,
@@ -74,7 +81,6 @@ func RegisterForExecution(
 			return &scheduleBackupSnapshotTasks{
 				scheduler: taskScheduler,
 				storage:   storage,
-				limit:     int(config.GetScheduleBackupSnapshotTasksLimit()),
 			}
 		})
 		if err != nil {

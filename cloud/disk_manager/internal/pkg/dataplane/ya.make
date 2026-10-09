@@ -16,6 +16,7 @@ SRCS(
     migrate_snapshot.go
     migrate_snapshot_database_task.go
     register.go
+    release_snapshot_backup_task.go
     replicate_disk_task.go
     transfer_from_disk_to_disk_task.go
     transfer_from_snapshot_to_disk_task.go

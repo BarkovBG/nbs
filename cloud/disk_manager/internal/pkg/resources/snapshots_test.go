@@ -439,6 +439,7 @@ func TestSnapshotsBackup(t *testing.T) {
 	defer db.Close(ctx)
 
 	storage := newStorage(t, ctx, db)
+	require.NoError(t, storage.SetSnapshotBackupFolder(ctx, "folder", "generation", true))
 
 	snapshot := SnapshotMeta{
 		ID:       "snapshot",
@@ -506,6 +507,7 @@ func newSnapshotBackupTestStorage(t *testing.T) (context.Context, *storageYDB) {
 	storage.backupEnabled = false
 	_, err = storage.CreateSnapshot(ctx, SnapshotMeta{
 		ID:            "snapshot",
+		FolderID:      "folder",
 		Disk:          &types.Disk{ZoneId: "zone", DiskId: "disk"},
 		CreateRequest: &wrappers.UInt64Value{Value: 1},
 		CreateTaskID:  "create",
@@ -515,7 +517,18 @@ func newSnapshotBackupTestStorage(t *testing.T) (context.Context, *storageYDB) {
 	err = storage.SnapshotCreated(ctx, "snapshot", "cp", time.Now(), 0, 0)
 	require.NoError(t, err)
 	storage.backupEnabled = true
+	require.NoError(t, storage.SetSnapshotBackupFolder(ctx, "folder", "generation", true))
 	return ctx, storage
+}
+
+func TestEnqueueSnapshotBackupRequiresEnabledFolder(t *testing.T) {
+	ctx, storage := newSnapshotBackupTestStorage(t)
+	require.NoError(t, storage.SetSnapshotBackupFolder(ctx, "folder", "generation", false))
+	err := storage.EnqueueSnapshotBackup(ctx, "snapshot", "manual")
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+	queue, err := storage.ListSnapshotsToBackup(ctx, 10)
+	require.NoError(t, err)
+	require.Empty(t, queue)
 }
 
 func TestEnqueueSnapshotBackupIsIdempotent(t *testing.T) {
@@ -719,6 +732,7 @@ func TestSnapshotsDeletionStopsBackup(t *testing.T) {
 	defer db.Close(ctx)
 
 	storage := newStorage(t, ctx, db)
+	require.NoError(t, storage.SetSnapshotBackupFolder(ctx, "folder", "generation", true))
 
 	snapshot := SnapshotMeta{
 		ID:       "snapshot",

@@ -1,6 +1,7 @@
 package dataplane
 
 import (
+	"bytes"
 	"context"
 
 	"github.com/golang/protobuf/proto"
@@ -8,6 +9,7 @@ import (
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/backup"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/protos"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage"
+	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/chunks"
 	"github.com/ydb-platform/nbs/cloud/tasks"
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
 	"github.com/ydb-platform/nbs/cloud/tasks/logging"
@@ -42,24 +44,47 @@ func (t *backupSnapshotDataTask) Load(request, state []byte) error {
 func (t *backupSnapshotDataTask) Run(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
-) error {
+) (err error) {
+	held := false
+	defer func() {
+		if held || t.request.OwnerId != "" || t.state.Finished {
+			err = retrySnapshotBackupError(err)
+		}
+	}()
 
 	// A DEK that cannot be opened fails the chunk copier on every
 	// chunk and leaves those queue rows unfinished, so this task
 	// interrupts forever. Reject it before anything is enqueued.
-	err := t.backupS3.CheckEncryptedDEK(t.request.EncryptedDek)
+	err = t.backupS3.CheckEncryptedDEK(t.request.EncryptedDek)
 	if err != nil {
 		return err
 	}
 
 	snapshotID := t.request.SnapshotId
 
+	// Persist completion before releasing the hold: a retry after release
+	// must not reacquire it or write objects after snapshot deletion started.
+	if t.state.Finished {
+		return t.finish(ctx, execCtx)
+	}
+
+	err = t.storage.HoldSnapshotForBackup(ctx, snapshotID, t.ownerID(execCtx))
+	if err != nil {
+		return err
+	}
+
+	held = true
 	meta, err := t.storage.CheckSnapshotReady(ctx, snapshotID)
 	if err != nil {
 		return err
 	}
 
 	t.state.ChunkCount = meta.ChunkCount
+
+	err = t.prepareChunkMap(ctx, execCtx, meta)
+	if err != nil {
+		return err
+	}
 
 	err = t.enqueueChunks(ctx, execCtx)
 	if err != nil {
@@ -71,18 +96,46 @@ func (t *backupSnapshotDataTask) Run(
 		return err
 	}
 
-	return t.clearCompletedBackupChunks(ctx, snapshotID)
+	if len(t.request.MetaKey) != 0 {
+		err = t.backupS3.PutObject(
+			ctx,
+			t.request.MetaKey,
+			t.request.EncryptedDek,
+			persistence.S3Object{Data: t.request.Meta},
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	err = t.backupS3.DeleteObject(ctx, backup.PendingChunkMapKey(snapshotID))
+	if err != nil {
+		return err
+	}
+
+	t.state.Finished = true
+	err = execCtx.SaveState(ctx)
+	if err != nil {
+		return err
+	}
+	return t.finish(ctx, execCtx)
 }
 
 func (t *backupSnapshotDataTask) Cancel(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
-) error {
+) (err error) {
 
-	// TODO(https://github.com/ydb-platform/nbs/issues/7237):
-	// lock the snapshot while its chunks are copied and remove them from
-	// backup_chunk_queue on cancellation.
-	return nil
+	// Cancellation must not be marked complete while cleanup has failed.
+	defer func() {
+		if err != nil && !errors.Is(err, errors.NewInterruptExecutionError()) {
+			err = errors.NewRetriableErrorf("failed to cancel snapshot backup: %v", err)
+		}
+	}()
+
+	// Run has stopped enqueueing. Drain also prevents workers with stale
+	// queue listings from starting new IO for this attempt.
+	return t.finish(ctx, execCtx)
 }
 
 func (t *backupSnapshotDataTask) GetMetadata(
@@ -97,6 +150,24 @@ func (t *backupSnapshotDataTask) GetResponse() proto.Message {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+func (t *backupSnapshotDataTask) finish(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+) error {
+
+	taskID := t.ownerID(execCtx)
+	err := t.storage.DrainSnapshotBackup(
+		ctx,
+		t.request.SnapshotId,
+		taskID,
+		t.batchSize,
+	)
+	if err != nil {
+		return err
+	}
+	return t.storage.ReleaseSnapshotForBackup(ctx, t.request.SnapshotId, taskID)
+}
 
 func validateChunkMapEntry(
 	entry storage.ChunkMapEntry,
@@ -124,9 +195,10 @@ func (t *backupSnapshotDataTask) enqueueBatch(
 ) error {
 
 	if len(batch) != 0 {
-		err := t.storage.EnqueueBackupChunks(
+		err := t.storage.EnqueueBackupChunksForOwner(
 			ctx,
 			t.request.SnapshotId,
+			t.ownerID(execCtx),
 			batch,
 		)
 		if err != nil {
@@ -134,7 +206,6 @@ func (t *backupSnapshotDataTask) enqueueBatch(
 		}
 	}
 
-	t.state.EnqueuedChunkCount += uint32(len(batch))
 	t.state.MilestoneChunkIndex = milestoneChunkIndex
 	return execCtx.SaveState(ctx)
 }
@@ -170,10 +241,9 @@ func (t *backupSnapshotDataTask) enqueueChunks(
 			return err
 		}
 
-		// Zero chunks have no data, and the chunks shallow copied from another
-		// snapshot (this snapshot only references them) are copied when that
-		// snapshot is backed up.
-		if !storage.IsChunkCreatedBySnapshot(entry.ChunkID, snapshotID) {
+		// Every referenced chunk must exist in the follower, even if its
+		// creator was never backed up or has already been deleted.
+		if len(entry.ChunkID) == 0 {
 			continue
 		}
 
@@ -207,59 +277,21 @@ func (t *backupSnapshotDataTask) waitForChunksBackupCompleted(
 	snapshotID string,
 ) error {
 
-	completed, err := t.storage.GetBackedUpChunkCount(ctx, snapshotID)
-	if err != nil {
-		return err
+	err := t.storage.CheckBackupChunksCompleted(ctx, snapshotID)
+	if errors.Is(err, errors.NewInterruptExecutionError()) {
+		logging.Debug(ctx, "Backup of snapshot with id %v is waiting for its chunks to finish backing up", snapshotID)
 	}
-
-	if completed < uint64(t.state.EnqueuedChunkCount) {
-		logging.Debug(
-			ctx,
-			"Backup of snapshot with id %v is waiting for its chunks to finish backing up",
-			snapshotID,
-		)
-		return errors.NewInterruptExecutionError()
-	}
-
-	return nil
+	return err
 }
 
-func (t *backupSnapshotDataTask) clearCompletedBackupChunks(
-	ctx context.Context,
-	snapshotID string,
-) error {
-
-	for {
-		cleared, err := t.storage.ClearCompletedBackupChunks(
-			ctx,
-			snapshotID,
-			t.batchSize,
-		)
-		if err != nil {
-			return err
-		}
-
-		// The storage clears fewer than batchSize entries only when no
-		// completed entries are left.
-		if cleared < t.batchSize {
-			return nil
-		}
-	}
-}
-
-func (t *backupSnapshotDataTask) backupChunkMap(
+func (t *backupSnapshotDataTask) prepareChunkMap(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
 	meta storage.SnapshotMeta,
 ) error {
 
-	if t.state.ChunkMapBackedUp {
+	if t.state.ChunkMapPrepared {
 		return nil
-	}
-
-	err := t.waitForChunksBackupCompleted(ctx, meta.ID)
-	if err != nil {
-		return err
 	}
 
 	chunkMap := &protos.BackupChunkMap{
@@ -283,7 +315,7 @@ func (t *backupSnapshotDataTask) backupChunkMap(
 		chunkMap.ChunkIds[entry.ChunkIndex] = entry.ChunkID
 	}
 
-	err = <-entriesErrors
+	err := <-entriesErrors
 	if err != nil {
 		return err
 	}
@@ -295,14 +327,146 @@ func (t *backupSnapshotDataTask) backupChunkMap(
 
 	err = t.backupS3.PutObject(
 		ctx,
-		backup.ChunkMapKey(meta.ID),
+		backup.PendingChunkMapKey(meta.ID),
 		t.request.EncryptedDek,
 		persistence.S3Object{Data: data},
 	)
 	if err != nil {
 		return err
 	}
+	// Older task states may have skipped inherited chunks or already published
+	// a map without verifying its objects. Restart their progress under the hold.
+	t.state.MilestoneChunkIndex = 0
+	t.state.ChunkMapBackedUp = false
+	t.state.ChunkMapPrepared = true
+	return execCtx.SaveState(ctx)
+}
 
+func (t *backupSnapshotDataTask) backupChunkMap(
+	ctx context.Context,
+	execCtx tasks.ExecutionContext,
+	meta storage.SnapshotMeta,
+) error {
+
+	if t.state.ChunkMapBackedUp {
+		return nil
+	}
+	if err := t.waitForChunksBackupCompleted(ctx, meta.ID); err != nil {
+		if errors.Is(err, errors.NewEmptyNonRetriableError()) {
+			t.state.MilestoneChunkIndex = 0
+			if saveErr := execCtx.SaveState(ctx); saveErr != nil {
+				return saveErr
+			}
+		}
+		return err
+	}
+	object, err := t.backupS3.GetObject(ctx, backup.PendingChunkMapKey(meta.ID))
+	if err != nil {
+		return err
+	}
+	if err := t.verifyChunkMap(ctx, execCtx, meta, object); err != nil {
+		return err
+	}
+	err = t.backupS3.PutObject(ctx, backup.ChunkMapKey(meta.ID), t.request.EncryptedDek, object)
+	if err != nil {
+		return err
+	}
 	t.state.ChunkMapBackedUp = true
 	return execCtx.SaveState(ctx)
+}
+
+func (t *backupSnapshotDataTask) ownerID(execCtx tasks.ExecutionContext) string {
+	if t.request.OwnerId != "" {
+		return t.request.OwnerId
+	}
+	return execCtx.GetTaskID()
+}
+
+func retrySnapshotBackupError(err error) error {
+	if err == nil || errors.Is(err, errors.NewInterruptExecutionError()) || errors.Is(err, errors.NewWrongGenerationError()) || errors.Is(err, context.Canceled) {
+		return err
+	}
+	// A typed non-retriable cause would still trigger runner cancellation.
+	return errors.NewRetriableErrorWithIgnoreRetryLimitf("snapshot backup waits for recovery: %v", err)
+}
+
+// Status rows are progress, not proof of a complete copy. Before publication
+// verify every nonzero map position and the actual encrypted target objects.
+func (t *backupSnapshotDataTask) verifyChunkMap(ctx context.Context, execCtx tasks.ExecutionContext, meta storage.SnapshotMeta, object persistence.S3Object) error {
+	owner := t.ownerID(execCtx)
+	if err := t.storage.CheckSnapshotBackupOwner(ctx, meta.ID, owner); err != nil {
+		return err
+	}
+	chunkMap := &protos.BackupChunkMap{}
+	if err := proto.Unmarshal(object.Data, chunkMap); err != nil {
+		return errors.NewNonRetriableError(err)
+	}
+	if uint64(len(chunkMap.ChunkIds)) != uint64(meta.ChunkCount) {
+		return errors.NewNonRetriableErrorf("backup map size mismatch for %v", meta.ID)
+	}
+	var expected, seen uint64
+	requeued := false
+	for _, id := range chunkMap.ChunkIds {
+		if id != "" {
+			expected++
+		}
+	}
+	verified := make(map[string]struct{})
+	readCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	entries, readErrors := t.storage.ReadChunkMap(readCtx, meta.ID, 0)
+	for entry := range entries {
+		if err := validateChunkMapEntry(entry, meta.ID, meta.ChunkCount); err != nil {
+			return err
+		}
+		if chunkMap.ChunkIds[entry.ChunkIndex] != entry.ChunkID {
+			return errors.NewNonRetriableErrorf("source chunk map changed for %v", meta.ID)
+		}
+		if entry.ChunkID == "" {
+			continue
+		}
+		seen++
+		if _, ok := verified[entry.ChunkID]; ok {
+			continue
+		}
+		blob, err := t.storage.ReadChunkBlob(ctx, entry.ChunkID, entry.StoredInS3)
+		if err != nil {
+			return err
+		}
+		target, targetErr := t.backupS3.GetObject(ctx, backup.ChunkKey(entry.ChunkID))
+		if targetErr != nil && errors.Is(targetErr, errors.NewEmptyRetriableError()) {
+			return targetErr
+		}
+		wanted := chunks.NewS3Object(blob)
+		equal := targetErr == nil && bytes.Equal(wanted.Data, target.Data)
+		for key, value := range wanted.Metadata {
+			actual := target.Metadata[key]
+			if value == nil || actual == nil || *actual != *value {
+				equal = false
+			}
+		}
+		if !equal {
+			if err := t.storage.RequeueBackupChunk(ctx, owner, storage.BackupChunkQueueEntry{
+				SnapshotID: meta.ID, ChunkID: entry.ChunkID, StoredInS3: entry.StoredInS3, EncryptedDEK: t.request.EncryptedDek,
+			}); err != nil {
+				return err
+			}
+			requeued = true
+		}
+
+		verified[entry.ChunkID] = struct{}{}
+	}
+	if err := <-readErrors; err != nil {
+		return err
+	}
+	if seen != expected {
+		return errors.NewNonRetriableErrorf("backup map of %v references missing source positions", meta.ID)
+	}
+	if err := t.storage.CheckSnapshotBackupOwner(ctx, meta.ID, owner); err != nil {
+		return err
+	}
+	if requeued {
+		return errors.NewInterruptExecutionError()
+	}
+	return nil
 }
