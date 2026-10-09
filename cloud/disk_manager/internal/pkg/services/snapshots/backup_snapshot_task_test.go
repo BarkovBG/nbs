@@ -226,16 +226,11 @@ func TestBackupSnapshotTaskCancellationStopsCopy(t *testing.T) {
 	f.task.state.DataplaneRequest = &dataplane_protos.BackupSnapshotDataRequest{SnapshotId: "snapshot"}
 	// The copy was scheduled, but its ID was not saved.
 	f.scheduler.On("ScheduleTask", mock.Anything, "dataplane.BackupSnapshotData", "", mock.Anything).Return("copy", nil).Once()
-	f.scheduler.On("CancelTask", mock.Anything, "copy").Return(true, nil)
-	f.scheduler.On("WaitTaskEnded", mock.Anything, "copy").Return(errors.NewInterruptExecutionError()).Once()
-	f.scheduler.On("WaitTaskEnded", mock.Anything, "copy").Return(nil).Once()
-
-	err := f.task.Cancel(f.ctx, f.execCtx)
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
-	f.storage.AssertNotCalled(t, "RemoveSnapshotFromBackupQueue", mock.Anything, mock.Anything, mock.Anything)
+	f.scheduler.On("CancelTask", mock.Anything, "copy").Return(true, nil).Once()
 
 	require.NoError(t, f.task.Cancel(f.ctx, f.execCtx))
 	f.storage.AssertCalled(t, "RemoveSnapshotFromBackupQueue", mock.Anything, "snapshot", "attempt")
+	f.scheduler.AssertNotCalled(t, "WaitTaskEnded", mock.Anything, mock.Anything)
 	f.scheduler.AssertExpectations(t)
 }
 
