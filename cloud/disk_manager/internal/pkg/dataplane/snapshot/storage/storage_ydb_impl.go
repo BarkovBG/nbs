@@ -1052,9 +1052,6 @@ func (s *storageYDB) ReadChunkBlob(
 
 	chunkStorage := s.getChunkStorage(storedInS3)
 	chunkBlob, err = chunkStorage.ReadChunkBlob(ctx, chunkID)
-	if err == nil {
-		err = chunks.ValidateChunkBlob(chunkBlob)
-	}
 	return chunkBlob, err
 }
 
@@ -1654,10 +1651,10 @@ func (s *storageYDB) findBackupChunkIDsTx(
 }
 
 func (s *storageYDB) enqueueBackupChunks(ctx context.Context, session *persistence.Session, snapshotID string, entries []BackupChunkQueueEntry) error {
-	return s.enqueueBackupChunksForOwner(ctx, session, snapshotID, "", entries, false)
+	return s.enqueueBackupChunksForOwner(ctx, session, snapshotID, "", entries)
 }
 
-func (s *storageYDB) enqueueBackupChunksForOwner(ctx context.Context, session *persistence.Session, snapshotID, ownerID string, entries []BackupChunkQueueEntry, force bool) error {
+func (s *storageYDB) enqueueBackupChunksForOwner(ctx context.Context, session *persistence.Session, snapshotID, ownerID string, entries []BackupChunkQueueEntry) error {
 
 	tx, err := session.BeginRWTransaction(ctx)
 	if err != nil {
@@ -1688,17 +1685,6 @@ func (s *storageYDB) enqueueBackupChunksForOwner(ctx context.Context, session *p
 	for _, entry := range entries {
 		if entry.SnapshotID != snapshotID {
 			return task_errors.NewNonRetriableErrorf("backup queue entry belongs to another snapshot")
-		}
-	}
-	if force {
-		_, err := tx.Execute(ctx, fmt.Sprintf(`
-            --!syntax_v1
-            pragma TablePathPrefix = "%v";
-            declare $keys as List<%v>;
-            delete from backup_chunks on select * from AS_TABLE($keys);
-        `, s.tablesPath, backupChunkKeyStructTypeString()), persistence.ValueParam("$keys", backupChunkKeyListValue(entries)))
-		if err != nil {
-			return err
 		}
 	}
 
@@ -2000,6 +1986,9 @@ func (s *storageYDB) ClaimBackupChunks(
 
 	// Reading the queue and registering the worker must serialize with drain.
 	// In particular, a worker cannot start IO using an old queue listing.
+	// $keys is this worker's bounded batch, not another persistent table.
+	// Re-read it and register IO in one RW transaction: cancellation may have
+	// removed entries after GetQueuedChunksToBackup returned them.
 	res, err := s.db.ExecuteRW(ctx, fmt.Sprintf(`
 		--!syntax_v1
 		pragma TablePathPrefix = "%v";

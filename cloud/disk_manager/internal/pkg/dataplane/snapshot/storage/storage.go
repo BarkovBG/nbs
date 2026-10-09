@@ -182,8 +182,6 @@ type Storage interface {
 
 	ListSnapshots(ctx context.Context) (tasks_common.StringSet, error)
 
-	RequeueBackupChunk(ctx context.Context, ownerID string, entry BackupChunkQueueEntry) error
-
 	EnqueueBackupChunksForOwner(ctx context.Context, snapshotID, ownerID string, entries []BackupChunkQueueEntry) error
 
 	EnqueueBackupChunks(

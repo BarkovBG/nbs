@@ -1,7 +1,6 @@
 package dataplane
 
 import (
-	"bytes"
 	"context"
 	"math/rand"
 
@@ -133,30 +132,13 @@ func (t *backupChunksTask) copyChunk(
 	entry storage.BackupChunkQueueEntry,
 ) error {
 
-	chunkBlob, err := t.storage.ReadChunkBlob(ctx, entry.ChunkID, entry.StoredInS3)
+	chunkBlob, err := t.storage.ReadChunkBlob(
+		ctx,
+		entry.ChunkID,
+		entry.StoredInS3,
+	)
 	if err != nil {
 		return err
-	}
-	expected := chunks.NewS3Object(chunkBlob)
-	exists, err := t.backupS3.ObjectExists(ctx, backup.ChunkKey(entry.ChunkID))
-	if err != nil {
-		return err
-	}
-	if exists {
-		object, err := t.backupS3.GetObject(ctx, backup.ChunkKey(entry.ChunkID))
-		if err != nil && errors.Is(err, errors.NewEmptyRetriableError()) {
-			return err
-		}
-		equal := err == nil && bytes.Equal(object.Data, expected.Data)
-		for key, value := range expected.Metadata {
-			actual := object.Metadata[key]
-			if value == nil || actual == nil || *value != *actual {
-				equal = false
-			}
-		}
-		if equal {
-			return nil
-		}
 	}
 
 	err = t.backupS3.PutObject(

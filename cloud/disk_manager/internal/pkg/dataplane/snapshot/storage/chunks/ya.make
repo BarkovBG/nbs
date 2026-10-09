@@ -1,7 +1,6 @@
 GO_LIBRARY()
 
 SRCS(
-    validate.go
     common.go
     storage.go
     storage_s3.go
@@ -9,7 +8,6 @@ SRCS(
 )
 
 GO_TEST_SRCS(
-    validate_test.go
     storage_test.go
 )
 
