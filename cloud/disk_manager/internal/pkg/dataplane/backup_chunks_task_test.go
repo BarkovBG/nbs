@@ -2,6 +2,7 @@ package dataplane
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -17,11 +18,11 @@ import (
 ////////////////////////////////////////////////////////////////////////////////
 
 type countingLimiter struct {
-	bytes int
+	bytes atomic.Int64
 }
 
 func (l *countingLimiter) Wait(ctx context.Context, bytes int) error {
-	l.bytes += bytes
+	l.bytes.Add(int64(bytes))
 	return nil
 }
 
@@ -94,7 +95,7 @@ func TestBackupChunksTask(t *testing.T) {
 	require.Equal(t, *object.Metadata["Checksum"], *raw.Metadata["Checksum"])
 
 	limiter := task.limiter.(*countingLimiter)
-	require.Equal(t, len(chunkBlob.Data), limiter.bytes)
+	require.Equal(t, int64(len(chunkBlob.Data)), limiter.bytes.Load())
 
 	queue, err := storage.GetQueuedChunksToBackup(ctx, 0, 10)
 	require.NoError(t, err)
