@@ -317,6 +317,7 @@ func (s *StorageMock) CountQueuedBackupChunks(
 	args := s.Called(ctx, limit)
 	return args.Int(0), args.Error(1)
 }
+
 func (s *StorageMock) ChunksBackupCompleted(
 	ctx context.Context,
 	entries []storage.BackupChunkQueueEntry,

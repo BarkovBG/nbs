@@ -1699,7 +1699,7 @@ func (s *storageYDB) readQueuedChunksToBackup(
 	limit int,
 ) ([]BackupChunkQueueEntry, error) {
 
-	res, err := session.StreamExecuteRO(ctx, fmt.Sprintf(`
+	res, err := session.ExecuteRO(ctx, fmt.Sprintf(`
 		--!syntax_v1
 		pragma TablePathPrefix = "%v";
 		declare $start as Uint64;
@@ -1708,6 +1708,7 @@ func (s *storageYDB) readQueuedChunksToBackup(
 		select snapshot_id, chunk_id, stored_in_s3, encrypted_dek
 		from backup_chunk_queue
 		where shard_id %v $start
+		order by shard_id, snapshot_id, chunk_id
 		limit $limit
 	`, s.tablesPath, condition),
 		persistence.ValueParam("$start", persistence.Uint64Value(startShardID)),
