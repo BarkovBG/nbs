@@ -59,14 +59,13 @@ type s3TokenAuthTransport struct {
 	tokenProvider credentials.Credentials
 }
 
-// Returns the default transport with room for the configured number of
-// concurrent requests. 0 keeps the default transport as is.
+// Returns a clone of the default transport with room for the given number of
+// idle connections. Must be called with a non-zero value: the default
+// transport is used as is otherwise.
 func newS3HTTPTransport(maxIdleConnsPerHost uint64) *http.Transport {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if maxIdleConnsPerHost != 0 {
-		transport.MaxIdleConns = int(maxIdleConnsPerHost)
-		transport.MaxIdleConnsPerHost = int(maxIdleConnsPerHost)
-	}
+	transport.MaxIdleConns = int(maxIdleConnsPerHost)
+	transport.MaxIdleConnsPerHost = int(maxIdleConnsPerHost)
 
 	return transport
 }
@@ -150,8 +149,11 @@ func NewS3Client(
 		},
 	}
 
-	transport := newS3HTTPTransport(maxIdleConnsPerHost)
-	sessionConfig.HTTPClient = &http.Client{Transport: transport}
+	var transport http.RoundTripper = http.DefaultTransport
+	if maxIdleConnsPerHost != 0 {
+		transport = newS3HTTPTransport(maxIdleConnsPerHost)
+		sessionConfig.HTTPClient = &http.Client{Transport: transport}
+	}
 
 	if tokenProvider != nil {
 		endpointURL, err := url.Parse(aws_endpoints.AddScheme(endpoint, false))
