@@ -1791,8 +1791,8 @@ func (s *storageYDB) ClearBackupChunks(
 		declare $limit as Uint64;
 
 		$keys = (
-			select snapshot_id, chunk_id
-			from backup_chunk_queue
+			select shard_id, snapshot_id, chunk_id
+			from backup_chunk_queue view snapshot_id_index
 			where snapshot_id = $snapshot_id
 			limit $limit
 		);
@@ -1882,7 +1882,7 @@ func (s *storageYDB) CheckBackupChunksCompleted(
 		declare $snapshot_id as Utf8;
 
 		select chunk_id
-		from backup_chunk_queue
+		from backup_chunk_queue view snapshot_id_index
 		where snapshot_id = $snapshot_id
 		limit 1
 	`, s.tablesPath),

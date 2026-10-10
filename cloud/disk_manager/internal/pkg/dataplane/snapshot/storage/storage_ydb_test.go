@@ -2099,6 +2099,42 @@ func TestClearBackupChunks(t *testing.T) {
 	require.Zero(t, cleared)
 }
 
+func TestBackupChunkQueueKeysChunksByShard(t *testing.T) {
+	f := createFixture(t)
+	defer f.teardown()
+
+	var entries []BackupChunkQueueEntry
+	for i := 0; i < 20; i++ {
+		entries = append(entries, BackupChunkQueueEntry{
+			SnapshotID:   "snap1",
+			ChunkID:      fmt.Sprintf("t.snap1.%v", i),
+			EncryptedDEK: []byte("dek"),
+		})
+	}
+	err := f.storage.EnqueueBackupChunks(f.ctx, "snap1", entries)
+	require.NoError(t, err)
+
+	// Rows of one snapshot are spread over the key space, so a read from the
+	// start of the table does not return them in chunk order.
+	got, err := f.storage.GetQueuedChunksToBackup(f.ctx, 20)
+	require.NoError(t, err)
+	require.Len(t, got, 20)
+	require.ElementsMatch(t, entries, got)
+	require.NotEqual(t, entries, got)
+
+	err = f.storage.ChunksBackupCompleted(f.ctx, entries[:19])
+	require.NoError(t, err)
+
+	err = f.storage.CheckBackupChunksCompleted(f.ctx, "snap1")
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+
+	cleared, err := f.storage.ClearBackupChunks(f.ctx, "snap1", 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, cleared)
+
+	require.NoError(t, f.storage.CheckBackupChunksCompleted(f.ctx, "snap1"))
+}
+
 func TestReadChunkBlob(t *testing.T) {
 	f := createFixture(t)
 	defer f.teardown()
