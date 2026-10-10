@@ -492,7 +492,7 @@ func TestBackupSnapshotDataTaskBacksUpChunkStoredInYDB(t *testing.T) {
 
 	chunksTask := newBackupChunksTask(storage, follower)
 	err = chunksTask.Run(ctx, newBackupExecutionContext(ctx))
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	require.NoError(t, err)
 
 	chunkBlob, err := storage.ReadChunkBlob(
 		ctx,
@@ -612,7 +612,7 @@ func TestBackupSnapshotDataTaskBacksUpShallowCopyWithoutCreatorBackup(t *testing
 	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
 	workerCtx := mocks.NewExecutionContextMock()
 	err = newBackupChunksTask(storage, follower).Run(ctx, workerCtx)
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	require.NoError(t, err)
 	require.NoError(t, task.Run(ctx, execCtx))
 	_, err = follower.getObject(ctx, backup.ChunkKey(chunk0))
 	require.NoError(t, err)
@@ -797,7 +797,7 @@ func TestBackupSnapshotDataTaskWaitsForChunkRetriedByAnotherWorker(t *testing.T)
 	require.Error(t, err)
 
 	err = newBackupChunksTask(storage, follower).Run(ctx, workerCtx)
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	require.NoError(t, err)
 	require.NoError(t, task.Run(ctx, execCtx))
 	require.Equal(t, []string{chunkID}, readBackupChunkMap(t, ctx, follower, "snapshot").ChunkIds)
 }
@@ -844,7 +844,7 @@ func backUpSnapshot(
 	require.NoError(t, err)
 
 	err = newBackupChunksTask(storage, follower).Run(ctx, workerCtx)
-	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+	require.NoError(t, err)
 	require.NoError(t, task.Run(ctx, execCtx))
 	return queue
 }

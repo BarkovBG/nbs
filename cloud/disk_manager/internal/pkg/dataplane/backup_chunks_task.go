@@ -3,6 +3,7 @@ package dataplane
 import (
 	"context"
 	"math/rand"
+	"time"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes/empty"
@@ -12,20 +13,24 @@ import (
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/chunks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/monitoring/metrics"
 	"github.com/ydb-platform/nbs/cloud/tasks"
-	"github.com/ydb-platform/nbs/cloud/tasks/errors"
 	"github.com/ydb-platform/nbs/cloud/tasks/logging"
 	"golang.org/x/sync/errgroup"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
 
-const backupChunkQueueWindowSize = 1000
+type chunkCopyLimiter interface {
+	Wait(ctx context.Context, bytes int) error
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// Copies queued chunks to the follower until the queue is empty. The
+// dispatcher keeps as many of these running as the queue needs.
 type backupChunksTask struct {
 	storage       storage.Storage
 	backupS3      *backup.S3
+	limiter       chunkCopyLimiter
 	batchSize     int
 	inflightLimit int
 	registry      metrics.Registry
@@ -47,23 +52,19 @@ func (t *backupChunksTask) Run(
 ) error {
 
 	for {
+		// A random start keeps the batches of concurrent workers apart.
 		entries, err := t.storage.GetQueuedChunksToBackup(
 			ctx,
-			0,
-			backupChunkQueueWindowSize,
+			rand.Uint64(),
+			t.batchSize,
 		)
 		if err != nil {
 			return err
 		}
 
 		if len(entries) == 0 {
-			return errors.NewInterruptExecutionError()
+			return nil
 		}
-
-		rand.Shuffle(len(entries), func(i, j int) {
-			entries[i], entries[j] = entries[j], entries[i]
-		})
-		entries = entries[:min(len(entries), t.batchSize)]
 
 		copied, err := t.copyChunks(ctx, entries)
 		if len(copied) == 0 {
@@ -111,6 +112,15 @@ func (t *backupChunksTask) copyChunk(
 	if err != nil {
 		return err
 	}
+
+	waitStart := time.Now()
+	err = t.limiter.Wait(ctx, len(chunkBlob.Data))
+	if err != nil {
+		return err
+	}
+	t.registry.Counter("backup/bandwidthWaitMs").Add(
+		time.Since(waitStart).Milliseconds(),
+	)
 
 	err = t.backupS3.PutObject(
 		ctx,
