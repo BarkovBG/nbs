@@ -81,7 +81,7 @@ func TestBackupChunksTask(t *testing.T) {
 	require.Equal(t, "kek1", *raw.Metadata["Key-Id"])
 	require.Equal(t, *object.Metadata["Checksum"], *raw.Metadata["Checksum"])
 
-	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
+	queue, err := storage.GetQueuedChunksToBackup(ctx, 0, 10)
 	require.NoError(t, err)
 	require.Empty(t, queue)
 }
@@ -125,7 +125,7 @@ func TestBackupChunksTaskCopiesSeveralBatches(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
+	queue, err := storage.GetQueuedChunksToBackup(ctx, 0, 10)
 	require.NoError(t, err)
 	require.Empty(t, queue)
 }
@@ -167,7 +167,7 @@ func TestBackupChunksTaskGoesOnPastMissingChunk(t *testing.T) {
 	_, err = follower.getObject(ctx, backup.ChunkKey(chunkID))
 	require.NoError(t, err)
 
-	queue, err := storage.GetQueuedChunksToBackup(ctx, 10)
+	queue, err := storage.GetQueuedChunksToBackup(ctx, 0, 10)
 	require.NoError(t, err)
 	require.Equal(
 		t,

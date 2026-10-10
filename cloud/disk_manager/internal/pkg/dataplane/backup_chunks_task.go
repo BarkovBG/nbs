@@ -49,6 +49,7 @@ func (t *backupChunksTask) Run(
 	for {
 		entries, err := t.storage.GetQueuedChunksToBackup(
 			ctx,
+			0,
 			backupChunkQueueWindowSize,
 		)
 		if err != nil {
