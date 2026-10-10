@@ -59,14 +59,27 @@ type s3TokenAuthTransport struct {
 	tokenProvider credentials.Credentials
 }
 
+// Returns the default transport with room for the configured number of
+// concurrent requests. 0 keeps the default transport as is.
+func newS3HTTPTransport(maxIdleConnsPerHost uint64) *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if maxIdleConnsPerHost != 0 {
+		transport.MaxIdleConns = int(maxIdleConnsPerHost)
+		transport.MaxIdleConnsPerHost = int(maxIdleConnsPerHost)
+	}
+
+	return transport
+}
+
 func newS3TokenAuthHTTPClient(
 	host string,
 	tokenProvider credentials.Credentials,
+	inner http.RoundTripper,
 ) *http.Client {
 
 	return &http.Client{
 		Transport: &s3TokenAuthTransport{
-			inner:         http.DefaultTransport,
+			inner:         inner,
 			host:          host,
 			tokenProvider: tokenProvider,
 		},
@@ -111,6 +124,7 @@ func NewS3Client(
 	maxRetriableErrorCount uint64,
 	availabilityMonitoring *AvailabilityMonitoring,
 	tokenProvider credentials.Credentials,
+	maxIdleConnsPerHost uint64,
 ) (*S3Client, error) {
 
 	s3Metrics := newS3Metrics(
@@ -135,6 +149,10 @@ func NewS3Client(
 			metrics: s3Metrics,
 		},
 	}
+
+	transport := newS3HTTPTransport(maxIdleConnsPerHost)
+	sessionConfig.HTTPClient = &http.Client{Transport: transport}
+
 	if tokenProvider != nil {
 		endpointURL, err := url.Parse(aws_endpoints.AddScheme(endpoint, false))
 		if err != nil {
@@ -147,6 +165,7 @@ func NewS3Client(
 		sessionConfig.HTTPClient = newS3TokenAuthHTTPClient(
 			endpointURL.Host,
 			tokenProvider,
+			transport,
 		)
 	}
 
@@ -199,6 +218,7 @@ func NewS3ClientFromConfig(
 		config.GetMaxRetriableErrorCount(),
 		availabilityMonitoring,
 		tokenProvider,
+		config.GetMaxIdleConnsPerHost(),
 	)
 }
 
