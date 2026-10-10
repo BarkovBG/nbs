@@ -25,14 +25,16 @@ type chunkCopyLimiter interface {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// Copies queued chunks to the follower until the queue is empty. The
-// dispatcher keeps as many of these running as the queue needs.
+// Copies queued chunks to the follower until the queue is empty or, if
+// lifetime is not zero, until it has run that long. The dispatcher keeps as
+// many of these running as the queue needs.
 type backupChunksTask struct {
 	storage       storage.Storage
 	backupS3      *backup.S3
 	limiter       chunkCopyLimiter
 	batchSize     int
 	inflightLimit int
+	lifetime      time.Duration
 	registry      metrics.Registry
 	state         *protos.BackupChunksTaskState
 }
@@ -50,6 +52,8 @@ func (t *backupChunksTask) Run(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,
 ) error {
+
+	deadline := time.Now().Add(t.lifetime)
 
 	for {
 		// A random start keeps the batches of concurrent workers apart.
@@ -74,6 +78,10 @@ func (t *backupChunksTask) Run(
 		err = t.storage.ChunksBackupCompleted(ctx, copied)
 		if err != nil {
 			return err
+		}
+
+		if t.lifetime > 0 && time.Now().After(deadline) {
+			return nil
 		}
 	}
 }

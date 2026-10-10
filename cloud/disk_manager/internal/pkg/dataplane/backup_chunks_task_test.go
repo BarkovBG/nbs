@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/backup"
@@ -144,6 +145,54 @@ func TestBackupChunksTaskCopiesSeveralBatches(t *testing.T) {
 	queue, err := storage.GetQueuedChunksToBackup(ctx, 0, 10)
 	require.NoError(t, err)
 	require.Empty(t, queue)
+}
+
+func TestBackupChunksTaskReturnsAfterLifetime(t *testing.T) {
+	ctx := test.NewContext()
+
+	storage, closeFunc := newStorage(t, ctx)
+	defer closeFunc()
+
+	follower := newTestFollower(t, ctx)
+	chunk0 := createSnapshotWithChunk(t, ctx, storage, "snap1")
+	chunk1 := createSnapshotWithChunk(t, ctx, storage, "snap2")
+
+	entries := []snapshot_storage.BackupChunkQueueEntry{
+		{
+			SnapshotID:   "snap1",
+			ChunkID:      chunk0,
+			StoredInS3:   true,
+			EncryptedDEK: follower.encryptedDEK,
+		},
+		{
+			SnapshotID:   "snap2",
+			ChunkID:      chunk1,
+			StoredInS3:   true,
+			EncryptedDEK: follower.encryptedDEK,
+		},
+	}
+	err := enqueueBackupChunks(ctx, storage, entries)
+	require.NoError(t, err)
+
+	task := newBackupChunksTask(storage, follower)
+	task.batchSize = 1
+	task.lifetime = time.Nanosecond
+	execCtx := mocks.NewExecutionContextMock()
+
+	err = task.Run(ctx, execCtx)
+	require.NoError(t, err)
+
+	queue, err := storage.GetQueuedChunksToBackup(ctx, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, queue, 1)
+
+	copiedChunkID := chunk0
+	if queue[0].ChunkID == chunk0 {
+		copiedChunkID = chunk1
+	}
+
+	_, err = follower.getObject(ctx, backup.ChunkKey(copiedChunkID))
+	require.NoError(t, err)
 }
 
 func TestBackupChunksTaskGoesOnPastMissingChunk(t *testing.T) {

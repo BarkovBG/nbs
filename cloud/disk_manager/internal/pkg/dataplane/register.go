@@ -191,6 +191,13 @@ func RegisterForExecution(
 		return err
 	}
 
+	backupChunksTaskLifetime, err := time.ParseDuration(
+		config.GetBackupChunksTaskLifetime(),
+	)
+	if err != nil {
+		return err
+	}
+
 	deleteBackupChunksTaskScheduleInterval, err := time.ParseDuration(
 		config.GetDeleteBackupChunksTaskScheduleInterval(),
 	)
@@ -319,6 +326,7 @@ func RegisterForExecution(
 					limiter:       bandwidthLimiter,
 					batchSize:     int(config.GetBackupChunksTaskBatchSize()),
 					inflightLimit: int(config.GetBackupChunksInflightLimit()),
+					lifetime:      backupChunksTaskLifetime,
 					registry:      metricsRegistry,
 				}
 			},
