@@ -62,8 +62,10 @@ func (t *backupChunksTask) Run(
 	workers.Add(1)
 	defer workers.Add(-1)
 
-	toCopy := make(chan storage.BackupChunkQueueEntry, t.batchSize)
-	copied := make(chan storage.BackupChunkQueueEntry, t.batchSize)
+	// An item is the queue entries of one chunk: the chunk is copied once for
+	// all snapshots that queued it.
+	toCopy := make(chan []storage.BackupChunkQueueEntry, t.batchSize)
+	copied := make(chan []storage.BackupChunkQueueEntry, t.batchSize)
 
 	group, groupCtx := errgroup.WithContext(ctx)
 
@@ -118,13 +120,25 @@ func (t *backupChunksTask) GetResponse() proto.Message {
 ////////////////////////////////////////////////////////////////////////////////
 
 // Reads the range batch by batch, each after the last entry of the previous
-// one, and passes the chunks to the copiers.
+// one, and passes the chunks to the copiers. Entries of one chunk queued by
+// several snapshots come one after another in key order; they are passed as
+// one item, also across batches.
 func (t *backupChunksTask) fetch(
 	ctx context.Context,
-	toCopy chan<- storage.BackupChunkQueueEntry,
+	toCopy chan<- []storage.BackupChunkQueueEntry,
 ) error {
 
+	send := func(entries []storage.BackupChunkQueueEntry) error {
+		select {
+		case toCopy <- entries:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	var after *storage.BackupChunkQueueEntry
+	var chunk []storage.BackupChunkQueueEntry
 	for {
 		readStart := time.Now()
 		entries, err := t.storage.GetQueuedChunksToBackup(
@@ -142,15 +156,21 @@ func (t *backupChunksTask) fetch(
 		}
 
 		if len(entries) == 0 {
-			return nil
+			if len(chunk) == 0 {
+				return nil
+			}
+			return send(chunk)
 		}
 
 		for _, entry := range entries {
-			select {
-			case toCopy <- entry:
-			case <-ctx.Done():
-				return ctx.Err()
+			if len(chunk) != 0 && chunk[0].ChunkID != entry.ChunkID {
+				err = send(chunk)
+				if err != nil {
+					return err
+				}
+				chunk = nil
 			}
+			chunk = append(chunk, entry)
 		}
 
 		after = &entries[len(entries)-1]
@@ -163,31 +183,23 @@ func (t *backupChunksTask) fetch(
 // which fails the backup of its snapshot, and the rest of the range goes on.
 func (t *backupChunksTask) copy(
 	ctx context.Context,
-	toCopy <-chan storage.BackupChunkQueueEntry,
-	copied chan<- storage.BackupChunkQueueEntry,
+	toCopy <-chan []storage.BackupChunkQueueEntry,
+	copied chan<- []storage.BackupChunkQueueEntry,
 ) error {
 
-	for entry := range toCopy {
+	for entries := range toCopy {
 		if ctx.Err() != nil {
 			return nil
 		}
 
-		err := t.copyChunk(ctx, entry)
+		// The object is the same for every snapshot of the chunk.
+		err := t.copyChunk(ctx, entries[0])
 		if errors.Is(err, errors.NewEmptyRetriableError()) {
 			return err
 		}
 
 		if err != nil {
-			logging.Warn(
-				ctx,
-				"Failed to copy chunk %v of snapshot %v, the backup fails: %v",
-				entry.ChunkID,
-				entry.SnapshotID,
-				err,
-			)
-			t.registry.Counter("backup/failedChunks").Inc()
-
-			err = t.storage.BackupChunkFailed(ctx, entry, err.Error())
+			err = t.chunkFailed(ctx, entries, err)
 			if err != nil {
 				return err
 			}
@@ -195,9 +207,35 @@ func (t *backupChunksTask) copy(
 		}
 
 		select {
-		case copied <- entry:
+		case copied <- entries:
 		case <-ctx.Done():
 			return nil
+		}
+	}
+
+	return nil
+}
+
+func (t *backupChunksTask) chunkFailed(
+	ctx context.Context,
+	entries []storage.BackupChunkQueueEntry,
+	copyErr error,
+) error {
+
+	t.registry.Counter("backup/failedChunks").Inc()
+
+	for _, entry := range entries {
+		logging.Warn(
+			ctx,
+			"Failed to copy chunk %v of snapshot %v, the backup fails: %v",
+			entry.ChunkID,
+			entry.SnapshotID,
+			copyErr,
+		)
+
+		err := t.storage.BackupChunkFailed(ctx, entry, copyErr.Error())
+		if err != nil {
+			return err
 		}
 	}
 
@@ -209,7 +247,7 @@ func (t *backupChunksTask) copy(
 // are done and copied is closed.
 func (t *backupChunksTask) complete(
 	ctx context.Context,
-	copied <-chan storage.BackupChunkQueueEntry,
+	copied <-chan []storage.BackupChunkQueueEntry,
 ) error {
 
 	var batch []storage.BackupChunkQueueEntry
@@ -232,12 +270,12 @@ func (t *backupChunksTask) complete(
 
 	for {
 		select {
-		case entry, ok := <-copied:
+		case entries, ok := <-copied:
 			if !ok {
 				return flush()
 			}
 
-			batch = append(batch, entry)
+			batch = append(batch, entries...)
 			if len(batch) >= t.batchSize {
 				err := flush()
 				if err != nil {

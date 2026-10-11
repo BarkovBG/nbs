@@ -40,6 +40,21 @@ func newBackupChunksTask(
 
 ////////////////////////////////////////////////////////////////////////////////
 
+type chunkReadCountingStorage struct {
+	snapshot_storage.Storage
+	reads atomic.Int64
+}
+
+func (s *chunkReadCountingStorage) ReadChunkBlob(
+	ctx context.Context,
+	chunkID string,
+	storedInS3 bool,
+) (chunks.ChunkBlob, error) {
+
+	s.reads.Add(1)
+	return s.Storage.ReadChunkBlob(ctx, chunkID, storedInS3)
+}
+
 type unavailableChunkStorage struct {
 	snapshot_storage.Storage
 	reads atomic.Int64
@@ -234,6 +249,47 @@ func TestBackupChunksTaskStopsOnRetriableError(t *testing.T) {
 	queue, err := queuedBackupChunks(ctx, storage)
 	require.NoError(t, err)
 	require.ElementsMatch(t, entries, queue)
+}
+
+func TestBackupChunksTaskCopiesSharedChunkOnce(t *testing.T) {
+	ctx := test.NewContext()
+
+	storage, closeFunc := newStorage(t, ctx)
+	defer closeFunc()
+
+	follower := newTestFollower(t, ctx)
+	chunkID := createSnapshotWithChunk(t, ctx, storage, "snap1")
+
+	// Two snapshots queued the same chunk before either copied it.
+	var entries []snapshot_storage.BackupChunkQueueEntry
+	for _, snapshotID := range []string{"snap1", "snap2"} {
+		entries = append(entries, snapshot_storage.BackupChunkQueueEntry{
+			SnapshotID:   snapshotID,
+			ChunkID:      chunkID,
+			StoredInS3:   true,
+			EncryptedDEK: follower.encryptedDEK,
+		})
+	}
+	err := enqueueBackupChunks(ctx, storage, entries)
+	require.NoError(t, err)
+
+	countingStorage := &chunkReadCountingStorage{Storage: storage}
+	task := newBackupChunksTask(countingStorage, follower)
+	// One entry per batch: the two entries of the chunk come in different
+	// batches and are still copied once.
+	task.batchSize = 1
+	execCtx := mocks.NewExecutionContextMock()
+
+	err = task.Run(ctx, execCtx)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, countingStorage.reads.Load())
+
+	_, err = follower.getObject(ctx, backup.ChunkKey(chunkID))
+	require.NoError(t, err)
+
+	queue, err := queuedBackupChunks(ctx, storage)
+	require.NoError(t, err)
+	require.Empty(t, queue)
 }
 
 func TestBackupChunksTaskMovesMissingChunkOutOfQueue(t *testing.T) {
