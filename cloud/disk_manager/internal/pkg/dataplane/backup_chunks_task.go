@@ -13,6 +13,7 @@ import (
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/chunks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/monitoring/metrics"
 	"github.com/ydb-platform/nbs/cloud/tasks"
+	"github.com/ydb-platform/nbs/cloud/tasks/errors"
 	"github.com/ydb-platform/nbs/cloud/tasks/logging"
 	"golang.org/x/sync/errgroup"
 )
@@ -61,7 +62,7 @@ func (t *backupChunksTask) Run(
 	workers.Add(1)
 	defer workers.Add(-1)
 
-	failures := &backupChunkCopyFailures{limit: t.batchSize}
+	chunkErrors := &firstChunkError{}
 	toCopy := make(chan storage.BackupChunkQueueEntry, t.batchSize)
 	copied := make(chan storage.BackupChunkQueueEntry, t.batchSize)
 
@@ -77,7 +78,7 @@ func (t *backupChunksTask) Run(
 		copiers.Add(1)
 		group.Go(func() error {
 			defer copiers.Done()
-			return t.copy(groupCtx, failures, toCopy, copied)
+			return t.copy(groupCtx, chunkErrors, toCopy, copied)
 		})
 	}
 
@@ -98,10 +99,9 @@ func (t *backupChunksTask) Run(
 		return err
 	}
 
-	// Failed chunks stay queued. A retriable error makes the framework run
-	// the task again; otherwise the task fails and the dispatcher schedules
-	// a new one for the range.
-	return failures.first()
+	// A chunk that could not be copied stays queued; a new task of the range
+	// tries it again.
+	return chunkErrors.get()
 }
 
 func (t *backupChunksTask) Cancel(
@@ -165,11 +165,13 @@ func (t *backupChunksTask) fetch(
 	}
 }
 
-// Stops the task when a batch worth of chunks failed in a row: the follower
-// or the chunk storage is likely down.
+// A retriable error, such as the follower or YDB being unavailable, stops
+// the task: the framework runs it again later. Any other error belongs to the
+// chunk, such as missing or corrupt data: the chunk is skipped so that it does
+// not hold up the rest of the range.
 func (t *backupChunksTask) copy(
 	ctx context.Context,
-	failures *backupChunkCopyFailures,
+	chunkErrors *firstChunkError,
 	toCopy <-chan storage.BackupChunkQueueEntry,
 	copied chan<- storage.BackupChunkQueueEntry,
 ) error {
@@ -180,21 +182,21 @@ func (t *backupChunksTask) copy(
 		}
 
 		err := t.copyChunk(ctx, entry)
+		if errors.Is(err, errors.NewEmptyRetriableError()) {
+			return err
+		}
+
 		if err != nil {
 			logging.Warn(
 				ctx,
-				"Failed to copy chunk %v of snapshot %v, will retry: %v",
+				"Failed to copy chunk %v of snapshot %v, skipping it: %v",
 				entry.ChunkID,
 				entry.SnapshotID,
 				err,
 			)
-			if failures.add(err) {
-				return err
-			}
+			chunkErrors.set(err)
 			continue
 		}
-
-		failures.reset()
 
 		select {
 		case copied <- entry:
@@ -291,36 +293,23 @@ func (t *backupChunksTask) copyChunk(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-type backupChunkCopyFailures struct {
+type firstChunkError struct {
 	mutex sync.Mutex
-	// Failures in a row that stop the task.
-	limit int
-	inRow int
 	err   error
 }
 
-// Returns true when limit chunks failed in a row.
-func (f *backupChunkCopyFailures) add(err error) bool {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
+func (e *firstChunkError) set(err error) {
+	e.mutex.Lock()
+	defer e.mutex.Unlock()
 
-	if f.err == nil {
-		f.err = err
+	if e.err == nil {
+		e.err = err
 	}
-	f.inRow++
-	return f.inRow >= f.limit
 }
 
-func (f *backupChunkCopyFailures) reset() {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
+func (e *firstChunkError) get() error {
+	e.mutex.Lock()
+	defer e.mutex.Unlock()
 
-	f.inRow = 0
-}
-
-func (f *backupChunkCopyFailures) first() error {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
-
-	return f.err
+	return e.err
 }

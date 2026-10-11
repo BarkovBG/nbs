@@ -7,16 +7,13 @@ option go_package = "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg
 ////////////////////////////////////////////////////////////////////////////////
 
 message ScheduleBackupChunksTasksState {
-    // Were WorkerTaskIds and ScheduledCount of the dispatcher without ranges.
-    reserved 1, 2;
-
     // Number of shard ranges the fields below are for.
-    uint32 RangeCount = 3;
+    uint32 RangeCount = 1;
     // The copy task of each range; empty when the range has none.
-    repeated string RangeTaskIds = 4;
+    repeated string RangeTaskIds = 2;
     // Copy tasks scheduled so far for each range. The idempotency key of the
     // next task of the range includes it.
-    repeated uint64 RangeScheduledCounts = 5;
+    repeated uint64 RangeScheduledCounts = 3;
     // The range the next pass starts from, so that every range gets a turn.
-    uint32 NextRange = 6;
+    uint32 NextRange = 4;
 }

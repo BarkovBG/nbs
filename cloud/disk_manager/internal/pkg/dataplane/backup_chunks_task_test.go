@@ -13,6 +13,7 @@ import (
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage/chunks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/test"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/monitoring/metrics"
+	"github.com/ydb-platform/nbs/cloud/tasks/errors"
 	"github.com/ydb-platform/nbs/cloud/tasks/mocks"
 	"github.com/ydb-platform/nbs/contrib/go/cityhash"
 )
@@ -39,19 +40,19 @@ func newBackupChunksTask(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-type chunkReadCountingStorage struct {
+type unavailableChunkStorage struct {
 	snapshot_storage.Storage
 	reads atomic.Int64
 }
 
-func (s *chunkReadCountingStorage) ReadChunkBlob(
+func (s *unavailableChunkStorage) ReadChunkBlob(
 	ctx context.Context,
 	chunkID string,
 	storedInS3 bool,
 ) (chunks.ChunkBlob, error) {
 
 	s.reads.Add(1)
-	return s.Storage.ReadChunkBlob(ctx, chunkID, storedInS3)
+	return chunks.ChunkBlob{}, errors.NewRetriableErrorf("storage is unavailable")
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -199,7 +200,7 @@ func TestBackupChunksTaskCopiesOnlyItsRange(t *testing.T) {
 	require.Equal(t, entries[1:], queue)
 }
 
-func TestBackupChunksTaskStopsWhenChunksFailInARow(t *testing.T) {
+func TestBackupChunksTaskStopsOnRetriableError(t *testing.T) {
 	ctx := test.NewContext()
 
 	storage, closeFunc := newStorage(t, ctx)
@@ -207,7 +208,6 @@ func TestBackupChunksTaskStopsWhenChunksFailInARow(t *testing.T) {
 
 	follower := newTestFollower(t, ctx)
 
-	// None of these chunks exists in the chunk storage.
 	var entries []snapshot_storage.BackupChunkQueueEntry
 	for _, chunkID := range []string{"task.snap1.0", "task.snap1.1"} {
 		entries = append(entries, snapshot_storage.BackupChunkQueueEntry{
@@ -220,17 +220,16 @@ func TestBackupChunksTaskStopsWhenChunksFailInARow(t *testing.T) {
 	err := enqueueBackupChunks(ctx, storage, entries)
 	require.NoError(t, err)
 
-	countingStorage := &chunkReadCountingStorage{Storage: storage}
-	task := newBackupChunksTask(countingStorage, follower)
-	task.batchSize = 1
+	unavailableStorage := &unavailableChunkStorage{Storage: storage}
+	task := newBackupChunksTask(unavailableStorage, follower)
 	task.ioDepth = 1
 	execCtx := mocks.NewExecutionContextMock()
 
-	// The first failure is a batch worth of failures in a row: the task
-	// stops instead of trying the next chunk.
+	// The chunk storage is unavailable: the task stops on the first chunk
+	// instead of trying the next one, and the framework runs it again later.
 	err = task.Run(ctx, execCtx)
-	require.Error(t, err)
-	require.EqualValues(t, 1, countingStorage.reads.Load())
+	require.True(t, errors.Is(err, errors.NewEmptyRetriableError()))
+	require.EqualValues(t, 1, unavailableStorage.reads.Load())
 
 	queue, err := queuedBackupChunks(ctx, storage)
 	require.NoError(t, err)
