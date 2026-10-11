@@ -15,7 +15,6 @@ import (
 	"github.com/ydb-platform/nbs/cloud/tasks/headers"
 	"github.com/ydb-platform/nbs/cloud/tasks/logging"
 	tasks_mocks "github.com/ydb-platform/nbs/cloud/tasks/mocks"
-	"github.com/ydb-platform/nbs/cloud/tasks/operation"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -125,13 +124,13 @@ func (s scheduleBackupChunksTasksTest) expectTaskScheduled(
 	).Return(fmt.Sprintf("task_%v", index), nil).Once()
 }
 
-func (s scheduleBackupChunksTasksTest) expectTaskDone(
-	taskID string,
-	done bool,
+func (s scheduleBackupChunksTasksTest) expectEndedTasks(
+	taskIDs []string,
+	ended []string,
 ) {
 
-	s.scheduler.On("GetOperation", mock.Anything, taskID).Return(
-		&operation.Operation{Id: taskID, Done: done},
+	s.scheduler.On("GetEndedTasks", mock.Anything, taskIDs).Return(
+		ended,
 		nil,
 	).Once()
 }
@@ -194,7 +193,7 @@ func TestScheduleBackupChunksTasksSchedulesOneTaskPerQueuedRange(
 func TestScheduleBackupChunksTasksLeavesRangeToItsTask(t *testing.T) {
 	s := newScheduleBackupChunksTasksTest()
 	s.withRangeTasks(map[uint32]string{0: "task_0"})
-	s.expectTaskDone("task_0", false)
+	s.expectEndedTasks([]string{"task_0"}, nil)
 	s.expectQueueQueued(true)
 	// Range 0 still has its task, so it is not looked at again.
 	s.expectRangeQueued(1, true)
@@ -208,12 +207,10 @@ func TestScheduleBackupChunksTasksLeavesRangeToItsTask(t *testing.T) {
 func TestScheduleBackupChunksTasksReplacesEndedTasks(t *testing.T) {
 	s := newScheduleBackupChunksTasksTest()
 	s.withRangeTasks(map[uint32]string{1: "old_1", 2: "old_2"})
-	s.expectTaskDone("old_1", true)
-	// The task of range 2 ended long ago and was cleared from the storage.
-	s.scheduler.On("GetOperation", mock.Anything, "old_2").Return(
-		nil,
-		errors.NewNonRetriableError(errors.NewNotFoundErrorWithTaskID("old_2")),
-	).Once()
+	s.expectEndedTasks(
+		[]string{"old_1", "old_2"},
+		[]string{"old_1", "old_2"},
+	)
 	s.expectQueueQueued(true)
 	s.expectRangeQueued(0, false)
 	// The new task of a range gets the next key of the range.
@@ -235,11 +232,11 @@ func TestScheduleBackupChunksTasksWaitsForTasksOfOldSplit(t *testing.T) {
 	s.task.state.RangeScheduledCounts = []uint64{1, 0, 0, 0}
 
 	// The old range overlaps the new ones: nothing starts while it runs.
-	s.expectTaskDone("old_0", false)
+	s.expectEndedTasks([]string{"old_0"}, nil)
 	s.run(t)
 	require.EqualValues(t, backupChunkRangesPerTask, s.task.state.RangeCount)
 
-	s.expectTaskDone("old_0", true)
+	s.expectEndedTasks([]string{"old_0"}, []string{"old_0"})
 	s.expectQueueQueued(true)
 	s.expectRangeQueued(0, true)
 	s.expectTaskScheduled(0, 0)
@@ -259,10 +256,11 @@ func TestScheduleBackupChunksTasksWaitsForTasksOfOldSplit(t *testing.T) {
 func TestScheduleBackupChunksTasksIgnoresRetryLimit(t *testing.T) {
 	s := newScheduleBackupChunksTasksTest()
 	s.withRangeTasks(map[uint32]string{0: "task_0"})
-	s.scheduler.On("GetOperation", mock.Anything, "task_0").Return(
-		nil,
-		errors.NewRetriableErrorf("storage is unavailable"),
-	).Once()
+	s.scheduler.On(
+		"GetEndedTasks",
+		mock.Anything,
+		[]string{"task_0"},
+	).Return(nil, errors.NewRetriableErrorf("storage is unavailable")).Once()
 
 	// A failed dispatcher would be replaced by one that does not know the
 	// running tasks, so transient errors never add up to a failure.

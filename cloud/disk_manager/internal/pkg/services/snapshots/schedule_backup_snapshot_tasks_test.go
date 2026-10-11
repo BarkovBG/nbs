@@ -12,11 +12,9 @@ import (
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources"
 	resources_mocks "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources/mocks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/snapshots/protos"
-	"github.com/ydb-platform/nbs/cloud/tasks/errors"
 	"github.com/ydb-platform/nbs/cloud/tasks/headers"
 	"github.com/ydb-platform/nbs/cloud/tasks/logging"
 	tasks_mocks "github.com/ydb-platform/nbs/cloud/tasks/mocks"
-	"github.com/ydb-platform/nbs/cloud/tasks/operation"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -87,6 +85,7 @@ func expectRunningCopies(
 ) {
 
 	var scheduled []resources.ScheduledSnapshotBackup
+	var taskIDs []string
 	for i := 0; i < count; i++ {
 		taskID := fmt.Sprintf("running%v", i)
 		scheduled = append(scheduled, resources.ScheduledSnapshotBackup{
@@ -94,8 +93,12 @@ func expectRunningCopies(
 			BackupID:   "attempt",
 			TaskID:     taskID,
 		})
-		scheduler.On("GetOperation", mock.Anything, taskID).Return(
-			&operation.Operation{Id: taskID, Done: false},
+		taskIDs = append(taskIDs, taskID)
+	}
+
+	if count != 0 {
+		scheduler.On("GetEndedTasks", mock.Anything, taskIDs).Return(
+			nil,
 			nil,
 		).Once()
 	}
@@ -197,14 +200,11 @@ func TestScheduleBackupSnapshotTasksFreesSlotsOfEndedTasks(t *testing.T) {
 		},
 		nil,
 	).Once()
-	scheduler.On("GetOperation", mock.Anything, "task1").Return(
-		&operation.Operation{Id: "task1", Done: true},
-		nil,
-	).Once()
-	scheduler.On("GetOperation", mock.Anything, "task2").Return(
-		nil,
-		errors.NewNonRetriableError(errors.NewNotFoundErrorWithTaskID("task2")),
-	).Once()
+	scheduler.On(
+		"GetEndedTasks",
+		mock.Anything,
+		[]string{"task1", "task2"},
+	).Return([]string{"task1", "task2"}, nil).Once()
 	storage.On(
 		"RemoveSnapshotFromBackupQueue",
 		mock.Anything,

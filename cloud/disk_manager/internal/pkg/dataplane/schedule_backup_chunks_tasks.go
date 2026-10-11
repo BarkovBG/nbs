@@ -148,37 +148,39 @@ func (t *scheduleBackupChunksTasks) schedule(
 	return nil
 }
 
-// Clears the ranges whose tasks ended; returns how many tasks still run. A
-// task missing from the task storage ended long ago and was cleared.
+// Clears the ranges whose tasks ended; returns how many tasks still run.
 func (t *scheduleBackupChunksTasks) dropEndedTasks(
 	ctx context.Context,
 ) (int, error) {
 
-	running := 0
-	for index, taskID := range t.state.RangeTaskIds {
-		if len(taskID) == 0 {
-			continue
+	var taskIDs []string
+	for _, taskID := range t.state.RangeTaskIds {
+		if len(taskID) != 0 {
+			taskIDs = append(taskIDs, taskID)
 		}
-
-		op, err := t.scheduler.GetOperation(ctx, taskID)
-		if errors.Is(err, errors.NewEmptyNotFoundError()) {
-			t.state.RangeTaskIds[index] = ""
-			continue
-		}
-
-		if err != nil {
-			return 0, err
-		}
-
-		if op.Done {
-			t.state.RangeTaskIds[index] = ""
-			continue
-		}
-
-		running++
 	}
 
-	return running, nil
+	if len(taskIDs) == 0 {
+		return 0, nil
+	}
+
+	ended, err := t.scheduler.GetEndedTasks(ctx, taskIDs)
+	if err != nil {
+		return 0, err
+	}
+
+	endedTaskIDs := make(map[string]struct{}, len(ended))
+	for _, taskID := range ended {
+		endedTaskIDs[taskID] = struct{}{}
+	}
+
+	for index, taskID := range t.state.RangeTaskIds {
+		if _, ok := endedTaskIDs[taskID]; ok {
+			t.state.RangeTaskIds[index] = ""
+		}
+	}
+
+	return len(taskIDs) - len(ended), nil
 }
 
 func (t *scheduleBackupChunksTasks) hasQueuedChunks(

@@ -11,7 +11,6 @@ import (
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/snapshots/protos"
 	"github.com/ydb-platform/nbs/cloud/tasks"
-	"github.com/ydb-platform/nbs/cloud/tasks/errors"
 	"github.com/ydb-platform/nbs/cloud/tasks/headers"
 )
 
@@ -144,15 +143,27 @@ func (t *scheduleBackupSnapshotTasks) countRunningCopies(
 		return 0, err
 	}
 
-	running := 0
-	for _, backup := range scheduled {
-		ended, err := t.taskEnded(ctx, backup.TaskID)
-		if err != nil {
-			return 0, err
-		}
+	if len(scheduled) == 0 {
+		return 0, nil
+	}
 
-		if !ended {
-			running++
+	var taskIDs []string
+	for _, backup := range scheduled {
+		taskIDs = append(taskIDs, backup.TaskID)
+	}
+
+	ended, err := t.scheduler.GetEndedTasks(ctx, taskIDs)
+	if err != nil {
+		return 0, err
+	}
+
+	endedTaskIDs := make(map[string]struct{}, len(ended))
+	for _, taskID := range ended {
+		endedTaskIDs[taskID] = struct{}{}
+	}
+
+	for _, backup := range scheduled {
+		if _, ok := endedTaskIDs[backup.TaskID]; !ok {
 			continue
 		}
 
@@ -166,22 +177,5 @@ func (t *scheduleBackupSnapshotTasks) countRunningCopies(
 		}
 	}
 
-	return running, nil
-}
-
-func (t *scheduleBackupSnapshotTasks) taskEnded(
-	ctx context.Context,
-	taskID string,
-) (bool, error) {
-
-	op, err := t.scheduler.GetOperation(ctx, taskID)
-	if errors.Is(err, errors.NewEmptyNotFoundError()) {
-		return true, nil
-	}
-
-	if err != nil {
-		return false, err
-	}
-
-	return op.Done, nil
+	return len(scheduled) - len(ended), nil
 }
