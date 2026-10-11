@@ -138,7 +138,8 @@ func (t *backupChunksTask) fetch(
 	}
 
 	var after *storage.BackupChunkQueueEntry
-	var chunk []storage.BackupChunkQueueEntry
+	// The entries of the last chunk read so far: the next batch may have more.
+	var pending []storage.BackupChunkQueueEntry
 	for {
 		readStart := time.Now()
 		entries, err := t.storage.GetQueuedChunksToBackup(
@@ -156,25 +157,41 @@ func (t *backupChunksTask) fetch(
 		}
 
 		if len(entries) == 0 {
-			if len(chunk) == 0 {
-				return nil
-			}
-			return send(chunk)
+			break
 		}
-
-		for _, entry := range entries {
-			if len(chunk) != 0 && chunk[0].ChunkID != entry.ChunkID {
-				err = send(chunk)
-				if err != nil {
-					return err
-				}
-				chunk = nil
-			}
-			chunk = append(chunk, entry)
-		}
-
 		after = &entries[len(entries)-1]
+
+		groups := groupByChunk(append(pending, entries...))
+		for _, group := range groups[:len(groups)-1] {
+			err = send(group)
+			if err != nil {
+				return err
+			}
+		}
+		pending = groups[len(groups)-1]
 	}
+
+	if len(pending) == 0 {
+		return nil
+	}
+	return send(pending)
+}
+
+// Splits entries into runs of one chunk, keeping their order.
+func groupByChunk(
+	entries []storage.BackupChunkQueueEntry,
+) [][]storage.BackupChunkQueueEntry {
+
+	var groups [][]storage.BackupChunkQueueEntry
+	start := 0
+	for i := 1; i <= len(entries); i++ {
+		if i == len(entries) || entries[i].ChunkID != entries[start].ChunkID {
+			// Capped, so that appending to a group never overwrites the next.
+			groups = append(groups, entries[start:i:i])
+			start = i
+		}
+	}
+	return groups
 }
 
 // A retriable error, such as the follower or YDB being unavailable, stops

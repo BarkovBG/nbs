@@ -352,3 +352,40 @@ func TestBackupChunksTaskEndsOnEmptyQueue(t *testing.T) {
 
 	require.NoError(t, task.Run(ctx, execCtx))
 }
+
+func TestGroupByChunk(t *testing.T) {
+	entry := func(
+		snapshotID string,
+		chunkID string,
+	) snapshot_storage.BackupChunkQueueEntry {
+
+		return snapshot_storage.BackupChunkQueueEntry{
+			SnapshotID: snapshotID,
+			ChunkID:    chunkID,
+		}
+	}
+
+	require.Empty(t, groupByChunk(nil))
+
+	groups := groupByChunk([]snapshot_storage.BackupChunkQueueEntry{
+		entry("A", "c1"),
+		entry("B", "c1"),
+		entry("A", "c2"),
+		entry("A", "c3"),
+		entry("B", "c3"),
+	})
+	require.Equal(
+		t,
+		[][]snapshot_storage.BackupChunkQueueEntry{
+			{entry("A", "c1"), entry("B", "c1")},
+			{entry("A", "c2")},
+			{entry("A", "c3"), entry("B", "c3")},
+		},
+		groups,
+	)
+
+	// A group grown by the next batch does not overwrite the next group.
+	first := append(groups[0], entry("C", "c1"))
+	require.Len(t, first, 3)
+	require.Equal(t, entry("A", "c2"), groups[1][0])
+}
