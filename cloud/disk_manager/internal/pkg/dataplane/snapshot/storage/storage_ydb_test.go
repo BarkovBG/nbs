@@ -2357,6 +2357,47 @@ func TestBackupChunkCompletedAfterDeletionIsNotMarkedCopied(t *testing.T) {
 	require.Equal(t, []BackupChunkQueueEntry{other}, got)
 }
 
+func TestBackupChunkFailed(t *testing.T) {
+	f := createFixture(t)
+	defer f.teardown()
+
+	// Snapshots A and B share chunk a.
+	entries := []BackupChunkQueueEntry{
+		{SnapshotID: "A", ChunkID: "t.a", EncryptedDEK: []byte("dek")},
+		{SnapshotID: "A", ChunkID: "t.c", EncryptedDEK: []byte("dek")},
+		{SnapshotID: "B", ChunkID: "t.a", EncryptedDEK: []byte("dek")},
+	}
+	err := f.storage.EnqueueBackupChunks(f.ctx, "A", entries[:2])
+	require.NoError(t, err)
+	err = f.storage.EnqueueBackupChunks(f.ctx, "B", entries[2:])
+	require.NoError(t, err)
+
+	err = f.storage.BackupChunkFailed(f.ctx, entries[1], "corrupt")
+	require.NoError(t, err)
+
+	// The failed chunk leaves the queue; the others stay.
+	got, err := f.queuedChunks(10)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []BackupChunkQueueEntry{entries[0], entries[2]}, got)
+
+	// The backup of A fails; B only waits for its chunk.
+	err = f.storage.CheckBackupChunksCompleted(f.ctx, "A")
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+	require.Contains(t, err.Error(), "t.c")
+	err = f.storage.CheckBackupChunksCompleted(f.ctx, "B")
+	require.True(t, errors.Is(err, errors.NewInterruptExecutionError()))
+
+	// Clearing A removes its queued and failed chunks, not those of B.
+	cleared, err := f.storage.ClearBackupChunks(f.ctx, "A", 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, cleared)
+	require.NoError(t, f.storage.CheckBackupChunksCompleted(f.ctx, "A"))
+
+	got, err = f.queuedChunks(10)
+	require.NoError(t, err)
+	require.Equal(t, entries[2:], got)
+}
+
 func TestGetQueuedChunksToBackupReadsShardRangeAfterCursor(t *testing.T) {
 	f := createFixture(t)
 	defer f.teardown()

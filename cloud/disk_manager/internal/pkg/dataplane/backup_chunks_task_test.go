@@ -236,7 +236,7 @@ func TestBackupChunksTaskStopsOnRetriableError(t *testing.T) {
 	require.ElementsMatch(t, entries, queue)
 }
 
-func TestBackupChunksTaskGoesOnPastMissingChunk(t *testing.T) {
+func TestBackupChunksTaskMovesMissingChunkOutOfQueue(t *testing.T) {
 	ctx := test.NewContext()
 
 	storage, closeFunc := newStorage(t, ctx)
@@ -266,19 +266,22 @@ func TestBackupChunksTaskGoesOnPastMissingChunk(t *testing.T) {
 	task := newBackupChunksTask(storage, follower)
 	execCtx := mocks.NewExecutionContextMock()
 
+	// The missing chunk does not hold up the rest of the range: it leaves the
+	// queue as failed and the task ends.
 	err = task.Run(ctx, execCtx)
-	require.Error(t, err)
+	require.NoError(t, err)
 
 	_, err = follower.getObject(ctx, backup.ChunkKey(chunkID))
 	require.NoError(t, err)
 
 	queue, err := queuedBackupChunks(ctx, storage)
 	require.NoError(t, err)
-	require.Equal(
-		t,
-		[]snapshot_storage.BackupChunkQueueEntry{missing},
-		queue,
-	)
+	require.Empty(t, queue)
+
+	// The backup of snap1 fails, the one of snap2 is complete.
+	err = storage.CheckBackupChunksCompleted(ctx, "snap1")
+	require.True(t, errors.Is(err, errors.NewEmptyNonRetriableError()))
+	require.NoError(t, storage.CheckBackupChunksCompleted(ctx, "snap2"))
 }
 
 func TestBackupChunksTaskEndsOnEmptyQueue(t *testing.T) {

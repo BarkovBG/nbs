@@ -195,6 +195,25 @@ func Create(
 	}
 	logging.Info(ctx, "Created backup_chunk_delete_queue table")
 
+	// Chunks that could not be copied to the follower: missing or corrupt
+	// data. The backup of their snapshot fails.
+	err = db.CreateOrAlterTable(
+		ctx,
+		config.GetStorageFolder(),
+		"backup_chunk_failures",
+		persistence.NewCreateTableDescription(
+			persistence.WithColumn("snapshot_id", persistence.Optional(persistence.TypeUTF8)),
+			persistence.WithColumn("chunk_id", persistence.Optional(persistence.TypeUTF8)),
+			persistence.WithColumn("error", persistence.Optional(persistence.TypeUTF8)),
+			persistence.WithPrimaryKeyColumn("snapshot_id", "chunk_id"),
+		),
+		dropUnusedColumns,
+	)
+	if err != nil {
+		return err
+	}
+	logging.Info(ctx, "Created backup_chunk_failures table")
+
 	if s3 != nil && len(config.GetS3Bucket()) != 0 {
 		exists, err := s3.BucketExists(ctx, config.GetS3Bucket())
 		if err != nil {
@@ -284,6 +303,12 @@ func Drop(
 		return err
 	}
 	logging.Info(ctx, "Dropped backup_chunk_delete_queue table")
+
+	err = db.DropTable(ctx, config.GetStorageFolder(), "backup_chunk_failures")
+	if err != nil {
+		return err
+	}
+	logging.Info(ctx, "Dropped backup_chunk_failures table")
 
 	logging.Info(ctx, "Dropped schema for dataplane snapshot storage")
 

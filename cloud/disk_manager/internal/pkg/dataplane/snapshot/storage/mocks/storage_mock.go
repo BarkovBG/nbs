@@ -329,6 +329,16 @@ func (s *StorageMock) CheckBackupChunksCompleted(
 	return args.Error(0)
 }
 
+func (s *StorageMock) BackupChunkFailed(
+	ctx context.Context,
+	entry storage.BackupChunkQueueEntry,
+	message string,
+) error {
+
+	args := s.Called(ctx, entry, message)
+	return args.Error(0)
+}
+
 func (s *StorageMock) ClearBackupChunks(
 	ctx context.Context,
 	snapshotID string,

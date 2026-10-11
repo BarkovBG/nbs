@@ -62,7 +62,6 @@ func (t *backupChunksTask) Run(
 	workers.Add(1)
 	defer workers.Add(-1)
 
-	chunkErrors := &firstChunkError{}
 	toCopy := make(chan storage.BackupChunkQueueEntry, t.batchSize)
 	copied := make(chan storage.BackupChunkQueueEntry, t.batchSize)
 
@@ -78,7 +77,7 @@ func (t *backupChunksTask) Run(
 		copiers.Add(1)
 		group.Go(func() error {
 			defer copiers.Done()
-			return t.copy(groupCtx, chunkErrors, toCopy, copied)
+			return t.copy(groupCtx, toCopy, copied)
 		})
 	}
 
@@ -94,14 +93,7 @@ func (t *backupChunksTask) Run(
 		return t.complete(ctx, copied)
 	})
 
-	err := group.Wait()
-	if err != nil {
-		return err
-	}
-
-	// A chunk that could not be copied stays queued; a new task of the range
-	// tries it again.
-	return chunkErrors.get()
+	return group.Wait()
 }
 
 func (t *backupChunksTask) Cancel(
@@ -167,11 +159,10 @@ func (t *backupChunksTask) fetch(
 
 // A retriable error, such as the follower or YDB being unavailable, stops
 // the task: the framework runs it again later. Any other error belongs to the
-// chunk, such as missing or corrupt data: the chunk is skipped so that it does
-// not hold up the rest of the range.
+// chunk, such as missing or corrupt data: the chunk leaves the queue as failed,
+// which fails the backup of its snapshot, and the rest of the range goes on.
 func (t *backupChunksTask) copy(
 	ctx context.Context,
-	chunkErrors *firstChunkError,
 	toCopy <-chan storage.BackupChunkQueueEntry,
 	copied chan<- storage.BackupChunkQueueEntry,
 ) error {
@@ -189,12 +180,17 @@ func (t *backupChunksTask) copy(
 		if err != nil {
 			logging.Warn(
 				ctx,
-				"Failed to copy chunk %v of snapshot %v, skipping it: %v",
+				"Failed to copy chunk %v of snapshot %v, the backup fails: %v",
 				entry.ChunkID,
 				entry.SnapshotID,
 				err,
 			)
-			chunkErrors.set(err)
+			t.registry.Counter("backup/failedChunks").Inc()
+
+			err = t.storage.BackupChunkFailed(ctx, entry, err.Error())
+			if err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -289,27 +285,4 @@ func (t *backupChunksTask) copyChunk(
 	t.registry.Counter("backup/copiedChunks").Inc()
 	t.registry.Counter("backup/copiedBytes").Add(int64(len(chunkBlob.Data)))
 	return nil
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
-type firstChunkError struct {
-	mutex sync.Mutex
-	err   error
-}
-
-func (e *firstChunkError) set(err error) {
-	e.mutex.Lock()
-	defer e.mutex.Unlock()
-
-	if e.err == nil {
-		e.err = err
-	}
-}
-
-func (e *firstChunkError) get() error {
-	e.mutex.Lock()
-	defer e.mutex.Unlock()
-
-	return e.err
 }

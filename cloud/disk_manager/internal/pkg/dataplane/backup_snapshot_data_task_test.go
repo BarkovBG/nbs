@@ -796,29 +796,29 @@ func (s failingBackupChunkStorage) ReadChunkBlob(
 	return chunks.ChunkBlob{}, errors.NewNonRetriableErrorf("source chunk is corrupt")
 }
 
-func TestBackupSnapshotDataTaskWaitsForChunkRetriedByAnotherWorker(t *testing.T) {
+func TestBackupSnapshotDataTaskFailsWhenChunkCannotBeCopied(t *testing.T) {
 	ctx := test.NewContext()
 	storage, closeFunc := newStorage(t, ctx)
 	defer closeFunc()
 	follower := newTestFollower(t, ctx)
-	chunkID := createSnapshotWithChunk(t, ctx, storage, "snapshot")
+	createSnapshotWithChunk(t, ctx, storage, "snapshot")
 	task := newBackupSnapshotDataTask(storage, follower, "snapshot")
 	execCtx := newBackupExecutionContext(ctx)
 	require.True(t, errors.Is(task.Run(ctx, execCtx), errors.NewInterruptExecutionError()))
 
 	workerCtx := mocks.NewExecutionContextMock()
 	worker := newBackupChunksTask(failingBackupChunkStorage{Storage: storage}, follower)
-	require.True(t, errors.Is(worker.Run(ctx, workerCtx), errors.NewEmptyNonRetriableError()))
+	require.NoError(t, worker.Run(ctx, workerCtx))
 
-	// The chunk stays queued; the copy waits instead of failing.
-	require.True(t, errors.Is(task.Run(ctx, execCtx), errors.NewInterruptExecutionError()))
+	// The corrupt chunk fails the copy instead of holding the snapshot
+	// forever; no map is written.
+	require.True(t, errors.Is(task.Run(ctx, execCtx), errors.NewEmptyNonRetriableError()))
 	_, err := follower.getObject(ctx, backup.ChunkMapKey("snapshot"))
 	require.Error(t, err)
 
-	err = newBackupChunksTask(storage, follower).Run(ctx, workerCtx)
-	require.NoError(t, err)
-	require.NoError(t, task.Run(ctx, execCtx))
-	require.Equal(t, []string{chunkID}, readBackupChunkMap(t, ctx, follower, "snapshot").ChunkIds)
+	// The failed copy clears its chunks and releases the snapshot.
+	require.NoError(t, task.Cancel(ctx, execCtx))
+	require.NoError(t, storage.CheckBackupChunksCompleted(ctx, "snapshot"))
 }
 
 // Fails reading a chunk, so the test sees which chunks a copy reads.
