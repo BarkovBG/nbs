@@ -69,6 +69,15 @@ func (s *SchedulerMock) CancelTask(
 	return args.Bool(0), args.Error(1)
 }
 
+func (s *SchedulerMock) PauseTask(
+	ctx context.Context,
+	taskID string,
+) error {
+
+	args := s.Called(ctx, taskID)
+	return args.Error(0)
+}
+
 func (s *SchedulerMock) WaitTask(
 	ctx context.Context,
 	execCtx tasks.ExecutionContext,

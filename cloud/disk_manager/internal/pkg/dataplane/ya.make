@@ -23,7 +23,6 @@ SRCS(
 
 GO_TEST_SRCS(
     collect_snapshots_task_test.go
-    delete_snapshot_task_test.go
     replicate_disk_task_test.go
 )
 

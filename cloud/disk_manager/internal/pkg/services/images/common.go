@@ -4,8 +4,10 @@ import (
 	"context"
 	"time"
 
+	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/clients/nbs"
 	dataplane_protos "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/protos"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources"
+	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/common"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/images/config"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/pools"
 	pools_protos "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/pools/protos"
@@ -23,6 +25,7 @@ func deleteImage(
 	scheduler tasks.Scheduler,
 	storage resources.Storage,
 	poolService pools.Service,
+	nbsFactory nbs.Factory,
 	imageID string,
 ) error {
 
@@ -86,12 +89,51 @@ func deleteImage(
 		return err
 	}
 
-	_, err = scheduler.WaitTask(ctx, execCtx, taskID)
+	zoneLost, err := imageZoneLost(ctx, storage, nbsFactory, imageMeta)
 	if err != nil {
 		return err
 	}
 
+	paused, err := common.PauseDataplaneDelete(
+		ctx,
+		execCtx,
+		scheduler,
+		zoneLost,
+		taskID,
+	)
+	if err != nil {
+		return err
+	}
+
+	if !paused {
+		_, err = scheduler.WaitTask(ctx, execCtx, taskID)
+		if err != nil {
+			return err
+		}
+	}
+
 	return storage.ImageDeleted(ctx, imageID, time.Now())
+}
+
+func imageZoneLost(
+	ctx context.Context,
+	storage resources.Storage,
+	nbsFactory nbs.Factory,
+	imageMeta *resources.ImageMeta,
+) (bool, error) {
+
+	if nbsFactory == nil || imageMeta == nil ||
+		len(imageMeta.CheckpointID) == 0 || len(imageMeta.SrcDiskID) == 0 {
+
+		return false, nil
+	}
+
+	disk, err := storage.GetDiskMeta(ctx, imageMeta.SrcDiskID)
+	if err != nil || disk == nil {
+		return false, err
+	}
+
+	return nbsFactory.IsZoneLost(disk.ZoneID), nil
 }
 
 func scheduleRetireBaseDisks(

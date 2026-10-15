@@ -383,6 +383,9 @@ type Factory interface {
 		srcZoneID string,
 		dstZoneID string,
 	) (MultiZoneClient, error)
+
+	// Zone is listed in the nbs client config and marked lost.
+	IsZoneLost(zoneID string) bool
 }
 
 ////////////////////////////////////////////////////////////////////////////////

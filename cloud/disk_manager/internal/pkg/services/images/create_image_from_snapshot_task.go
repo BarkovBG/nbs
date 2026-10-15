@@ -139,6 +139,7 @@ func (t *createImageFromSnapshotTask) Cancel(
 		t.scheduler,
 		t.storage,
 		t.poolService,
+		nil, // nbsFactory
 		t.request.DstImageId,
 	)
 }

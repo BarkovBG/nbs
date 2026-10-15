@@ -8,7 +8,6 @@ import (
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/clients/nbs"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/protos"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/snapshot/storage"
-	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/types"
 	"github.com/ydb-platform/nbs/cloud/tasks"
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
 	"github.com/ydb-platform/nbs/cloud/tasks/logging"
@@ -49,9 +48,14 @@ func (t *deleteSnapshotTask) deletingSnapshot(
 	}
 
 	if len(snapshotMeta.CheckpointID) != 0 {
-		err = t.deleteSourceCheckpoint(
+		nbsClient, err := t.nbsFactory.GetClient(ctx, snapshotMeta.Disk.ZoneId)
+		if err != nil {
+			return err
+		}
+
+		err = nbsClient.DeleteCheckpoint(
 			ctx,
-			snapshotMeta.Disk,
+			snapshotMeta.Disk.DiskId,
 			snapshotMeta.CheckpointID,
 		)
 		if err != nil {
@@ -76,76 +80,6 @@ func (t *deleteSnapshotTask) deletingSnapshot(
 	}
 
 	return nil
-}
-
-func (t *deleteSnapshotTask) deleteSourceCheckpoint(
-	ctx context.Context,
-	disk *types.Disk,
-	checkpointID string,
-) error {
-
-	nbsClient, err := t.nbsFactory.GetClient(ctx, disk.ZoneId)
-	if err != nil {
-		return err
-	}
-
-	err = nbsClient.DeleteCheckpoint(ctx, disk.DiskId, checkpointID)
-	if err == nil || nbs.IsNotFoundError(err) {
-		return nil
-	}
-
-	// Images are deleted through this same task. Checkpoint deletion is retried
-	// without a limit, so a source disk that is gone or cannot accept the
-	// request blocks snapshot and image deletion.
-	gone, checkErr := sourceDiskGoneOrUnavailable(ctx, nbsClient, disk.DiskId)
-	if checkErr != nil || !gone {
-		return err
-	}
-
-	logging.Warn(
-		ctx,
-		"Skipping deletion of checkpoint %v on disk %v, disk is gone or unavailable: %v",
-		checkpointID,
-		disk.DiskId,
-		err,
-	)
-	return nil
-}
-
-func sourceDiskGoneOrUnavailable(
-	ctx context.Context,
-	nbsClient nbs.Client,
-	diskID string,
-) (bool, error) {
-
-	states, err := nbsClient.ListDiskStates(ctx)
-	if err != nil {
-		return false, err
-	}
-
-	for _, state := range states {
-		if state.DiskID != diskID {
-			continue
-		}
-
-		switch state.State {
-		case types.DiskState_DISK_STATE_TEMPORARILY_UNAVAILABLE,
-			types.DiskState_DISK_STATE_ERROR:
-			return true, nil
-		default:
-			return false, nil
-		}
-	}
-
-	_, err = nbsClient.Describe(ctx, diskID)
-	if nbs.IsNotFoundError(err) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-
-	return false, nil
 }
 
 func (t *deleteSnapshotTask) Run(

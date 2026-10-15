@@ -9,6 +9,7 @@ import (
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/clients/nbs"
 	dataplane_protos "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/dataplane/protos"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources"
+	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/common"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/snapshots/protos"
 	"github.com/ydb-platform/nbs/cloud/tasks"
 	"github.com/ydb-platform/nbs/cloud/tasks/errors"
@@ -79,12 +80,33 @@ func (t *deleteSnapshotTask) deleteSnapshot(
 		return err
 	}
 
-	_, err = t.scheduler.WaitTask(ctx, execCtx, taskID)
+	paused, err := common.PauseDataplaneDelete(
+		ctx,
+		execCtx,
+		t.scheduler,
+		snapshotZoneLost(t.nbsFactory, snapshotMeta),
+		taskID,
+	)
 	if err != nil {
 		return err
 	}
 
+	if !paused {
+		_, err = t.scheduler.WaitTask(ctx, execCtx, taskID)
+		if err != nil {
+			return err
+		}
+	}
+
 	return t.storage.SnapshotDeleted(ctx, t.request.SnapshotId, time.Now())
+}
+
+func snapshotZoneLost(nbsFactory nbs.Factory, snapshotMeta *resources.SnapshotMeta) bool {
+	if snapshotMeta == nil || snapshotMeta.Disk == nil || len(snapshotMeta.CheckpointID) == 0 {
+		return false
+	}
+
+	return nbsFactory.IsZoneLost(snapshotMeta.Disk.ZoneId)
 }
 
 func (t *deleteSnapshotTask) Run(

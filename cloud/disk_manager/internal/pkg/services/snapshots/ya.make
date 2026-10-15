@@ -12,6 +12,7 @@ SRCS(
 )
 
 GO_TEST_SRCS(
+    delete_snapshot_task_test.go
     schedule_backup_snapshot_tasks_test.go
 )
 

@@ -23,6 +23,11 @@ func (f *FactoryMock) HasClient(zoneID string) bool {
 	return args.Bool(0)
 }
 
+func (f *FactoryMock) IsZoneLost(zoneID string) bool {
+	args := f.Called(zoneID)
+	return args.Bool(0)
+}
+
 func (f *FactoryMock) GetClient(
 	ctx context.Context,
 	zoneID string,

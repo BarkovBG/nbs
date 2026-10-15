@@ -247,6 +247,10 @@ func (s *scheduler) getTaskResponse(
 	return nil, nil
 }
 
+func (s *scheduler) PauseTask(ctx context.Context, taskID string) error {
+	return s.storage.PauseTask(ctx, taskID)
+}
+
 func (s *scheduler) WaitTask(
 	ctx context.Context,
 	execCtx ExecutionContext,

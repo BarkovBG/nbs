@@ -263,6 +263,7 @@ func (t *createImageFromDiskTask) Cancel(
 		t.scheduler,
 		t.storage,
 		t.poolService,
+		t.nbsFactory,
 		t.request.DstImageId,
 	)
 }

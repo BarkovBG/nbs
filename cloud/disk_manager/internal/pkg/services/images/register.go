@@ -137,6 +137,7 @@ func RegisterForExecution(
 			scheduler:   taskScheduler,
 			storage:     storage,
 			poolService: poolService,
+			nbsFactory:  nbsFactory,
 		}
 	})
 	if err != nil {

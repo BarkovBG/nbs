@@ -79,6 +79,9 @@ type Scheduler interface {
 	// Returns false if it has successfully finished.
 	CancelTask(ctx context.Context, taskID string) (bool, error)
 
+	// Pauses task execution until ResumeTask is called on task storage.
+	PauseTask(ctx context.Context, taskID string) error
+
 	// Interrupts execution if waited task has no result yet.
 	// Execution will be resumed when result is ready.
 	// Returns task response.

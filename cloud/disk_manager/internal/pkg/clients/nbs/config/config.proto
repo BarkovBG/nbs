@@ -10,6 +10,11 @@ option go_package = "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg
 
 message Zone {
     repeated string Endpoints = 1;
+    // Disks in this zone are gone. Deleting a snapshot or image whose source
+    // disk is here pauses dataplane.DeleteSnapshot and finishes the
+    // control-plane task, so compute gets success. Resume that dataplane task
+    // when the disks are back.
+    optional bool Lost = 2;
 }
 
 message GrpcKeepAliveConfig {

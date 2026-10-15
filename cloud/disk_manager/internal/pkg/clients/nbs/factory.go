@@ -120,6 +120,15 @@ func (f *factory) initClients(
 	}
 
 	for zoneID, zone := range f.config.GetZones() {
+		if zone.GetLost() {
+			logging.Info(
+				ctx,
+				"Zone %v is lost, nbs client is not created",
+				zoneID,
+			)
+			continue
+		}
+
 		clientCreds := &nbs_client.ClientCredentials{
 			RootCertsFile: f.config.GetRootCertsFile(),
 			TlsProvider:   f.tlsProvider,
@@ -238,6 +247,11 @@ func (f *factory) GetZones() []string {
 func (f *factory) HasClient(zoneID string) bool {
 	_, ok := f.clients[zoneID]
 	return ok
+}
+
+func (f *factory) IsZoneLost(zoneID string) bool {
+	zone, ok := f.config.GetZones()[zoneID]
+	return ok && zone.GetLost()
 }
 
 func (f *factory) GetClient(

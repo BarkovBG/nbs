@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	nbs_mocks "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/clients/nbs/mocks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources"
 	resources_storage_mocks "github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/resources/mocks"
 	"github.com/ydb-platform/nbs/cloud/disk_manager/internal/pkg/services/images/config"
@@ -111,4 +112,71 @@ func TestDeleteImageSchedulesRetireBaseDisksIdempotently(t *testing.T) {
 	err = task.Run(ctx, execCtx)
 	require.NoError(t, err)
 	mock.AssertExpectationsForObjects(t, scheduler, storage, poolService, execCtx)
+}
+
+func TestDeleteImagePausesDataplaneWhenZoneIsLost(t *testing.T) {
+	zoneID := "zone-a"
+
+	ctx := logging.SetLogger(
+		context.Background(),
+		logging.NewStderrLogger(logging.DebugLevel),
+	)
+	scheduler := tasks_mocks.NewSchedulerMock()
+	storage := resources_storage_mocks.NewStorageMock()
+	poolService := pools_service_mocks.NewServiceMock()
+	nbsFactory := nbs_mocks.NewFactoryMock()
+	execCtx := tasks_mocks.NewExecutionContextMock()
+	config := &config.ImagesConfig{}
+
+	task := &deleteImageTask{
+		config:      config,
+		scheduler:   scheduler,
+		storage:     storage,
+		poolService: poolService,
+		nbsFactory:  nbsFactory,
+		request: &protos.DeleteImageRequest{
+			ImageId: "image",
+		},
+		state: &protos.DeleteImageTaskState{},
+	}
+
+	execCtx.On("GetTaskID").Return("delete_image_task")
+	poolService.On("ImageDeleting", mock.Anything, mock.Anything).Return("pool-task", nil)
+	scheduler.On("WaitTask", mock.Anything, execCtx, "pool-task").Return(mock.Anything, nil)
+	storage.On(
+		"DeleteImage",
+		ctx,
+		"image",
+		"delete_image_task",
+		mock.Anything,
+	).Return(&resources.ImageMeta{
+		ID:           "image",
+		SrcDiskID:    "disk",
+		CheckpointID: "checkpoint",
+		DeleteTaskID: "delete_image_task",
+	}, nil)
+	storage.On("GetDiskMeta", ctx, "disk").Return(&resources.DiskMeta{
+		ID:     "disk",
+		ZoneID: zoneID,
+	}, nil)
+	nbsFactory.On("IsZoneLost", zoneID).Return(true)
+	scheduler.On(
+		"ScheduleTask",
+		mock.Anything,
+		"dataplane.DeleteSnapshot",
+		mock.Anything,
+		mock.Anything,
+	).Return("dataplane-task", nil)
+	scheduler.On("PauseTask", ctx, "dataplane-task").Return(nil)
+	storage.On("ImageDeleted", ctx, "image", mock.Anything).Return(nil)
+
+	require.NoError(t, task.Run(ctx, execCtx))
+	scheduler.AssertNotCalled(
+		t,
+		"WaitTask",
+		mock.Anything,
+		mock.Anything,
+		"dataplane-task",
+	)
+	mock.AssertExpectationsForObjects(t, scheduler, storage, poolService, nbsFactory, execCtx)
 }
